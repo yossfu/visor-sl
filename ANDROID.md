@@ -58,7 +58,8 @@ JavaScript, a partir de las fuentes públicas de Linden Lab
 (`message_template.msg`, `indra_constants.h`, `llprimitive.cpp`,
 `lltextureentry.*`, `patch_dct.cpp`, `avatar_lad.xml`…) y **verificado contra
 datagramas reales** congelados en los autotests (`recapturas.js` y
-`vectors.js`). El resultado es `src/sl/lludp/` (812 comprobaciones en verde),
+`vectors.js`). El resultado es `src/sl/lludp/` (861 comprobaciones en verde en
+14 suites, más `src/sl/relay.js` con 36),
 que es el MISMO código en el escritorio y dentro del APK.
 
 En un principio se estudió portar la capa de red de **Linkpoint**

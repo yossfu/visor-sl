@@ -24,6 +24,20 @@ Tiene siempre estas secciones, en este orden:
 `diag.json()` devuelve lo mismo en JSON (para volcados automáticos);
 `diag.report({ full: true })` amplía el entorno con el bloque WebGL completo.
 
+En `=== ESTADO AHORA ===` hay dos bloques que importan cuando «no pasa nada» en
+el móvil:
+
+- **sesión**: estado, enlace, fase, si está listo, región, `simPackets`,
+  prims/parches/avatares, `kbIn`/`kbOut`, **parones** y **parón más largo**, y el
+  error (si lo hay). Un parón es una congelación real de la página (WebView en
+  segundo plano, montar la región): es normal y no significa que el enlace se
+  haya caído.
+- **LLUDP**: el resumen del retransmisor (`lldpRelay.gateway.resumen()`): fase,
+  `simPackets`, **`relogins`**, el circuito (paquetes, RTT, reenvíos, silencio en
+  ms) y el bloque **`puente`** con lo que ha ido y vuelto por el WebSocket local
+  de la app (host, puertos, datagramas y KB en cada sentido). Si el puente no
+  arrancó, aquí se ve por qué.
+
 ## 2. Niveles y categorías
 
 El nivel se elige en el desplegable del panel y **filtra lo que se guarda**

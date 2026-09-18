@@ -172,6 +172,47 @@ export function typeName(type) {
 const PING_MS = 8000;         // latido si no hay trafico
 const PONG_TIMEOUT_MS = 6000; // sin respuesta: se da la conexion por muerta
 const HANDSHAKE_MS = 8000;    // tiempo maximo para HELLO/WELCOME
+const PING_TICK_MS = 2000;    // cada cuanto mira el vigilante
+const STALL_TICKS = 3;        // latidos sin respuesta antes de dar el enlace por muerto
+const FROZEN_TICK_MS = 4000;  // un intervalo mas largo que esto = la pagina estuvo parada
+
+// Un paso del vigilante del latido. Devuelve:
+//   "vivo"    -> no hay ningun latido esperando respuesta (o lo acabamos de perdonar)
+//   "paron"   -> el propio navegador dejo la pagina parada (pestana de fondo,
+//                WebView congelado): el hueco NO es culpa del otro extremo, asi
+//                que se perdona y se reinicia la cuenta
+//   "silencio"-> hay un latido sin contestar, pero aun no son suficientes
+//   "muerto"  -> STALL_TICKS ticks con un latido sin contestar: el enlace cayo
+//
+// Un enlace CALLADO no es un enlace muerto. Esto es importante: el enlace solo
+// lleva tramas cuando pasa algo (terreno, objetos, chat, cambios de fase), asi
+// que estando ya dentro lo normal es que no llegue nada durante muchos segundos.
+// Lo que delata a un extremo muerto es un LATIDO que se queda sin respuesta.
+// (La version anterior daba el enlace por muerto solo por silencio: un enlace
+// sano y callado se mataba el solo en unos segundos, y el usuario veia "se ha
+// perdido el enlace con el retransmisor" / "enlace cerrado (1000)".)
+//
+// Estar fuera del cierre de `createRelay` deja probarlo sin relojes de verdad.
+export function pasoVigilante(st, now, gap) {
+  if (gap > FROZEN_TICK_MS) {
+    st.frozenTicks = (st.frozenTicks || 0) + 1;
+    st.lastPauseMs = Math.round(gap);
+    st.lastRecv = Math.max(st.lastRecv, now);
+    st.lastPong = Math.max(st.lastPong, now);
+    st.pendingPing = 0;   // el latido que hubiera en vuelo se quedo en el paron
+    st.missedTicks = 0;
+    return "paron";
+  }
+  const pend = st.pendingPing || 0;
+  if (pend > 0 && now - pend > PONG_TIMEOUT_MS) {
+    st.missedTicks = (st.missedTicks || 0) + 1;
+    if (st.missedTicks < STALL_TICKS) return "silencio";
+    st.missedTicks = 0;
+    return "muerto";
+  }
+  st.missedTicks = 0;
+  return "vivo";
+}
 
 function noop() {}
 
@@ -203,7 +244,7 @@ export function createRelay(opts) {
     region: null, welcome: null, authModes: [], error: null, mock: false,
     bytesIn: 0, bytesOut: 0, framesIn: 0, framesOut: 0,
     pingTimer: null, retryTimer: null, handshakeTimer: null, pongTimer: null,
-    pendingPing: 0,
+    pendingPing: 0, missedTicks: 0, frozenTicks: 0, lastPauseMs: 0,
   };
 
   function setLink(link) {
@@ -327,6 +368,9 @@ export function createRelay(opts) {
       default:
         break;
     }
+    // Cualquier trama que llegue (no solo un PONG) prueba que el otro extremo
+    // sigue ahi, asi que el latido pendiente queda contestado.
+    st.pendingPing = 0;
     onMessage(frame.type, frame.r, u8);
   }
 
@@ -357,18 +401,40 @@ export function createRelay(opts) {
     st.retryTimer = setTimeout(() => { st.retryTimer = null; connect(); }, wait);
   }
 
+  // Vigilante del latido. La decision vive en `pasoVigilante` (fuera de este
+  // cierre) para poder probarla sin esperar minutos de reloj.
+  //
+  // Dos cosas que se aprendieron a base de romperlo en el movil:
+  //  * la pagina se congela de verdad (pestana en segundo plano, WebView
+  //    suspendido, un paron largo montando la region) y al volver
+  //    `performance.now()` ha saltado varios segundos: ese hueco NO es culpa del
+  //    otro extremo y se perdona.
+  //  * un enlace callado no esta muerto. ANTES este bucle solo mandaba el latido
+  //    cuando el contador de silencio estaba a cero, asi que un enlace sin nada
+  //    que contar (lo normal estando ya dentro) se moria el solo: el usuario
+  //    veia "se ha perdido el enlace con el retransmisor" y un "enlace cerrado
+  //    (1000)" sin motivo. Ahora el latido se manda siempre que toque, y lo que
+  //    mata el enlace es un latido SIN respuesta.
   function startPing() {
     if (st.pingTimer) return;
+    let lastTick = performance.now();
+    st.missedTicks = 0;
+    st.pendingPing = 0;
     st.pingTimer = setInterval(() => {
       if (!st.socket) return;
       const now = performance.now();
-      if (now - st.lastRecv > PONG_TIMEOUT_MS && now - st.lastPong > PONG_TIMEOUT_MS) {
+      const gap = now - lastTick;
+      lastTick = now;
+      const paso = pasoVigilante(st, now, gap);
+      if (paso === "muerto") {
         st.error = "el retransmisor no contesta";
+        onError("el retransmisor no contesta a los latidos (" +
+          Math.round((now - (st.lastRecv || now)) / 1000) + " s sin una sola trama)");
         try { st.socket.close(); } catch (e) { /* ya cerrado */ }
         return;
       }
       if (now - st.lastSend > PING_MS) ping();
-    }, 2000);
+    }, PING_TICK_MS);
   }
 
   function stopTimers() {
@@ -644,6 +710,29 @@ export function runRelaySelfTest() {
     d = decode(uni);
     d.r.getU8(); d.r.getI16();
     eq("trama: UTF-8", d.r.getStr32(), "cañón 🛰️ ñ");
+
+    // 3b. El vigilante del latido. Ni un paron de la propia pagina (pestana de
+    // fondo, WebView congelado) ni un enlace simplemente CALLADO pueden matar el
+    // enlace: era la causa del "enlace cerrado (1000)" que veia el usuario en el
+    // movil. Lo que mata el enlace es un latido SIN respuesta.
+    const tl = 100000;
+    const lat = { lastRecv: tl, lastPong: tl, lastSend: tl, pendingPing: 0, missedTicks: 0, frozenTicks: 0, lastPauseMs: 0 };
+    eq("latido: con trafico reciente sigue vivo", pasoVigilante(lat, tl + 2000, 2000), "vivo");
+    eq("latido: un paron de 9 s de la pagina se perdona", pasoVigilante(lat, tl + 11000, 9000), "paron");
+    ok("latido: y queda contado para el informe", lat.frozenTicks === 1 && lat.lastPauseMs === 9000,
+      lat.frozenTicks + "/" + lat.lastPauseMs);
+    eq("latido: 20 s de silencio sin latido pendiente no lo matan",
+      pasoVigilante(lat, tl + 31100, 2000), "vivo");
+    lat.pendingPing = tl + 32000;                     // se manda un latido
+    eq("latido: el latido reciente todavia no es una caida", pasoVigilante(lat, tl + 34000, 2000), "vivo");
+    eq("latido: pasados 6 s sin respuesta, avisa", pasoVigilante(lat, tl + 38100, 2000), "silencio");
+    eq("latido: ni el segundo tick", pasoVigilante(lat, tl + 40100, 2000), "silencio");
+    eq("latido: al tercer tick sin respuesta, si", pasoVigilante(lat, tl + 42100, 2000), "muerto");
+    pasoVigilante(lat, tl + 44100, 2000);             // otro tick sin respuesta
+    lat.lastRecv = tl + 45000;                        // y llega una trama cualquiera
+    lat.pendingPing = 0;
+    eq("latido: una trama reinicia la cuenta", pasoVigilante(lat, tl + 46100, 2000), "vivo");
+    eq("latido: la cuenta vuelve a cero", lat.missedTicks, 0);
 
     // 4. El transporte completo contra un servidor de mentira.
     const pair = loopbackPair();

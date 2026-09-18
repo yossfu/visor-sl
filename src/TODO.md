@@ -346,14 +346,25 @@ de juego" en el README).
       (1 trama binaria = 1 datagrama). Sustituye al antiguo `RelayServer.kt` +
       `FrameCodec.kt`, que se borraron. `MainActivity` carga el visor con
       `?udp=ws://127.0.0.1:PUERTO#sl`.
-- [ ] Compilar el APK (GitHub Actions o Android Studio) y probarlo en el móvil.
-- [ ] Traer un informe del móvil y arreglar lo que salga.
+- [x] Compilar el APK (GitHub Actions, flujo `Compilar APK`): el run nº 9 salió
+      en verde el 2026-09-18. La APK se descarga del artefacto del propio run.
+- [x] Primer informe del móvil y arreglo de lo que salió: el usuario vio «se ha
+      perdido el enlace con el retransmisor · enlace cerrado (1000)». Eran dos
+      fallos del vigilante de latido del enlace: los parones del WebView contaban
+      como silencio, y un enlace *callado* (lo normal estando ya dentro) se
+      mataba solo porque el latido solo se mandaba con el contador de silencio a
+      cero (ver «Enlace y parones del móvil» en el README). Arreglado: parones
+      perdonados, el enlace ahora se pregunta siempre y muere solo si un latido
+      no se contesta, relogin automático al volver el enlace (aunque te pille a
+      mitad de entrar), aviso de circuito caducado y el puente UDP visible en el
+      informe. Verificado en vivo: 45 s seguidos dentro sin caerse, y caída
+      forzada recuperada en ~0,8 s. Falta volver a compilar el APK y probarlo.
 
 ## Fase 12 — Núcleo LLUDP (mundo real)
 
 Todo el protocolo de Second Life en JavaScript (`src/sl/lludp/`), con el nativo
 reducido a mover datagramas. Ver "Modelo del núcleo LLUDP" en el README y
-`src/VIEWER-REAL.md`. **812 comprobaciones en verde.**
+`src/VIEWER-REAL.md`. **861 comprobaciones en verde (14 suites).**
 
 - [x] Plantillas del protocolo (`templates.js`, 483 mensajes) y códec binario
       (`codec.js`), verificados contra datagramas REALES (`recapturas.js`) y

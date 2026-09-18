@@ -136,8 +136,8 @@ navegador es mover datagramas UDP: la trae la **app Android** (un puente tonto d
       - `src/sl/lludp/` — **el núcleo LLUDP** (Fase 10): plantillas del protocolo,
         códec binario, circuito UDP con acks/reenvíos/ping, terreno (DCT),
         objetos, avatares, el retransmisor `gateway.js` y un simulador de región
-        real (`sim.js`). 812 comprobaciones en verde. Ver "Modelo del núcleo
-        LLUDP".
+        real (`sim.js`). 861 comprobaciones en verde (14 suites). Ver "Modelo del
+        núcleo LLUDP".
       - `src/sl/avatarLad.js` / `src/sl/avatarMesh.js` — forma real del avatar.
 - [x] `src/avatarRealBody.js` + `src/sl/slAppearance.js` + `src/sl/avatarLad.js` —
       la **forma real** del avatar: resuelve los parámetros de `avatar_lad.xml`
@@ -572,7 +572,7 @@ transporte es:
   datagrama, y una primera trama de texto `{"cmd":"connect","host":…,"port":…}`.
   Ahí sí se habla con un simulador de Second Life de verdad.
 
-Piezas (todas con autotest, **812 comprobaciones en verde**):
+Piezas (todas con autotest, **861 comprobaciones en verde** en 14 suites):
 
 - `templates.js` (68 KB, **483 mensajes** del protocolo), `template.js`
   (`TemplateSet`) y `codec.js` (bloques, compresión de ceros, uuids, utf8 fijo).
@@ -588,9 +588,15 @@ Piezas (todas con autotest, **812 comprobaciones en verde**):
 - `gateway.js` — **el retransmisor**: mantiene el circuito, traduce entre el
   protocolo del enlace (`relay.js`) y LLUDP, y expone todo al visor. Aquí está
   el estado de la sesión (fase, región, terreno, prims, residentes, chat).
+  Su guardia (relogin que cierra el circuito viejo, «no está listo» si el
+  simulador no ha mandado nada, aviso de circuito caducado, fase que no
+  retrocede) tiene autotest propio: `runGatewayGuardiaSelfTest` (13/13).
 - `sim.js` — el simulador de región (72 prims de ejemplo, residentes, chat que
   responde, terreno, `RegionHandshake`, `SimStats`…).
 - `udp.js` — los transportes (par de pruebas en memoria y el puente WebSocket).
+- [`../relay.js`](../relay.js) — **el enlace**: saludo y estado con el
+  retransmisor (o con el puente UDP de la app) y el vigilante de latido descrito
+  en «Enlace y parones del móvil». Autotest 36/36.
 
 En modo real, el flujo es: login XML-RPC → `simIp`/`simPort`/`circuitCode`/
 `sessionId` → el gateway abre el puente UDP y manda `UseCircuitCode` →
@@ -598,6 +604,52 @@ En modo real, el flujo es: login XML-RPC → `simIp`/`simPort`/`circuitCode`/
 terreno y objetos en cola → **listo**. A partir de ahí el visor manda
 `AgentUpdate` a 10 Hz y puede chatear, tocar prims (por uuid) y teletransportarse
 dentro de la región. Verificado de extremo a extremo contra el simulador.
+
+### Enlace y parones del móvil
+
+El síntoma que reportó el usuario en el APK —«se ha perdido el enlace con el
+retransmisor · enlace cerrado (1000)»— tenía causa propia, y eran **dos** cosas a
+la vez, las dos del vigilante de latido de `relay.js`:
+
+1. **Un parón de la página contaba como silencio.** En el móvil la página se
+   congela de verdad (WebView en segundo plano, o un parón largo montando la
+   región): al volver, `performance.now()` había saltado varios segundos y el
+   vigilante lo leía como si el otro extremo hubiera muerto.
+2. **Un enlace callado se mataba solo.** El latido solo se mandaba *mientras* el
+   contador de silencio estuviera a cero, así que un enlace sin nada que contar
+   —lo normal estando ya dentro, porque el enlace solo lleva tramas cuando pasa
+   algo— no se preguntaba nunca y se daba por muerto a los pocos segundos. Esto
+   se reprodujo en el editor: la sesión entraba pero se caía sola en ~10 s.
+
+Reglas ahora:
+
+- **Un parón no es una caída.** `pasoVigilante()` (función pura, con autotest)
+  perdona cualquier hueco de más de 4 s (`gap > FROZEN_TICK_MS`), lo cuenta
+  (`frozenTicks`, `lastPauseMs`, que salen en el informe) y sigue.
+- **Un enlace callado no está muerto: se le pregunta.** El latido se manda
+  siempre que toque (cada `PING_MS` = 8 s sin tráfico), y lo que da el enlace por
+  muerto es un **latido sin respuesta** (`PONG_TIMEOUT_MS` = 6 s × `STALL_TICKS`
+  = 3). Cualquier trama que llegue cuenta como respuesta, no solo el `PONG`.
+  Comprobado en vivo: la sesión aguanta 45 s seguidos sin una sola trama de más
+  y sigue en la región, mientras que antes caía a los ~10 s.
+- **El enlace vuelve y la sesión se recupera sola.** Si el enlace se cae, da
+  igual si ya estabas dentro o si te pilló a mitad de entrar: `session.js` marca
+  `relinkPending` y, cuando el enlace vuelve, **vuelve a mandar el login**.
+  Medido en vivo: caída detectada en ~0,2 s, sesión recuperada (con el estado del
+  mundo intacto) en ~0,8 s. El aviso dice que intentará recuperarlo, y
+  `becomeReady()` limpia el error.
+- **El gateway no miente.** No declara «en la región» si el simulador no ha
+  mandado un solo paquete (`simPackets === 0`); si lleva más de
+  `SIM_SILENCIO_MS` (15 s) callado, avisa de que el circuito puede haber
+  caducado; y la fase **no retrocede** a `ENTERING` cuando ya está dentro (el
+  terreno sigue llegando y un `RegionHandshake` repetido dejaba el visor clavado
+  en `ENTERING` para siempre).
+- **El relogin cierra el circuito viejo** antes de abrir el nuevo (`relogins`),
+  para no dejar dos circuitos latiendo a la vez.
+- **Todo sale en el informe** (`diag`): estado y fase, parones y parón más largo,
+  `simPackets`, `relogins`, y el bloque `puente` con los datagramas que han ido y
+  vuelto por el WebSocket local de la app. Sin eso, un «no pasa nada» en el móvil
+  no se distingue de un puerto cerrado.
 
 Límites honestos (documentados, no bugs): las texturas de Second Life son
 **JPEG2000** y el navegador no las decodifica, así que el visor no pide assets y

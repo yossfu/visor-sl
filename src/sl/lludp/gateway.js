@@ -86,6 +86,7 @@ import {
   C, S, PHASE, PROTOCOL, RES, ASSET_FORMAT, CHAT_KIND, ZERO_UUID,
   putAsset, encode, encodeJson, decode, loopbackPair,
 } from "../relay.js";
+import { decodePacket } from "./codec.js";
 import { defaultTemplates } from "./template.js";
 import { createCircuit } from "./circuit.js";
 import { openUdpBridge } from "./udp.js";
@@ -120,6 +121,7 @@ const GRID = REGION_SIZE + 1;             // 257 vertices por lado
 const QUIET_READY_MS = 1200;              // sin noticias del simulador: damos la region por lista
 const GRACE_TERRAIN_MS = 800;             // plazo para los parches vecinos
 const READY_TIMEOUT_MS = 12000;           // si algo se atasca, entramos igual
+const SIM_SILENCIO_MS = 15000;            // el simulador manda latido cada pocos segundos
 const POSE_HZ = 10;
 const NAME_REQ_MIN_MS = 1000;
 const COARSE_RANGE = 96;                  // metros: los vecinos mas lejanos no se dibujan
@@ -204,6 +206,8 @@ export function createLldpGateway(opts = {}) {
     // receptores
     handshake: null, waterLevel: 20, channelVersion: "", simAccess: 21, regionFlags: 0,
     patches: 0, objects: 0, avatars: 0, chats: 0, touches: 0, assets: 0, terse: 0,
+    simPackets: 0, sinSimAvisado: false, relogins: 0,
+    avisoSilencio: false,
     agentUpdates: 0, expected: 0, spawn: null, parcel: null, info: null,
     health: 100, balance: null, localPort: 0, peerNames: 0, rezes: 0,
     // tiempos
@@ -213,6 +217,7 @@ export function createLldpGateway(opts = {}) {
   };
 
   let salidaCerrada = false;
+  let cerrandoPorRelogin = false;
   let terrenoPrimero = 0;
   const pendientesTerreno = new Set();
   const emitidosTerreno = new Set();
@@ -253,6 +258,13 @@ export function createLldpGateway(opts = {}) {
   function sendJson(type, obj) { return send(type, (w) => w.putJson(obj)); }
 
   function setPhase(phase, progress, text) {
+    // La fase no puede RETROCEDER una vez que la region esta lista. El terreno
+    // y los objetos siguen llegando (y un RegionHandshake repetido tambien
+    // puede caer) despues de entrar, y anunciar "recibiendo..." con el mundo ya
+    // montado dejaba al visor esperando un READY que ya habia pasado: se veia
+    // la region pero la sesion no entraba nunca. El unico paso atras legitimo
+    // es DISCONNECTED, que es un cierre de verdad.
+    if (st.ready && phase === PHASE.ENTERING) return;
     st.phase = phase;
     if (progress !== undefined && progress !== null) st.progress = progress;
     if (text) st.text = text;
@@ -348,6 +360,7 @@ export function createLldpGateway(opts = {}) {
     emitidosTerreno.add(slPy * PATCHES + slPx);
     st.patches = emitidosTerreno.size;
     st.terrainAt = now();
+    // `setPhase` ya impide que esto retroceda la fase si la region esta lista.
     if (st.phase < PHASE.ENTERING) setPhase(PHASE.ENTERING, 5, "recibiendo el terreno…");
     else if (st.patches < PATCHES * PATCHES && st.progress < 45) setPhase(PHASE.ENTERING, 5 + Math.round((st.patches / (PATCHES * PATCHES)) * 40), "recibiendo el terreno…");
     mirarListo();
@@ -537,10 +550,28 @@ export function createLldpGateway(opts = {}) {
     }
     if (!st.udp) { fallo("no hay transporte UDP hacia el simulador", true); return; }
 
+    // Relogin: si ya habia un circuito (el visor se reengancho despues de perder
+    // el enlace), se cierra antes de abrir otro. Dejarlo vivo significaba dos
+    // circuitos latiendo a la vez: poses y peticiones duplicadas al simulador.
+    if (st.circuit) {
+      st.relogins++;
+      cerrandoPorRelogin = true;
+      try { st.circuit.close("nueva sesion del visor"); } catch (e) { /* noop */ }
+      cerrandoPorRelogin = false;
+      st.circuit = null;
+      st.ready = false;
+      st.avisoSilencio = false;
+      st.sinSimAvisado = false;
+      log("gateway: el visor se vuelve a presentar (relogin " + st.relogins + ")");
+    }
+
     st.circuit = createCircuit({ udp: st.udp, templates, log, now });
     st.circuit.on("message", onSimMessage);
     st.circuit.on("close", (razon) => {
       if (st.stopped) return;
+      // Un cierre pedido por nosotros mismos (relogin) no es una caida: la fase
+      // no se toca, que el relogin ya la esta llevando.
+      if (cerrandoPorRelogin) return;
       st.ready = false;
       setPhase(PHASE.DISCONNECTED, 0, "el simulador ha cerrado el circuito" + (razon ? ": " + razon : ""));
     });
@@ -727,6 +758,8 @@ export function createLldpGateway(opts = {}) {
 
   function onSimMessage(msg) {
     if (!msg || !msg.name) return;
+    st.simPackets++;
+    st.avisoSilencio = false;
     st.lastSimAt = now();
     st.lastMessageAt = st.lastSimAt;
     st.messages[msg.name] = (st.messages[msg.name] || 0) + 1;
@@ -843,8 +876,20 @@ export function createLldpGateway(opts = {}) {
     const conTerreno = st.patches >= 256 || (st.terrainAt && t - st.terrainAt > GRACE_TERRAIN_MS);
     const conMovimiento = !!st.movementAt;
     if (!conMovimiento) {
-      // Sin AgentMovementComplete (region rara) se entra igual pasado un rato.
+      // Sin AgentMovementComplete (region rara) se entra igual pasado un rato,
+      // pero SOLO si el simulador ha dado senal de vida. Declarar "en la region"
+      // con el mundo vacio y sin un solo paquete del simulador era mentir al
+      // usuario (y hacia que un circuito muerto pareciera una sesion normal).
       if (t - st.startedAt > READY_TIMEOUT_MS) {
+        if (!st.simPackets) {
+          if (!st.sinSimAvisado && t - st.startedAt > READY_TIMEOUT_MS + 5000) {
+            st.sinSimAvisado = true;
+            fallo("el simulador no ha enviado un solo paquete desde que se abrio el circuito " +
+              "(¿puerto UDP bloqueado, o el puente no llega al simulador?)", false);
+            setPhase(PHASE.ENTERING, 5, "el simulador no responde");
+          }
+          return;
+        }
         st.ready = true;
         send(S.OBJECTS_END, (w) => w.putU32(st.objects));
         setPhase(PHASE.READY, 100, "en la region");
@@ -1035,6 +1080,19 @@ export function createLldpGateway(opts = {}) {
         if (t - st.lastPoseAt >= 1000 / POSE_HZ) mandaPose();
       }
     }
+    // Un circuito del que no se sabe nada en SIM_SILENCIO_MS esta muerto casi
+    // seguro: el simulador de Second Life manda StartPingCheck cada pocos
+    // segundos. Antes esto se quedaba en silencio (el visor parecia vivo pero
+    // no lo estaba) y el usuario no tenia forma de saberlo.
+    if (st.ready && st.circuit && !st.avisoSilencio) {
+      const t = now();
+      const ultimo = Math.max(st.lastSimAt || 0, st.startedAt || 0);
+      if (ultimo && t - ultimo > SIM_SILENCIO_MS) {
+        st.avisoSilencio = true;
+        fallo("el simulador lleva " + Math.round((t - ultimo) / 1000) +
+          " s sin decir nada: puede que el circuito haya caducado. Sal y vuelve a entrar.", false);
+      }
+    }
     mirarListo();
   }
 
@@ -1101,13 +1159,25 @@ export function createLldpGateway(opts = {}) {
     get objects() { return objetosVistos; },
     terrrenoGrid: () => grid,
     resumen() {
+      const b = st.bridge ? st.bridge.state : null;
       return {
         phase: st.phase, ready: st.ready, region: st.region && st.region.name,
         patches: st.patches, objects: st.objects, avatars: st.avatars, chats: st.chats,
         touches: st.touches, agentUpdates: st.agentUpdates, spawn: st.spawn,
+        simPackets: st.simPackets, relogins: st.relogins,
         circuit: st.circuit ? {
           packetsIn: st.circuit.state.packetsIn, packetsOut: st.circuit.state.packetsOut,
           rtt: st.circuit.state.rtt, resends: st.circuit.state.resends,
+          silencioMs: Math.round(st.circuit.silentMs || 0),
+        } : null,
+        // El puente UDP nativo (la app Android): si arranco, a que puerto local,
+        // hacia donde, y cuantos datagramas han ido y vuelto. Sin esto, un
+        // "no pasa nada" en el movil no se puede distinguir de un puerto cerrado.
+        puente: b ? {
+          enlace: b.link, listo: !!b.ready, error: b.error || null,
+          host: b.host, puerto: b.port, puertoLocal: b.localPort,
+          datagramasIn: b.packetsIn, datagramasOut: b.packetsOut,
+          kbIn: Math.round(b.bytesIn / 1024), kbOut: Math.round(b.bytesOut / 1024),
         } : null,
       };
     },
@@ -1426,4 +1496,113 @@ function esperar(cond, ms) {
     };
     tick();
   });
+}
+
+// ---------------------------------------------------------------------------
+// Autotest de la guardia (con reloj de mentira)
+// ---------------------------------------------------------------------------
+// Lo que se prueba aqui no se puede probar con relojes de verdad sin esperar
+// minutos. Son los tres fallos que dejaban al usuario del movil con un visor
+// "vivo" que no lo estaba:
+//   * un simulador SORDO no puede acabar en "en la region" (mentira),
+//   * su silencio, una vez dentro, hay que avisarlo,
+//   * y volver a presentarse (relogin) tiene que cerrar el circuito viejo y
+//     mandar un UseCircuitCode nuevo, en vez de dejar dos circuitos latiendo.
+// El transporte UDP es de mentira (guarda lo que sale y no contesta), y el
+// reloj tambien: `opts.now` lo inyecta el gateway en el circuito.
+
+export function runGatewayGuardiaSelfTest() {
+  const checks = [];
+  const ok = (name, cond, got) => checks.push({ name, ok: !!cond, got });
+  const eq = (name, got, want) => checks.push({ name, ok: JSON.stringify(got) === JSON.stringify(want), got, want });
+
+  const templates = defaultTemplates();
+  let reloj = 100000;
+  const vaAlSim = [];
+  const udp = {
+    setHandler: () => {},
+    send: (b) => vaAlSim.push(b instanceof Uint8Array ? b : new Uint8Array(b)),
+    close: () => {},
+  };
+
+  const gateway = createLldpGateway({
+    udp, mock: false, auto: false, now: () => reloj,
+    credentials: { agentId: "66666666-7777-8888-9999-aaaaaaaaaaaa", sessionId: "11111111-2222-3333-4444-555555555555", circuitCode: 0x77, regionX: 1000, regionY: 1000 },
+    log: () => {},
+  });
+
+  // Extremo de mentira del visor: guarda las tramas que le manda el gateway.
+  const alVisor = [];
+  let escucha = null;
+  const extremo = {
+    readyState: 1,
+    addEventListener(t, fn) { if (t === "message") escucha = fn; },
+    removeEventListener() { escucha = null; },
+    send(bytes) { alVisor.push(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)); },
+    close() {}, emit() {},
+  };
+  gateway.attach(extremo);
+  const entregar = (u8) => escucha({ data: u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) });
+  const tramas = () => alVisor.map((f) => decode(f).type);
+  const ultimoPaquete = () => decodePacket(vaAlSim[vaAlSim.length - 1], templates).name;
+
+  // 1. El saludo.
+  entregar(encodeJson(C.HELLO, { protocol: PROTOCOL, client: "prueba" }));
+  ok("guardia: el saludo se contesta con WELCOME", tramas().includes(S.WELCOME), tramas());
+
+  // 2. El login abre el circuito y manda el UseCircuitCode.
+  entregar(encodeJson(C.LOGIN, {}));
+  ok("guardia: el login abre el circuito", !!gateway.state.circuit);
+  eq("guardia: y manda UseCircuitCode", vaAlSim.length ? ultimoPaquete() : null, "UseCircuitCode");
+
+  // 3. Simulador sordo: se pasa el plazo y NO puede decir que esta en la region.
+  vaAlSim.length = 0;
+  reloj += READY_TIMEOUT_MS + 6000;
+  gateway.update();
+  eq("guardia: un simulador sordo no entra en la region", gateway.state.ready, false);
+  ok("guardia: se avisa de que no ha mandado nada",
+    tramas().includes(S.ERROR) && /no ha enviado un solo paquete/.test(textoDeError(alVisor)), textoDeError(alVisor));
+  ok("guardia: y no se pierde ni un paquete del simulador", gateway.state.simPackets === 0, gateway.state.simPackets);
+
+  // 4. Dentro y en silencio: se avisa del circuito que probablemente caduco.
+  gateway.state.ready = true;
+  alVisor.length = 0;
+  reloj += SIM_SILENCIO_MS + 2000;
+  gateway.update();
+  ok("guardia: el silencio estando dentro se avisa",
+    tramas().includes(S.ERROR) && /sin decir nada/.test(textoDeError(alVisor)), textoDeError(alVisor));
+
+  // ...y un paquete del simulador borra el aviso (si vuelve a hablar, volvera a contar).
+  gateway.onSimMessage({ name: "StartPingCheck" });
+  ok("guardia: un paquete del simulador borra el aviso", gateway.state.avisoSilencio === false && gateway.state.simPackets === 1,
+    gateway.state.avisoSilencio + "/" + gateway.state.simPackets);
+
+  // 5. Relogin: el visor se vuelve a presentar.
+  const circuitoViejo = gateway.state.circuit;
+  vaAlSim.length = 0;
+  alVisor.length = 0;
+  reloj += 1000;
+  entregar(encodeJson(C.LOGIN, {}));
+  ok("guardia: el relogin cuenta", gateway.state.relogins === 1, gateway.state.relogins);
+  ok("guardia: y cambia el circuito", gateway.state.circuit !== circuitoViejo, !!gateway.state.circuit);
+  ok("guardia: el circuito viejo se cierra", circuitoViejo.state.dead === true, circuitoViejo.state.dead);
+  eq("guardia: y el nuevo manda su UseCircuitCode", vaAlSim.length ? ultimoPaquete() : null, "UseCircuitCode");
+  ok("guardia: sin decir que el simulador cerro nada",
+    !tramas().includes(S.ERROR), tramas());
+
+  gateway.stop();
+  gateway.state.stopped = true;
+
+  const failed = checks.filter((c) => !c.ok);
+  return { checks: checks.length, passed: checks.length - failed.length, fails: failed };
+}
+
+// Saca el texto del ultimo S.ERROR que el gateway mando al visor.
+function textoDeError(alVisor) {
+  for (let i = alVisor.length - 1; i >= 0; i--) {
+    const f = decode(alVisor[i]);
+    if (f.type !== S.ERROR) continue;
+    try { f.r.getU8(); f.r.getStr(); return f.r.getStr(); } catch (e) { return ""; }
+  }
+  return "";
 }

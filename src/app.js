@@ -40,13 +40,24 @@ diag.registerState("visor", () => ({
 }));
 diag.registerState("sesión", () => {
   if (!session) return { estado: net ? "multijugador perchance" : "sin sesión" };
-  const st = session.state || {};
+  const st = session.stats ? session.stats() : {};
   return {
-    estado: st.status || st.state || "?",
+    estado: st.text || "?",
+    enlace: st.link, fase: st.phase, listo: !!st.ready,
     region: st.region ? st.region.name : null,
     simulador: !!session.mock,
+    prims: st.objects, parches: st.patches, avatares: st.avatars,
+    kbIn: st.kbIn, kbOut: st.kbOut,
+    // Parones del navegador (pestana de fondo / WebView congelado): explican
+    // los tirones y, antes, el falso "enlace cerrado (1000)".
+    parones: st.linkPauses, paronMasLargoMs: st.linkPauseMs,
+    error: st.error || null,
     jugadores: peers && peers.count ? peers.count() : null,
   };
+});
+diag.registerState("LLUDP", () => {
+  if (!lldpRelay || !lldpRelay.gateway) return null;
+  try { return lldpRelay.gateway.resumen(); } catch (e) { return { error: String((e && e.message) || e) }; }
 });
 diag.registerState("render", () => {
   if (!mount || !mount.quality) return null;

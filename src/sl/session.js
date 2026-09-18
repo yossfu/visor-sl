@@ -78,6 +78,7 @@ export function createSession(opts = {}) {
     expected: 0, patches: 0, objects: 0, avatars: 0, assets: 0, chats: 0,
     poseSent: 0, interacts: 0, teleports: 0,
     kbIn: 0, kbOut: 0, pingMs: 0, simFps: 0, agents: 0, parcel: null,
+    linkPauses: 0, linkPauseMs: 0,
     info: null, caps: null, inventory: null, spawn: spawn || null,
     mockLabel: null, mockServer: null, textures: 0, missing: 0, elapsed: 0,
   };
@@ -111,6 +112,11 @@ export function createSession(opts = {}) {
     state.pingMs = rs.rtt || 0;
     state.kbIn = Math.round(rs.bytesIn / 1024);
     state.kbOut = Math.round(rs.bytesOut / 1024);
+    // Cuantas veces el navegador dejo la pagina parada (pestana de fondo,
+    // WebView congelado) y cuanto duro el paron mas largo. No es un error del
+    // enlace, pero explica los tirones y viaja en el informe de diagnostico.
+    state.linkPauses = rs.frozenTicks || 0;
+    state.linkPauseMs = rs.lastPauseMs || 0;
   }
 
   function setPhase(p, progress, text) {
@@ -134,6 +140,16 @@ export function createSession(opts = {}) {
   // anterior a ENTERING: el retransmisor recibia un LOGIN detras de otro y
   // contestaba mandando la region entera otra vez (terreno sin fin).
   let loginSent = false;
+
+  // El enlace se cayo estando ya dentro de la region. Al volver hay que
+  // presentarse otra vez (el retransmisor empieza de cero con cada enlace) y no
+  // basta con esperar: sin esto la sesion se quedaba con el mundo en pantalla
+  // pero muerta (fase DISCONNECTED, sin poses ni chat) para siempre.
+  let relinkPending = false;
+
+  // El retransmisor manda OBJECTS_END justo cuando da la region por lista. Vale
+  // como "ya se puede entrar" aunque la fase se haya quedado atras.
+  let finDeObjetos = false;
 
   function sendLogin() {
     if (!pending || !relay || loginSent) return;
@@ -396,6 +412,7 @@ export function createSession(opts = {}) {
       }
       case S.OBJECTS_END:
         state.expected = r.getU32() || state.expected;
+        finDeObjetos = true;
         break;
       case S.OBJECT_UPDATE: {
         const uuid = r.getUuid();
@@ -482,18 +499,35 @@ export function createSession(opts = {}) {
     state.link = s.link;
     if (s.region) state.region = s.region;
     if (s.phase !== undefined && s.phase !== state.phase) setPhase(s.phase, s.progress, s.text);
-    if (s.link === "ready" && !state.ready && state.phase < PHASE.ENTERING) {
-      // Enlace listo: ahora las credenciales.
-      setPhase(PHASE.LOGIN_REQUEST, 1, "iniciando sesion…");
-      sendLogin();
+    if (s.link === "ready" && !state.ready) {
+      if (state.phase < PHASE.ENTERING) {
+        // Enlace listo: ahora las credenciales.
+        setPhase(PHASE.LOGIN_REQUEST, 1, "iniciando sesion…");
+        sendLogin();
+      } else if (relinkPending) {
+        // El enlace volvio despues de caerse estando dentro: hay que volver a
+        // presentarse. `loginSent` se pone a false para que el login salga.
+        relinkPending = false;
+        loginSent = false;
+        onLog("El enlace ha vuelto: recuperando la sesion con el retransmisor…", "warn");
+        setPhase(PHASE.LOGIN_REQUEST, 1, "recuperando el enlace…");
+        sendLogin();
+      }
     }
     if (s.link === "closed" || s.link === "idle") {
-      // Enlace perdido: cuando vuelva, hay que volver a presentarse.
+      // Enlace perdido: cuando vuelva, hay que volver a presentarse. Da igual si
+      // el enlace se cayo estando ya dentro o a mitad de entrar: el relogin
+      // reabre el circuito con el retransmisor y sigue donde estaba.
+      const habiaPedido = loginSent || state.phase >= PHASE.LOGIN_REQUEST;
       loginSent = false;
       if (state.ready) {
         state.ready = false;
-        state.error = "se ha perdido el enlace con el retransmisor";
+        relinkPending = true;
+        const causa = state.error ? " (" + state.error + ")" : "";
+        state.error = "se ha perdido el enlace con el retransmisor" + causa + "; el visor intentara recuperarlo solo";
         onLog(state.error, "warn");
+      } else if (habiaPedido) {
+        relinkPending = true;
       }
     }
     onStatus(state);
@@ -503,6 +537,7 @@ export function createSession(opts = {}) {
   function becomeReady() {
     if (state.ready) return;
     state.ready = true;
+    state.error = null;
     welcome();
     onReady(state);
     onLog("En la region «" + ((state.region && state.region.name) || "?") + "».", "region");
@@ -701,7 +736,11 @@ export function createSession(opts = {}) {
     // Se entra cuando el rele dice READY *y* ya se ha vaciado lo que venia en
     // camino: si se entra antes, el avatar aparece sobre un mundo a medias y se
     // cae al vacio mientras el terreno sigue llegando.
-    if (!state.ready && state.phase === PHASE.READY && state.link === "ready" && !tq.length && !oq.length) becomeReady();
+    // El `finDeObjetos` es la red de seguridad: el retransmisor solo manda
+    // OBJECTS_END cuando da la region por lista, asi que aunque un anuncio de
+    // progreso llegue tarde y baje la fase, el visor no se queda fuera.
+    if (!state.ready && state.link === "ready" && !tq.length && !oq.length &&
+        (state.phase === PHASE.READY || (finDeObjetos && state.phase >= PHASE.ENTERING))) becomeReady();
   }
 
   function dispose() {
@@ -738,6 +777,7 @@ export function createSession(opts = {}) {
       assets: state.assets, chats: state.chats, poseSent: state.poseSent,
       interacts: state.interacts, kbIn: state.kbIn, kbOut: state.kbOut,
       pingMs: state.pingMs, simFps: state.simFps, agents: state.agents,
+      linkPauses: state.linkPauses || 0, linkPauseMs: state.linkPauseMs || 0,
       parcel: state.parcel, missing: state.missing,
       pending: { terrain: tq.length, objects: oq.length, assets: aq.length },
       peers: peers ? peers.count() : 0,
