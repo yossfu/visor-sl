@@ -69,17 +69,42 @@ export function makeId0(seed) {
 
 // --- nombre -----------------------------------------------------------------
 //
-// SL acepta "nombre apellido" o el nombre de usuario moderno ("steller.sunshine").
-// Devuelve siempre { firstName, lastName }.
+// El login de Linden Lab solo entiende DOS campos, `first` y `last`, y los dos
+// tienen que ser alfanumericos (nada de puntos, guiones, tildes ni espacios). En
+// cambio, el usuario puede escribir su cuenta de tres maneras distintas:
+//
+//   "Steller Sunshine"  -> cuenta antigua: first="Steller",  last="Sunshine"
+//   "steller.sunshine"  -> usuario moderno con punto: se parte igual (el punto
+//                          NO puede viajar en `first`)
+//   "bobsmith12"        -> usuario moderno de una sola palabra: first="bobsmith12",
+//                          last="Resident"
+//
+// Lo del apellido "Resident" no es un invento: es lo que responde el propio
+// Linden Lab para las cuentas modernas (el visor oficial lo trata como "sin
+// apellido", ver llstartup.cpp), y es lo que manda cualquier visor de terceros.
+// Si se manda `last` vacio, el servidor contesta:
+//   "last name parameter must be alphanumeric"
+// que es exactamente el fallo que veia el usuario con su usuario de una palabra.
+
+export const APELLIDO_MODERNO = "Resident";
 
 export function splitSlName(input) {
   const s = String(input || "").trim().replace(/\s+/g, " ");
   if (!s) return { firstName: "", lastName: "" };
   const sp = s.indexOf(" ");
-  if (sp > 0) return { firstName: s.slice(0, sp), lastName: s.slice(sp + 1) };
+  if (sp > 0) {
+    // Cuenta antigua: "Nombre Apellido".
+    return { firstName: s.slice(0, sp), lastName: s.slice(sp + 1) };
+  }
   const dot = s.indexOf(".");
-  if (dot > 0) return { firstName: s.slice(0, dot), lastName: s.slice(dot + 1).replace(/\./g, " ") };
-  return { firstName: s, lastName: "" };
+  if (dot > 0) {
+    // Usuario moderno con punto ("steller.sunshine"): el servidor no admite el
+    // punto en `first`, asi que se parte en los dos campos, como una cuenta
+    // antigua. Se quitan los puntos que pudieran sobrar del apellido.
+    return { firstName: s.slice(0, dot), lastName: s.slice(dot + 1).replace(/\./g, "") };
+  }
+  // Usuario moderno de una sola palabra: el apellido es "Resident".
+  return { firstName: s, lastName: APELLIDO_MODERNO };
 }
 
 // --- peticion ---------------------------------------------------------------
@@ -273,6 +298,14 @@ export const FAILURES = {
     title: "Respuesta ilegible del servidor",
     hint: "Llego algo que no es XML-RPC. Suele pasar cuando un proxy devuelve una pagina de error en vez de la respuesta de Linden Lab.",
   },
+  nombre: {
+    title: "Nombre de la cuenta mal escrito",
+    hint: "El nombre de la cuenta solo lleva letras y numeros: sin puntos, guiones, tildes ni espacios (salvo el espacio de las cuentas antiguas, «Nombre Apellido»). Para una cuenta nueva escribe solo tu nombre de usuario, por ejemplo bobsmith12.",
+  },
+  "viewer-data": {
+    title: "Linden Lab rechaza el formato del nombre",
+    hint: "Revisa como escribes la cuenta: los usuarios nuevos son una sola palabra (bobsmith12) o «nombre.apellido», y las cuentas antiguas se escriben «Nombre Apellido» (con espacio).",
+  },
 };
 
 export function describeFailure(reason, message) {
@@ -311,6 +344,12 @@ export async function login(opts, deps) {
 
   const nm = o.firstName !== undefined ? { firstName: o.firstName, lastName: o.lastName || "" } : splitSlName(o.name);
   if (!nm.firstName) return fail("key", "escribe tu nombre de Second Life");
+  // El servidor rechaza cualquier cosa que no sea letra o numero en `first` y
+  // `last` (y lo hace con un error en ingles poco claro). Mejor decirlo aqui,
+  // en castellano, antes de gastar la peticion.
+  if (!/^[A-Za-z0-9]+$/.test(nm.firstName) || !/^[A-Za-z0-9]+$/.test(nm.lastName)) {
+    return fail("nombre", "nombre: " + nm.firstName + " / apellido: " + nm.lastName);
+  }
   if (!o.password && !o.passwordHash) return fail("key", "escribe tu contrasena");
   if (!f) return fail("red", "no hay forma de hacer peticiones HTTP");
 
@@ -373,8 +412,8 @@ export async function login(opts, deps) {
     sessionId: str(reply, "session_id"),
     secureSessionId: str(reply, "secure_session_id"),
     firstName: str(reply, "first_name") || nm.firstName,
-    lastName: str(reply, "last_name") || nm.lastName,
-    displayName: ((str(reply, "first_name") || nm.firstName) + " " + (str(reply, "last_name") || nm.lastName)).trim(),
+    lastName: nombreReal(str(reply, "last_name") || nm.lastName),
+    displayName: nombreCompleto(str(reply, "first_name") || nm.firstName, str(reply, "last_name") || nm.lastName),
     circuitCode: num(reply, "circuit_code"),
     simIp: ipString(pick(reply, "sim_ip")),
     simPort: num(reply, "sim_port"),
@@ -401,6 +440,19 @@ export async function login(opts, deps) {
 
 function fail(reason, message) {
   return Object.assign({ ok: false }, describeFailure(reason, message));
+}
+
+// Las cuentas modernas (usuario de una sola palabra) llegan con
+// `last_name = "Resident"`: eso quiere decir "sin apellido", no que el residente
+// se apellide Resident. Se limpia tanto para el nombre que se muestra como para
+// el `lastName` que se guarda en la sesion.
+function nombreReal(apellido) {
+  const a = String(apellido || "").trim();
+  return a && a.toLowerCase() !== APELLIDO_MODERNO.toLowerCase() ? a : "";
+}
+
+function nombreCompleto(nombre, apellido) {
+  return (String(nombre || "") + " " + nombreReal(apellido)).trim();
 }
 
 // --- redireccion de la sesion al retransmisor -------------------------------
@@ -432,7 +484,8 @@ export function runLoginSelfTest() {
 
   eq("nombre: dos palabras", splitSlName("Steller Sunshine"), { firstName: "Steller", lastName: "Sunshine" });
   eq("nombre: con punto", splitSlName("steller.sunshine"), { firstName: "steller", lastName: "sunshine" });
-  eq("nombre: solo usuario", splitSlName("bobsmith12"), { firstName: "bobsmith12", lastName: "" });
+  eq("nombre: solo usuario", splitSlName("bobsmith12"), { firstName: "bobsmith12", lastName: "Resident" });
+  eq("nombre: mayusculas y espacios de sobra", splitSlName("  Steller   Sunshine "), { firstName: "Steller", lastName: "Sunshine" });
 
   eq("start_location: uri", parseStartLocation("uri:Umbral Infinito&128&64&25"), { kind: "uri", region: "Umbral Infinito", position: [128, 64, 25] });
   eq("start_location: last", parseStartLocation("last"), { kind: "last" });
@@ -448,6 +501,8 @@ export function runLoginSelfTest() {
   eq("peticion: metodo", /<methodName>login_to_simulator<\/methodName>/.test(body), true);
   eq("peticion: hash de la contrasena", body.indexOf("$1$" + md5Hex("secreta")) > 0, true);
   eq("peticion: sin la contrasena en claro", body.indexOf("secreta") < 0, true);
+  eq("peticion: apellido de usuario moderno",
+    /<name>last<\/name><value><string>Resident<\/string>/.test(buildLoginBody({ name: "bobsmith12", password: "x" })), true);
   eq("peticion: campos obligatorios", ["first", "last", "passwd", "start", "channel", "version", "platform", "mac", "id0", "agree_to_tos"].every((k) => body.indexOf("<name>" + k + "</name>") > 0), true);
   if (typeof DOMParser !== "undefined") {
     const doc = new DOMParser().parseFromString(body, "text/xml");

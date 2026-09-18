@@ -110,7 +110,7 @@ habla LLUDP con el simulador— sigue especificada, trama a trama, en
       - `src/sl/bin.js` — `Writer`/`Reader` little-endian (uuid = 16 bytes).
       - `src/sl/md5.js` — MD5 y `slPasswordHash` (`"$1$"` + MD5); 6/6.
       - `src/sl/llsd.js` — XML-RPC/LLSD y notación LLSD; 25/25.
-      - `src/sl/login.js` — login real vía `superFetch`; 21/21.
+      - `src/sl/login.js` — login real vía `superFetch`; 23/23.
       - `src/sl/relay.js` — protocolo (`C.*`/`S.*`) y transporte WebSocket;
         26/26.
       - `src/sl/mockServer.js` — retransmisor de pruebas (región inventada);
@@ -444,7 +444,15 @@ región de Second Life de verdad**. La pieza que no puede vivir en el navegador
   **puente de red** de `ViewerServer.kt`, `/proxy?url=…`, porque allí no hay
   servidor de perchance que haga de proxy — ver [`ANDROID.md`](ANDROID.md)). La contraseña nunca viaja en claro: se manda
   `"$1$" + MD5(contraseña)` (`src/sl/md5.js`), como cualquier visor, y no se
-  guarda en ningún sitio. La respuesta trae `agent_id`, `session_id`,
+  guarda en ningún sitio. El servidor solo acepta `first`/`last` alfanuméricos
+  (sin puntos, guiones ni tildes), así que `splitSlName()` traduce las tres
+  formas de escribir una cuenta: «Nombre Apellido» (antiguas) → `first`/`last`
+  por el espacio; «nombre.apellido» (modernas con punto) → igual, por el punto
+  (el punto no puede viajar en `first`); y el usuario de una sola palabra
+  («bobsmith12») → `first="bobsmith12"`, `last="Resident"` (el apellido centinela
+  que usa Linden Lab para las cuentas sin apellido; con `last` vacío el login
+  responde `last name parameter must be alphanumeric`).
+  La respuesta trae `agent_id`, `session_id`,
   `secure_session_id`, `circuit_code`, la región de destino y
   `seed_capability`; `relayCredentials()` extrae justo lo que necesita el
   retransmisor.
