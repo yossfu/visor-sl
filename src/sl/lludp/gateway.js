@@ -875,6 +875,17 @@ export function createLldpGateway(opts = {}) {
     const t = now();
     const conTerreno = st.patches >= 256 || (st.terrainAt && t - st.terrainAt > GRACE_TERRAIN_MS);
     const conMovimiento = !!st.movementAt;
+    // Sin circuito abierto no hay nada que esperar: el plazo de "el simulador no
+    // responde" solo cuenta desde que se le ha mandado el UseCircuitCode. Antes
+    // de eso `startedAt` vale 0, y como el visor puede llevar minutos abierto en
+    // la pantalla de inicio, la resta daba por hecho un silencio que nunca
+    // existio: el gateway se declaraba "el simulador no responde" (fase
+    // ENTERING) antes de haber intentado nada, y el visor, al ver la fase ya
+    // pasada de ENTERING, no mandaba el login siquiera (el informe del movil del
+    // 18-09-2026: circuito nulo, puente nulo, cero datagramas y "el simulador no
+    // ha enviado un solo paquete"). El circuito y `startedAt` se ponen juntos en
+    // `onLogin`, asi que esto es lo mismo que exigir que el login haya pasado.
+    if (!st.circuit || !st.startedAt) return;
     if (!conMovimiento) {
       // Sin AgentMovementComplete (region rara) se entra igual pasado un rato,
       // pero SOLO si el simulador ha dado senal de vida. Declarar "en la region"
@@ -1560,6 +1571,16 @@ export function runGatewayGuardiaSelfTest() {
   const entregar = (u8) => escucha({ data: u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) });
   const tramas = () => alVisor.map((f) => decode(f).type);
   const ultimoPaquete = () => decodePacket(vaAlSim[vaAlSim.length - 1], templates).name;
+
+  // 0. Antes del login no hay circuito: por mucho reloj que pase, el gateway no
+  //    puede acusar al simulador de no decir nada (todavia no le ha mandado un
+  //    solo datagrama). El visor de la app puede llevar minutos en la pantalla de
+  //    inicio con `startedAt` a 0, y esa resta era la que disparaba el aviso...
+  //    y con el aviso, la fase ENTERING que dejaba al visor sin mandar el login.
+  reloj += READY_TIMEOUT_MS * 3;
+  gateway.update();
+  ok("guardia: sin login no acusa al simulador", !tramas().includes(S.ERROR), tramas());
+  eq("guardia: y sigue en espera", gateway.state.phase, PHASE.IDLE);
 
   // 1. El saludo.
   entregar(encodeJson(C.HELLO, { protocol: PROTOCOL, client: "prueba" }));

@@ -372,12 +372,25 @@ de juego" en el README).
       en el mensaje de error de la sesión). Autotest 21/21 en `udp.js`. Versión de
       la app 0.1.1 y `DIAG_VERSION` 1.1, para que el próximo informe diga si la
       APK nueva es la que está corriendo. Falta compilar y probar en el móvil.
+- [x] **Tercer informe del móvil** (17:47, ya con la 0.1.1): salió el fallo de la
+      guardia «simulador sordo», que contaba el plazo desde `startedAt`, que vale
+      **0 hasta el `UseCircuitCode`**. Como el reloj es `performance.now()` y el
+      usuario había estado 21 s en la pantalla de inicio, la guardia disparó antes
+      del login, puso la fase en `ENTERING` y la sesión —que solo manda el login
+      con la fase anterior a `ENTERING`— **no pidió la región nunca** (`circuit:
+      null`, `puente: null`, `framesIn: 4` = saludo + 3 latidos, sin `LOGIN`).
+      Arreglado: la guardia no cuenta sin circuito (`gateway.js`) y la sesión
+      manda el login si no se ha mandado nunca (`session.js`). Autotest de la
+      guardia 15/15 (total 866). Reproducido en el editor con `?udp=sim` esperando
+      18,5 s antes de entrar. Versión de la app 0.1.2 y `DIAG_VERSION` 1.2, para que
+      el próximo informe confirme que corre el código nuevo. Falta compilar el APK
+      y probar en el móvil.
 
 ## Fase 12 — Núcleo LLUDP (mundo real)
 
 Todo el protocolo de Second Life en JavaScript (`src/sl/lludp/`), con el nativo
 reducido a mover datagramas. Ver "Modelo del núcleo LLUDP" en el README y
-`src/VIEWER-REAL.md`. **864 comprobaciones en verde (14 suites).**
+`src/VIEWER-REAL.md`. **866 comprobaciones en verde (14 suites).**
 
 - [x] Plantillas del protocolo (`templates.js`, 483 mensajes) y códec binario
       (`codec.js`), verificados contra datagramas REALES (`recapturas.js`) y

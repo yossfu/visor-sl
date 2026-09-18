@@ -140,7 +140,11 @@ function create(opts) {
     const opts = {
       credentials,
       regionName: (session && session.start && session.start.region) || "",
-      onLog: (t) => log(t),
+      // `log` y no `onLog`: el gateway apunta su traza por `opts.log`, y con el
+      // nombre viejo se tiraba entera (con ella, el puerto local del puente, la
+      // posicion de entrada o el resumen de la region: justo lo que hace falta
+      // para leer un informe del movil).
+      log: (t) => { try { log(t); } catch (e) { /* sin panel */ } },
     };
     if (puente === "sim") {
       const simMod = await import("./lludp/sim.js");

@@ -136,7 +136,7 @@ navegador es mover datagramas UDP: la trae la **app Android** (un puente tonto d
       - `src/sl/lludp/` — **el núcleo LLUDP** (Fase 10): plantillas del protocolo,
         códec binario, circuito UDP con acks/reenvíos/ping, terreno (DCT),
         objetos, avatares, el retransmisor `gateway.js` y un simulador de región
-        real (`sim.js`). 864 comprobaciones en verde (14 suites). Ver "Modelo del
+        real (`sim.js`). 866 comprobaciones en verde (14 suites). Ver "Modelo del
         núcleo LLUDP".
       - `src/sl/avatarLad.js` / `src/sl/avatarMesh.js` — forma real del avatar.
 - [x] `src/avatarRealBody.js` + `src/sl/slAppearance.js` + `src/sl/avatarLad.js` —
@@ -572,7 +572,7 @@ transporte es:
   datagrama, y una primera trama de texto `{"cmd":"connect","host":…,"port":…}`.
   Ahí sí se habla con un simulador de Second Life de verdad.
 
-Piezas (todas con autotest, **864 comprobaciones en verde** en 14 suites):
+Piezas (todas con autotest, **866 comprobaciones en verde** en 14 suites):
 
 - `templates.js` (68 KB, **483 mensajes** del protocolo), `template.js`
   (`TemplateSet`) y `codec.js` (bloques, compresión de ceros, uuids, utf8 fijo).
@@ -590,7 +590,8 @@ Piezas (todas con autotest, **864 comprobaciones en verde** en 14 suites):
   el estado de la sesión (fase, región, terreno, prims, residentes, chat).
   Su guardia (relogin que cierra el circuito viejo, «no está listo» si el
   simulador no ha mandado nada, aviso de circuito caducado, fase que no
-  retrocede) tiene autotest propio: `runGatewayGuardiaSelfTest` (13/13).
+  retrocede, **ni acusa al simulador antes de haberle mandado el login**) tiene
+  autotest propio: `runGatewayGuardiaSelfTest` (15/15).
 - `sim.js` — el simulador de región (72 prims de ejemplo, residentes, chat que
   responde, terreno, `RegionHandshake`, `SimStats`…).
 - `udp.js` — los transportes (par de pruebas en memoria y el puente WebSocket).
@@ -700,6 +701,47 @@ capability* y un decodificador J2C); los **bakes** (BoM) son J2C por lo mismo, a
 que se aplica la *forma* real pero no la textura cocida; y el teletransporte a
 **otra región** todavía no cambia de circuito (avisa claro y se vuelve a entrar
 desde la pantalla de inicio). Todo el detalle en [`VIEWER-REAL.md`](VIEWER-REAL.md).
+
+### El «el simulador no responde» llegaba antes del login (el fallo del 18-09-2026)
+
+El tercer informe del móvil (17:47, ya con la APK 0.1.1 y el socket sin atar al
+bucle) traía lo contrario de lo esperado: **ni un datagrama intentado**. El
+bloque `LLUDP` del informe decía `circuit: null`, `puente: null`,
+`simPackets: 0` y `kbOut: 0`; la sesión, fase 3 con el mensaje «el simulador no ha
+enviado un solo paquete desde que se abrió el circuito (¿puerto UDP bloqueado, o
+el puente no llega al simulador?)», y el registro nativo no tenía ni una línea de
+socket. Es decir: el circuito no se había abierto nunca, y el aviso hablaba de un
+circuito que no existía.
+
+Causa: la guardia «simulador sordo» de `gateway.js` contaba el plazo desde
+`st.startedAt`, que vale **0 hasta que se manda el `UseCircuitCode`**. El reloj
+del gateway es `performance.now()` (la vida de la página), y el usuario había
+estado **21 s en la pantalla de inicio** antes de pulsar «Entrar»; así que, en
+cuanto se montó el retransmisor, `t - 0` ya era mayor que el plazo y la guardia
+disparó en el primer tic, **antes del login**. El daño no se quedaba en un aviso
+de más: `fallo()` ponía la fase en `ENTERING`, esa fase llegaba al visor, y la
+sesión —que solo manda el login cuando la fase es anterior a `ENTERING`, para no
+repetirlo— **se quedaba sin pedir la región siquiera**. La prueba está en el
+propio informe: `framesIn: 4` (el saludo y tres latidos, uno cada 8 s) y el último
+trama del visor con tipo `0x08` (`PING`) — el `LOGIN` (`0x02`) no se mandó nunca.
+
+Arreglado en dos sitios (defensa en profundidad):
+
+- `gateway.js` (`mirarListo`): la guardia no cuenta nada **sin circuito abierto**
+  (`if (!st.circuit || !st.startedAt) return;`). El circuito y `startedAt` se
+  ponen juntos en `onLogin`, así que el plazo solo corre desde que se le ha
+  mandado el `UseCircuitCode` al simulador.
+- `session.js` (`onLinkState`): aunque llegue una fase de más, si el login **no se
+  ha mandado nunca** se manda igual (`state.phase < PHASE.ENTERING || (!loginSent
+  && !relinkPending)`), conservando el camino de `relinkPending` para que el
+  relogin siga contando lo que de verdad pasó.
+
+Autotest: `runGatewayGuardiaSelfTest` gana las dos comprobaciones que faltaban
+(con el reloj adelantado y sin login: no hay `ERROR` y la fase sigue en `IDLE`),
+15/15. Reproducido y verificado en el editor con `?udp=sim`: esperando 18,5 s en
+la pantalla de inicio (para que la página pase de los 17 s del plazo), la versión
+anterior se quedaba en fase 3 sin mandar el login, y con el arreglo entra en la
+región (256 parches, 71 prims, 18 residentes).
 
 ## Modelo de la forma real del avatar (SL, Bento y BoM)
 

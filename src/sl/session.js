@@ -500,7 +500,13 @@ export function createSession(opts = {}) {
     if (s.region) state.region = s.region;
     if (s.phase !== undefined && s.phase !== state.phase) setPhase(s.phase, s.progress, s.text);
     if (s.link === "ready" && !state.ready) {
-      if (state.phase < PHASE.ENTERING) {
+      // El login no se manda si la fase dice que ya se ha pasado de ENTERING...
+      // salvo que no se haya mandado NUNCA: eso solo puede ser una fase de mas
+      // (el retransmisor contando un plazo que no ha corrido) y darla por buena
+      // dejaba la sesion sin pedir la region siquiera, con el enlace listo. El
+      // camino de `relinkPending` se conserva tal cual para que el relogin siga
+      // contando lo que de verdad paso.
+      if (state.phase < PHASE.ENTERING || (!loginSent && !relinkPending)) {
         // Enlace listo: ahora las credenciales.
         setPhase(PHASE.LOGIN_REQUEST, 1, "iniciando sesion…");
         sendLogin();

@@ -43,7 +43,7 @@
     android: true,
     relayUrl: relayUrl,
     udpUrl: udpUrl,
-    version: "0.1.1",
+    version: "0.1.2",
   };
 
   // -------------------------------------------------------- vigia de arranque

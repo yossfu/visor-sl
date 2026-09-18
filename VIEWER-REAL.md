@@ -339,14 +339,15 @@ Tres caminos, de menos a más real:
 | `src/sl/login.js` | `runLoginSelfTest()` | 15/15 |
 | `src/sl/relay.js` | `runRelaySelfTest()` | 36/36 |
 | `src/sl/mockServer.js` | `runMockSelfTest()` | 19/19 |
-| `src/sl/lludp/*` | (14 suites, ver `scratch/lludp-runner.js`) | **864/864** |
+| `src/sl/lludp/*` | (14 suites, ver `scratch/lludp-runner.js`) | **866/866** |
 
 El núcleo LLUDP se prueba entero sin navegador ni red: plantillas y códec,
 circuito (acks, reenvíos, ping), terreno, objetos, avatares, el gateway real
 (`runGatewaySelfTest`, 40/40) y su guardia de reconexión
-(`runGatewayGuardiaSelfTest`, 13/13: relogin que cierra el circuito viejo, no
-declararse «listo» sin paquetes del simulador, aviso de circuito caducado), el
-puente UDP y el simulador de región.
+(`runGatewayGuardiaSelfTest`, 15/15: relogin que cierra el circuito viejo, no
+declararse «listo» sin paquetes del simulador, aviso de circuito caducado, y no
+acusar al simulador antes de haberle mandado el login), el puente UDP y el
+simulador de región.
 
 La sesión contra `sim.js` se verificó en el editor: entra en la región en ~2 s,
 recibe 256 parches de terreno, decenas de prims y 18 residentes, y el chat, el
