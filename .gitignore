@@ -1,0 +1,17 @@
+# Se coloca como `.gitignore` en la raiz del repositorio (se renombra al armar
+# el repo: la carpeta `src/` del proyecto perchance no admite nombres con punto).
+#
+# Lo que se ignora es todo lo que Gradle genera o guarda de la maquina local.
+# El APK compilado no se sube al repositorio: lo produce GitHub al compilar.
+
+.gradle/
+build/
+app/build/
+app/src/main/assets/viewer/
+local.properties
+*.iml
+.idea/
+.cxx/
+captures/
+*.apk
+*.keystore
