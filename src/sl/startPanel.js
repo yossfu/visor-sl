@@ -168,10 +168,13 @@ function create(opts) {
     setBusy(false);
     const title = (result && result.title) || "No se pudo iniciar sesion";
     const hint = (result && result.hint) || "";
+    const detalle = (result && result.message) || "";
     log(title + (hint ? " — " + hint : ""), "err");
-    if (result && result.message) log(result.message, "err");
+    if (detalle) log(detalle, "err");
     status(title);
-    notice(title + (hint ? " " + hint : ""));
+    // El detalle tambien va a la vista (y no solo al registro): en el movil el
+    // registro no se lee comodo, y sin el, un "Failed to fetch" no explica nada.
+    notice(title + (hint ? " " + hint : "") + (detalle ? " — " + detalle : ""));
   }
 
   // Comprueba que hay retransmisor antes de gastar un login. Devuelve false si

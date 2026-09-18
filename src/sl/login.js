@@ -267,7 +267,7 @@ export const FAILURES = {
   unknown: { title: "No se pudo iniciar sesion", hint: "Vuelve a intentarlo." },
   red: {
     title: "Sin contacto con el servidor de login",
-    hint: "Puede ser la red, o el proxy. Comprueba la conexion y vuelve a intentarlo.",
+    hint: "Puede ser la red o la salida a internet (el proxy de perchance, o el puente de la app). Comprueba la conexion y vuelve a intentarlo.",
   },
   formato: {
     title: "Respuesta ilegible del servidor",
@@ -328,7 +328,12 @@ export async function login(opts, deps) {
   }
 
   if (!res || (res.status && res.status >= 400)) {
-    const r = describeFailure("red", "HTTP " + (res && res.status));
+    // El cuerpo del error trae la explicacion de verdad: el puente de la app (en
+    // Android) o el proxy de perchance escriben ahi lo que ha fallado, y sin
+    // esto solo se veria un "HTTP 502" que no dice nada.
+    let detalle = "";
+    try { detalle = String(await res.text()).trim().slice(0, 300); } catch (e) { detalle = ""; }
+    const r = describeFailure("red", "HTTP " + (res && res.status) + (detalle ? " — " + detalle : ""));
     return Object.assign({ ok: false }, r);
   }
 

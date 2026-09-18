@@ -139,6 +139,7 @@ app/src/main/
   java/org/visor/sl/
     MainActivity.kt           <- la WebView, el arranque y el ciclo de vida
     ViewerServer.kt           <- sirve los assets por http://127.0.0.1
+                                 (y el puente de red /proxy?url=... de env.js)
     RelayServer.kt            <- enlace WebSocket interno con el visor
     FrameCodec.kt             <- el formato binario de los mensajes del enlace
     VisorDiag.kt              <- depuracion e informes (window.VisorDiag)

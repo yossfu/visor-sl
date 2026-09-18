@@ -108,6 +108,15 @@ Tres detalles técnicos que importan:
 2. **El WebSocket es `127.0.0.1`**, así que no necesita `wss://` ni certificados.
 3. **Un solo permiso**: `INTERNET` (y el socket UDP no pide permisos extra en
    Android).
+4. **La salida a internet pasa por un puente** (`/proxy?url=…` en
+   `ViewerServer.kt`). El WebView aplica CORS igual que Chrome y los servidores
+   de Second Life no mandan cabeceras CORS: un `fetch` directo a
+   `login.agni.lindenlab.com` responde bien a curl pero el navegador descarta la
+   respuesta, y el visor solo ve un «Failed to fetch». El puente se pide a un
+   camino del **mismo origen** que la página y la petición de verdad la hace
+   Kotlin, que no está sujeto a CORS. Es el equivalente local de `superFetch`:
+   `env.js` enruta por ahí todo lo que sale del aparato y deja directo lo de casa
+   (los `src/`, `character/`, el enlace con el núcleo nativo).
 
 El visor JS detecta que corre dentro de la app (`env.js` deja `window.__SL_APP__`
 y rellena `window.root`) y se conecta solo a `ws://127.0.0.1:PORT`, sin pantalla

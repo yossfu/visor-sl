@@ -11,9 +11,11 @@
 //   * `root.kv`            -> IndexedDB del WebView (mismo formato de carpetas
 //                             que el plugin `kv`), para que el autoguardado de
 //                             la region, el inventario y el aspecto funcionen.
-//   * `root.superFetch`    -> `fetch` normal (la app no atraviesa CORS: si el
-//                             visor necesita pedir algo, se le da una direccion
-//                             que el WebView ya pueda pedir).
+//   * `root.superFetch`    -> el puente de red de la app (`/proxy?url=...`,
+//                             ver `ViewerServer.kt`). El WebView aplica CORS
+//                             igual que Chrome y los servidores de Second Life
+//                             no mandan cabeceras CORS, asi que la peticion la
+//                             hace el lado nativo desde fuera del navegador.
 //   * `root.createServerSocket` -> NO se define: el multijugador de la app va
 //                             por dentro del enlace con el nucleo nativo
 //                             (`RelayServer`), no por el servidor de perchance.
@@ -393,8 +395,66 @@
   };
 
   // ---------------------------------------------------------------- root
+  // ------------------------------------------------------- el puente de red
+  // El WebView aplica CORS igual que Chrome: un `fetch` directo a
+  // `login.agni.lindenlab.com` muere con un "Failed to fetch" que no explica
+  // nada, porque Linden Lab no manda cabeceras CORS (y buena parte de los CDN
+  // de Second Life tampoco). Eso NO se arregla desde JavaScript.
+  //
+  // El nucleo nativo (`ViewerServer.kt`) expone `/proxy?url=...`: se pide a un
+  // camino del MISMO origen que esta pagina, asi que el navegador no tiene nada
+  // que comprobar, y la peticion de verdad la hace Kotlin, que no esta sujeto a
+  // CORS. Es el equivalente local del plugin `super-fetch` de perchance.
+  //
+  // Solo pasa por el puente lo que sale del aparato; lo de casa (los `src/`,
+  // `character/`, el retransmisor) se pide directamente, sin dar una vuelta.
+  var URL_DE_CASA = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?(\/|$)/i;
+
   function superFetch(url, opts) {
-    return fetch(url, opts);
+    var u = url === null || url === undefined ? "" : String(url);
+    if (/^https?:\/\//i.test(u) && !URL_DE_CASA.test(u)) {
+      return fetch("/proxy?url=" + encodeURIComponent(u), opts);
+    }
+    return fetch(u, opts);
+  }
+
+  // Una linea que se pueda LEER en el telefono: la consola del WebView no se ve
+  // (haría falta un cable y chrome://inspect), asi que se manda al registro
+  // nativo, que viaja dentro del informe (Ajustes -> Depuracion e informes).
+  function anotar(texto) {
+    try {
+      if (window.VisorDiag && typeof window.VisorDiag.logNativo === "function") {
+        window.VisorDiag.logNativo(texto);
+      }
+    } catch (e) { /* el puente es opcional */ }
+    try { if (typeof console !== "undefined" && console.log) console.log("[env] " + texto); } catch (e) { /* nada */ }
+  }
+
+  // ------------------------------------------------------- prueba de la salida
+  // Pide un recurso publico pequeno a traves del puente nada mas arrancar: deja
+  // escrito si el telefono tiene salida a internet y si el puente responde, que
+  // es justo lo que no se ve cuando el login falla con un "Failed to fetch".
+  function probarSalida() {
+    var destino = "https://login.agni.lindenlab.com/cgi-bin/login.cgi";
+    var t0 = Date.now();
+    var pedido;
+    try {
+      pedido = fetch("/proxy?url=" + encodeURIComponent(destino));
+    } catch (e) {
+      anotar("salida a internet: no se pudo pedir (" + (e && e.message ? e.message : e) + ")");
+      return;
+    }
+    pedido.then(function (r) {
+      return r.text().then(function (texto) {
+        if (r.status >= 500) {
+          anotar("salida a internet FALLIDA: el puente contesta HTTP " + r.status + " — " + String(texto).slice(0, 200));
+        } else {
+          anotar("salida a internet OK: HTTP " + r.status + " en " + (Date.now() - t0) + " ms (login.agni.lindenlab.com alcanzable)");
+        }
+      });
+    }).catch(function (e) {
+      anotar("salida a internet FALLIDA: " + (e && e.message ? e.message : e));
+    });
   }
 
   if (!window.root) {
@@ -433,6 +493,9 @@
   } else {
     if (!fillRelayField()) setTimeout(fillRelayField, 400);
   }
+
+  // La prueba de salida va en segundo plano: no retrasa el arranque.
+  setTimeout(probarSalida, 1500);
 
   console.log("[env] app Android lista. Enlace interno:", relayUrl || "(sin relay)");
 })();

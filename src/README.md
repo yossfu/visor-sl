@@ -440,7 +440,9 @@ región de Second Life de verdad**. La pieza que no puede vivir en el navegador
 
 - **`src/sl/login.js`** — login real: XML-RPC `login_to_simulator` a
   `login.agni.lindenlab.com` (o aditi) a través de `superFetch` (el servidor de
-  Linden Lab no manda CORS). La contraseña nunca viaja en claro: se manda
+  Linden Lab no manda CORS; dentro de la app Android esa salida la hace el
+  **puente de red** de `ViewerServer.kt`, `/proxy?url=…`, porque allí no hay
+  servidor de perchance que haga de proxy — ver [`ANDROID.md`](ANDROID.md)). La contraseña nunca viaja en claro: se manda
   `"$1$" + MD5(contraseña)` (`src/sl/md5.js`), como cualquier visor, y no se
   guarda en ningún sitio. La respuesta trae `agent_id`, `session_id`,
   `secure_session_id`, `circuit_code`, la región de destino y

@@ -109,11 +109,19 @@ visor devolvió un 404. Eso lo cuenta la parte nativa (`MainActivity.kt`,
 
 Así, cuando algo va mal en la app (no en el visor), el informe también lo cuenta.
 
+> La **consola del WebView no se ve en el teléfono** (haría falta un cable y
+> `chrome://inspect`), así que el visor puede escribir en este registro con
+> `VisorDiag.logNativo(texto)` — `env.js` lo usa, por ejemplo, para *probar la
+> salida a internet* al arrancar: pide un recurso público a través del puente de
+> red (`/proxy?url=…`) y deja en el registro si el teléfono llega o no, que es
+> justo el dato que falta cuando el login falla con un «Failed to fetch».
+
 ## 7. El puente `window.VisorDiag` (referencia)
 
 | Método (JS) | Qué hace |
 |---|---|
 | `ping()` | `true`: sirve para comprobar que el puente existe |
+| `logNativo(texto)` | una línea del visor en el **registro nativo** (y por tanto en el informe) |
 | `info()` | JSON con app/Android/SDK/modelo/fabricante/pantalla, la **carpeta de informes** y el **registro nativo** |
 | `saveReport(nombre, texto)` | escribe el informe y devuelve su ruta |
 | `shareReport(nombre, texto)` | escribe el informe y abre «Compartir» de Android |

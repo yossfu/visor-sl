@@ -338,7 +338,13 @@ export function createMeshGallery(container, opts = {}) {
   }
 
   async function fetchBytes(url) {
-    const res = await fetch(url);
+    // `root.superFetch` es el puente de red (el plugin de perchance, o el de la
+    // app Android): hace la peticion fuera del navegador. Sin el, una URL de
+    // otro dominio muere con "Failed to fetch" por CORS.
+    const sup = (typeof window !== "undefined" && window.root && typeof window.root.superFetch === "function")
+      ? window.root.superFetch
+      : null;
+    const res = await (sup ? sup(url) : fetch(url));
     if (!res.ok) throw new Error("HTTP " + res.status);
     return await res.arrayBuffer();
   }

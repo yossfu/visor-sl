@@ -23,6 +23,12 @@
 //   clearReports()         -> borra los informes guardados.
 //   toast(texto)           -> un aviso breve en pantalla.
 //   ping()                 -> devuelve true: sirve para comprobar el puente.
+//   logNativo(texto)       -> una linea del visor en el registro NATIVO. La
+//                             consola del WebView no se ve en el telefono (haría
+//                             falta un cable y chrome://inspect), así que este
+//                             es el camino para que lo que el visor descubre de
+//                             la parte nativa (por ejemplo, si la salida a
+//                             internet funciona) acabe en el informe.
 //
 // El puente es OPCIONAL para el visor: `diag.js` lo detecta y, si no esta,
 // usa la descarga/copia del navegador. Aqui siempre esta.
@@ -95,6 +101,14 @@ class VisorDiagBridge(private val activity: Activity) {
 
     @JavascriptInterface
     fun ping(): Boolean = true
+
+    // Una linea del visor en el registro nativo (y por tanto en el informe).
+    // Sirve para lo que solo el visor sabe y solo el registro nativo enseña: la
+    // consola del WebView no es visible en el telefono.
+    @JavascriptInterface
+    fun logNativo(texto: String) {
+        VisorNativeLog.add("[visor] " + texto.take(400))
+    }
 
     // Datos que el visor mete en la cabecera del informe ("app nativa",
     // "dispositivo", "carpeta de informes", ...) y el registro nativo.
