@@ -204,6 +204,31 @@ editor de construcción abierto, `#gameUi` **baja a 10** para quedar por debajo 
 tapa sigue vivo. En horizontal (`max-height: 520px`) el carril se tumba encima
 del racimo de acciones y el chat se arrima a la izquierda para no meterse debajo.
 
+### El menú de rutas en el móvil
+
+La clase `body.touch` la pone **`src/app.js` al cargar** (`const TACTIL`), no
+`viewer.js` al montarse: la pantalla de entrada (`#sl`) no monta visor y se
+quedaba sin ella, así que dentro de la app Android salía la maqueta de
+escritorio. No basta con mirar `(pointer: coarse)` (algunos WebView no lo
+anuncian): también se cuenta `maxTouchPoints` + `(hover: none)` y, si está
+`window.__SL_APP__.android`, se da por hecho.
+
+En táctil, `<nav>` (que tiene id `#hudNavEl` precisamente por esto) **se mueve al
+`<body>`** desde `gameHUD.js` y pasa de ser una tira de enlaces siempre visible a
+un **cajón** que abre el botón `☰` (`#hudMenuBtn`) y cierra el telón
+`#hudMenuBackdrop` (z 41/42, por encima del carril y del mando). Se mueve al
+`<body>` porque los `.hud` llevan `backdrop-filter`, que crea su propio contexto
+de apilado: dentro de la barra el cajón quedaría **debajo** del minimapa y del
+carril. La posición vertical se mide al abrir (`#hudTopCtn` cambia de alto al
+plegarse la línea de datos).
+
+Los datos del visor van partidos en dos: `#viewStatEl` (dónde estás) y
+`#hudInfoEl` (velocidad, hora, prims, distancia, calidad). En el móvil la franja
+nace plegada y solo se ve la primera parte, de modo que el plegado sirve de algo.
+`#hudPerfEl` (ruta, tris, fps) se movió del alto a esa misma línea para dejar la
+barra limpia, junto con el botón Construir (que ya está en el carril) y la
+leyenda de teclas de Ajustes (`.gKeys`).
+
 ## Rutas de la app
 - `#primtest` — galería 3D orbitable de los 21 casos (7 formas + variantes).
 - `#primtest/hoja` — hoja de contactos cenital con etiquetas.
@@ -212,8 +237,10 @@ del racimo de acciones y el chat se arrima a la izquierda para no meterse debajo
 - `window.__app.mount.focusCase(i)` aísla por índice cualquier caso del catálogo;
   `window.__app.probe()` ejecuta la sonda de píxeles.
 - `#sl` — pantalla de arranque del visor real (Fase 8): modo de sesión, modo por
-  retransmisor y simulador de pruebas. La ruta por defecto sigue siendo
-  `#viewer`; se llega a `#sl` desde el enlace «Second Life» de la navegación.
+  retransmisor y simulador de pruebas. En el navegador la ruta por defecto es
+  `#viewer` y se llega a `#sl` desde el menú; en la **app Android** (`MainActivity`)
+  la app abre directamente `#sl`, que es donde está el formulario de entrada y
+  donde `env.js` deja ya relleno el retransmisor interno.
 - `#bodytest[/modo]` — el **avatar real** (cuerpo de sistema + texturas), con
   modos `quieto`, `cara`, `pose`, `correr`, `saludar`, `sentar`, `huesos`,
   `morph`, `falda`.

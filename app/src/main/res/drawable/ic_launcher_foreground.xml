@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Icono del lanzador: un "prim" (cubo) isometrico, el simbolo mas reconocible de
+  Second Life, sobre el azul oscuro de la app.
+
+  Este drawable es la CAPA DE ENCIMA del icono adaptativo (Android 8+). El
+  sistema recorta el icono con la forma que use el lanzador del movil (circulo,
+  cuadrado redondeado, gota...), asi que el cubo tiene que caber en la "zona
+  segura": el cuadrado central de 66x66 dentro de los 108x108 del lienzo. El
+  cubo ocupa de (30,31) a (78,77), dentro de esa zona.
+
+  El fondo (el azul) lo pone `@color/ic_launcher_background`, y para moviles
+  antiguos (Android 7 y anteriores, que no entienden iconos adaptativos) estan
+  los PNG de `mipmap-*/ic_launcher.png`, dibujados con la misma geometria y los
+  mismos colores que este archivo. Si tocas las coordenadas o los colores de
+  aqui, hay que volver a generar esos PNG (ver src/android/README.md).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Cara de arriba -->
+    <path android:pathData="M54,31 L78,43 L54,55 L30,43 Z"
+        android:strokeColor="#08101C"
+        android:strokeWidth="1.6"
+        android:strokeLineJoin="round">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="54" android:startY="31"
+                android:endX="54" android:endY="55">
+                <item android:offset="0" android:color="#C6F9FF" />
+                <item android:offset="1" android:color="#6FDAF8" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Cara de la izquierda -->
+    <path android:pathData="M30,43 L54,55 L54,77 L30,65 Z"
+        android:strokeColor="#08101C"
+        android:strokeWidth="1.6"
+        android:strokeLineJoin="round">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="30" android:startY="43"
+                android:endX="30" android:endY="65">
+                <item android:offset="0" android:color="#2AA0D8" />
+                <item android:offset="1" android:color="#125C8A" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Cara de la derecha -->
+    <path android:pathData="M78,43 L54,55 L54,77 L78,65 Z"
+        android:strokeColor="#08101C"
+        android:strokeWidth="1.6"
+        android:strokeLineJoin="round">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="78" android:startY="43"
+                android:endX="78" android:endY="65">
+                <item android:offset="0" android:color="#4FC9F2" />
+                <item android:offset="1" android:color="#2192C6" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

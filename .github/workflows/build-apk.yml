@@ -1,3 +1,14 @@
+# Este archivo se coloca en `.github/workflows/build-apk.yml` del repositorio.
+# GitHub solo compila si el archivo esta EXACTAMENTE en esa ruta y al principio
+# del arbol, por eso en el codigo fuente vive como `workflow-build-apk.yml`
+# (la carpeta `src/` del proyecto perchance no admite nombres que empiecen por
+# punto) y el script que arma el repositorio lo renombra.
+#
+# Resultado: cada vez que subes cambios, o cuando le das al boton "Run workflow"
+# en la pestana Actions, GitHub compila la app en sus servidores y deja un
+# archivo `visor-sl-apk` descargable. No hace falta Android Studio ni SDK en tu
+# ordenador: GitHub ya lo tiene todo puesto.
+
 name: Compilar APK
 
 on:
@@ -21,6 +32,10 @@ jobs:
       - name: Preparar el visor dentro de la app
         run: node build-viewer.mjs
 
+      # Mete DENTRO del APK el modelo real del cuerpo de sistema de Second Life
+      # (mallas avatar_*.llm + texturas base), que es lo que hace que el avatar
+      # se deforme igual que en SL. Si la descarga falla, el paso no rompe la
+      # compilacion: el visor los pedira por red en tiempo de ejecucion.
       - name: Incluir el modelo del avatar real (cuerpo de sistema)
         run: node fetch-character-assets.mjs
 

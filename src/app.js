@@ -64,6 +64,30 @@ const hudInfoEl = document.getElementById("hudInfoEl");
 const viewStatEl = document.getElementById("viewStatEl");
 const bootErrorEl = document.getElementById("bootErrorEl");
 const loadingEl = document.getElementById("loadingEl");
+
+// --- "esto es un telefono" ---------------------------------------------------
+// Se decide UNA vez, aqui, y no dentro del visor: antes la clase `touch` la
+// ponia `viewer.js` al montarse, asi que las pantallas que no montan visor
+// —sobre todo la de entrada (#sl), que es la que abre la app Android— se
+// quedaban sin ella y se pintaban con la maqueta de escritorio (etiquetas al
+// lado de los campos, botones diminutos, la barra de enlaces arriba). Toda la
+// hoja de estilo tactil cuelga de `body.touch`: sin ella, en el movil se ve la
+// interfaz de escritorio.
+//
+// No basta con `(pointer: coarse)`: algunos WebView no lo anuncian. Se mira
+// tambien si hay dedos (`maxTouchPoints`) y, si el visor corre dentro de la app
+// Android (`window.__SL_APP__`), se da por hecho.
+const TACTIL = (() => {
+  try {
+    if (window.__SL_APP__ && window.__SL_APP__.android) return true;
+    const mm = window.matchMedia ? window.matchMedia.bind(window) : null;
+    if (mm && mm("(pointer: coarse)").matches) return true;
+    if (navigator.maxTouchPoints > 0 && mm && mm("(hover: none)").matches) return true;
+  } catch (e) { /* sin matchMedia: se queda como escritorio */ }
+  return false;
+})();
+if (TACTIL) (document.body || document.documentElement).classList.add("touch");
+
 const navEls = {
   start: document.getElementById("navStartEl"),
   viewer: document.getElementById("navViewerEl"),
@@ -191,11 +215,18 @@ function paintViewerHud(v) {
   const hour = h.hour;
   const hh = Math.floor(hour);
   const mm = Math.floor((hour - hh) * 60);
+  // La linea de datos va partida en dos: lo esencial (donde estas) en
+  // `#viewStatEl`, y el resto en `#hudInfoEl`. En el telefono la franja nace
+  // plegada y solo se ve la primera parte, asi que el mundo respira y todo lo
+  // demas sigue a un toque.
   if (viewStatEl) {
     viewStatEl.innerHTML =
       "posición " + fmt(h.pos[0]) + ", " + fmt(h.pos[1]) + ", " + fmt(h.pos[2]) + " m" +
-      " &middot; región " + fmt(h.sl[0]) + " / " + fmt(h.sl[1]) + " / " + fmt(h.sl[2]) +
-      " &middot; " + h.mode + " (" + fmt(h.speed) + " m/s)" +
+      " &middot; región " + fmt(h.sl[0]) + " / " + fmt(h.sl[1]) + " / " + fmt(h.sl[2]);
+  }
+  if (hudInfoEl) {
+    hudInfoEl.innerHTML =
+      h.mode + " (" + fmt(h.speed) + " m/s)" +
       " &middot; hora " + String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0") +
       " &middot; " + h.objects + " prims" +
       (h.camMode === "free" ? " &middot; cámara libre" : " &middot; distancia " + fmt(h.camDist) + " m") +
@@ -223,6 +254,10 @@ function boot() {
     panel.show();
     document.body.dataset.ready = "1";
     if (loadingEl) loadingEl.hidden = true;
+    // En la app Android hay un vigia (src/android/env.js) que tapa la pantalla
+    // con un diagnostico si el visor no llega a arrancar. Aqui ya ha arrancado:
+    // se le dice para que se retire y no estorbe.
+    if (window.__visorListo) window.__visorListo();
     running = false;
     window.__app = {
       mount: null, route, rebuild: boot,
@@ -388,6 +423,7 @@ function boot() {
     return;
   }
   if (loadingEl) loadingEl.hidden = true;
+  if (window.__visorListo) window.__visorListo();
   window.__app = {
     mount, route, rebuild: boot,
     diag,
@@ -500,6 +536,10 @@ function frame(now) {
 
 function showError(msg) {
   diag.error("error", msg);
+  // En la app Android, si esto pasa durante el arranque, el vigia de
+  // src/android/env.js enseña el mensaje (y comprueba si faltan archivos). Si
+  // ya habia arrancado, el vigia se ignora solo y queda el aviso de siempre.
+  if (window.__visorFallo) window.__visorFallo(msg);
   if (!bootErrorEl) return;
   bootErrorEl.hidden = false;
   bootErrorEl.textContent = msg;

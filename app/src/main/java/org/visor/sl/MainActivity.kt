@@ -93,8 +93,13 @@ class MainActivity : Activity() {
             relay = r
 
             val relayUrl = "ws://127.0.0.1:" + relayPort
+            // `#sl` abre directamente la pantalla de entrada (nombre, contraseña
+            // y retransmisor), que es la pantalla natural de la app: es la unica
+            // forma de entrar en Second Life, y el retransmisor interno ya llega
+            // relleno. Sin el `#sl` el visor arrancaria en el mundo vacio y
+            // habria que buscar "Iniciar sesion" en la barra de arriba.
             val url = "http://127.0.0.1:" + v.port + "/index.html?relay=" +
-                URLEncoder.encode(relayUrl, "UTF-8")
+                URLEncoder.encode(relayUrl, "UTF-8") + "#sl"
             log("visor en " + url)
             runOnUiThread { webView?.loadUrl(url) }
         } catch (e: Exception) {

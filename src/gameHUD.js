@@ -728,7 +728,7 @@ export function createGameHUD(opts = {}) {
 
     const keySec = el("div", "gSec");
     keySec.appendChild(el("div", "gSecHead", "Controles"));
-    keySec.appendChild(el("div", "gLegend",
+    keySec.appendChild(el("div", "gLegend gKeys",
       "WASD andar · Mayús correr · Espacio saltar · C volar · E/Q subir y bajar · F cámara libre · " +
       "B construir · G rejilla · 1-4 hora · P pausa · H ocultar el HUD."));
     keySec.appendChild(el("div", "gLegend",
@@ -806,6 +806,46 @@ export function createGameHUD(opts = {}) {
     // El plegado cambia la altura de la barra, pero el navegador no ha vuelto a
     // medirla todavia: hay que esperar un fotograma o el minimapa salta.
     requestAnimationFrame(placeMini);
+  }
+
+  // --- menu de juego (solo tactil) ------------------------------------------
+  // En el telefono la tira de enlaces de la barra de arriba desaparece: era UI
+  // de escritorio plantada encima del mundo, con "Iniciar sesion" siempre a la
+  // vista. Aqui el MISMO <nav> se convierte en un cajon que abre el boton de la
+  // izquierda y se cierra al elegir destino o al tocar fuera.
+  //
+  // El nav y el telon se mueven al <body>: los `.hud` llevan `backdrop-filter`,
+  // que crea su propio contexto de apilado, y dentro de la barra el cajon
+  // quedaria por debajo del minimapa y el carril. En el <body> el telon tambien
+  // puede oscurecer el mando tactil entero.
+  const menuBtnEl = document.getElementById("hudMenuBtn");
+  const navEl = document.getElementById("hudNavEl");
+  const backdropEl = document.getElementById("hudMenuBackdrop");
+  if (document.body.classList.contains("touch") && menuBtnEl && navEl && backdropEl) {
+    if (navEl.parentNode !== document.body) document.body.appendChild(navEl);
+    if (backdropEl.parentNode !== document.body) document.body.appendChild(backdropEl);
+
+    const setMenu = (open) => {
+      const isOpen = !!open;
+      document.body.classList.toggle("menu-open", isOpen);
+      if (isOpen) {
+        // El cajon se cuelga justo debajo de la franja alta midiendola, en vez
+        // de a un `top` fijo: la barra cambia de alto al plegarse la linea de
+        // datos y con la escala de fuente del sistema.
+        const top = document.getElementById("hudTopCtn");
+        if (top) navEl.style.top = Math.round(top.getBoundingClientRect().bottom + 8) + "px";
+      }
+    };
+    on(menuBtnEl, "click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setMenu(!document.body.classList.contains("menu-open"));
+    });
+    on(backdropEl, "click", () => setMenu(false));
+    on(navEl, "click", (e) => { if (e.target && e.target.closest("a")) setMenu(false); });
+    window.addEventListener("hashchange", () => setMenu(false));
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") setMenu(false); });
+    setMenu(false);
   }
 
   // --- bucle ----------------------------------------------------------------

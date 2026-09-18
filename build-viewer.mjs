@@ -104,6 +104,79 @@ html = HEAD + html + '\n</body>\n</html>\n';
 fs.writeFileSync(indexPath, html, "utf8");
 console.log("parcheado app/src/main/assets/viewer/index.html (" + html.length + " bytes)");
 
+// --- 5. el visor tiene que estar COMPLETO ------------------------------------
+// El fallo mas caro (y mas invisible) de todo el montaje: subir al repositorio
+// solo PARTE de `src/`. Si falta un modulo cualquiera, el navegador no puede
+// cargar el `<script type="module">`, no arranca ni una linea de JavaScript y
+// la app se queda para siempre en "Preparando el mundo..." mostrando el HTML de
+// escritorio de fondo (barra de navegacion, atajos WASD, el chat suelto).
+// El APK compila igual: no hay error de Kotlin ni de Gradle. Solo se ve al
+// abrirlo en el movil.
+//
+// Por eso aqui se recorre el grafo de `import` RELATIVOS de todos los modulos
+// copiados y, si alguno apunta a un archivo que no esta, se aborta la
+// compilacion con la lista exacta de lo que falta.
+function ficherosDe(dir, out) {
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) ficherosDe(p, out);
+    else out.push(p);
+  }
+  return out;
+}
+
+function modulosQueFaltan() {
+  const faltan = new Set();
+  for (const f of ficherosDe(OUT, [])) {
+    if (!f.endsWith(".js") && !f.endsWith(".mjs")) continue;
+    const texto = fs.readFileSync(f, "utf8");
+    const specs = [];
+    for (const m of texto.matchAll(/\bfrom\s*["']([^"']+)["']/g)) specs.push(m[1]);
+    for (const m of texto.matchAll(/\bimport\s*\(\s*["']([^"']+)["']/g)) specs.push(m[1]);
+    for (const m of texto.matchAll(/^\s*import\s+["']([^"']+)["']/gm)) specs.push(m[1]);
+    for (const s of specs) {
+      if (!s.startsWith(".")) continue;                       // esm.sh y demas: no son ficheros
+      const destino = path.resolve(path.dirname(f), s);
+      if (!fs.existsSync(destino)) {
+        faltan.add(path.relative(OUT, destino).split(path.sep).join("/") + "   (lo importa " + path.relative(OUT, f).split(path.sep).join("/") + ")");
+      }
+    }
+  }
+  return [...faltan].sort();
+}
+
+const rotos = modulosQueFaltan();
+if (rotos.length) {
+  console.error("");
+  console.error("ERROR: el visor esta INCOMPLETO: faltan " + rotos.length + " archivos que otros modulos importan.");
+  for (const r of rotos.slice(0, 60)) console.error("   " + r);
+  if (rotos.length > 60) console.error("   ... y " + (rotos.length - 60) + " mas");
+  console.error("");
+  console.error("Esto es lo que deja la app clavada en \"Preparando el mundo...\": sin esos");
+  console.error("modulos no se carga el <script type=\"module\"> y no arranca NADA.");
+  console.error("Suele significar que en el repositorio no esta la carpeta `src/` entera");
+  console.error("(solo algunos archivos sueltos). Sube `src/` COMPLETA y vuelve a lanzar esto.");
+  process.exit(1);
+}
+console.log("grafo de modulos: completo (ningun import relativo apunta a un archivo que falte)");
+
+// --- 6. manifiesto ----------------------------------------------------------
+// La lista de los modulos del visor, junto a la pagina. Sirve para que el vigia
+// de `env.js` pueda decir EN EL MOVIL que archivos faltan si algun dia la app no
+// arranca (en vez de quedarse para siempre en "Preparando el mundo..."): pide
+// cada uno de esta lista y canta los que no responden. Las rutas son relativas
+// a la raiz de los assets, que es como las pide el visor.
+const modulos = ficherosDe(OUT, [])
+  .map((p) => path.relative(OUT, p).split(path.sep).join("/"))
+  .filter((rel) => rel.endsWith(".js") || rel.endsWith(".mjs"))
+  .sort();
+fs.writeFileSync(
+  path.join(OUT, "manifiesto.json"),
+  JSON.stringify({ generado: new Date().toISOString(), total: modulos.length, modulos }, null, 2) + "\n",
+  "utf8"
+);
+console.log("manifiesto.json: " + modulos.length + " modulos listados");
+
 // --- recuento ----------------------------------------------------------------
 function count(dir) {
   let n = 0;

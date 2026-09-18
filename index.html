@@ -548,13 +548,15 @@ self.onclose = function (msg) {
   #hudBarCtn { width: 100%; max-width: 1180px; justify-content: space-between; flex-wrap: wrap; }
   #hudBarCtn .title { font-weight: 600; letter-spacing: 0.2px; }
   .dim { opacity: 0.72; }
-  #hudBarCtn nav { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
-  #hudBarCtn nav a {
+  #hudNavEl { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+  #hudNavEl a {
     color: #bcd4f6; text-decoration: none; padding: 3px 8px; border-radius: 7px;
     border: 1px solid rgba(120, 150, 200, 0.25); font-size: 12px; white-space: nowrap;
   }
-  #hudBarCtn nav a:hover { background: rgba(120, 160, 220, 0.18); }
-  #hudBarCtn nav a.on { background: rgba(120, 160, 220, 0.28); border-color: rgba(160, 200, 255, 0.5); }
+  #hudNavEl a:hover { background: rgba(120, 160, 220, 0.18); }
+  #hudNavEl a.on { background: rgba(120, 160, 220, 0.28); border-color: rgba(160, 200, 255, 0.5); }
+  /* El boton de menu y el telon del cajon solo existen en tactil (ver abajo). */
+  #hudMenuBtn, #hudMenuBackdrop { display: none; }
   #hudFootCtn { font-size: 12px; max-width: min(620px, 72vw); }
   #hudHelpCtn { bottom: 10px; right: 10px; font-size: 12px; flex-direction: column; align-items: flex-start; gap: 2px; }
   #hudHelpCtn kbd {
@@ -810,16 +812,52 @@ self.onclose = function (msg) {
   body.touch #hudHelpCtn { display: none; }
   body.touch .hud { font-size: 12px; padding: 6px 9px; gap: 7px; }
   body.touch #hudBarCtn { align-items: center; gap: 3px 6px; }
-  body.touch #hudBarCtn .title { flex: 0 1 auto; font-size: 12px; }
-  /* El menu de rutas se queda en una sola linea que se desliza con el dedo, en
-     vez de plegarse en tres o cuatro lineas y comerse la franja alta entera. */
-  body.touch #hudBarCtn nav {
-    flex: 1 1 60%; flex-wrap: nowrap; min-width: 0; gap: 4px;
-    overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none;
-    -webkit-overflow-scrolling: touch;
+  body.touch #hudBarCtn .title { flex: 1 1 auto; min-width: 0; font-size: 12px; }
+  /* El boton de menu: la unica entrada a las rutas en el telefono. */
+  body.touch #hudMenuBtn {
+    display: flex; align-items: center; justify-content: center; flex: 0 0 auto;
+    width: 40px; height: 40px; margin: -3px 0 -3px -3px; padding: 0;
+    border-radius: 12px; font-size: 17px; line-height: 1;
+    color: #dfe8f8; background: rgba(120, 160, 220, 0.16);
+    border: 1px solid rgba(150, 190, 245, 0.34);
+    -webkit-tap-highlight-color: transparent;
   }
-  body.touch #hudBarCtn nav::-webkit-scrollbar { display: none; }
-  body.touch #hudBarCtn nav a { flex: 0 0 auto; white-space: nowrap; padding: 2px 6px; font-size: 11px; }
+  body.touch #hudMenuBtn:active { background: rgba(120, 160, 220, 0.32); }
+  /* En el telefono no hay barra de enlaces permanente: eso es UI de escritorio
+     encima del mundo. El mismo <nav> se convierte en un cajon que abre el boton
+     de arriba a la izquierda y se cierra al elegir destino o al tocar fuera. El
+     HUD lo mueve al <body> (ver gameHUD.js) para que ningun panel del juego lo
+     tape y para que el telon pueda oscurecer la pantalla entera. */
+  body.touch #hudNavEl {
+    position: fixed; z-index: 42;
+    top: calc(env(safe-area-inset-top, 0px) + 64px);
+    left: 8px; right: 8px; width: auto;
+    display: none; flex-direction: column; flex-wrap: nowrap; gap: 3px;
+    padding: 8px; border-radius: 16px;
+    background: rgba(10, 14, 22, 0.94);
+    border: 1px solid rgba(120, 150, 200, 0.3);
+    box-shadow: 0 16px 38px rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  }
+  body.touch.menu-open #hudNavEl { display: flex; }
+  body.touch #hudNavEl a {
+    flex: 0 0 auto; padding: 13px 14px; border-radius: 12px; font-size: 14px;
+    border: 1px solid transparent; background: rgba(120, 160, 220, 0.08);
+  }
+  body.touch #hudNavEl a.on {
+    background: rgba(120, 160, 220, 0.3); border-color: rgba(160, 200, 255, 0.45);
+  }
+  body.touch #hudMenuBackdrop {
+    display: none; position: fixed; inset: 0; z-index: 41; pointer-events: auto;
+    background: rgba(4, 7, 12, 0.45);
+    backdrop-filter: blur(1.5px); -webkit-backdrop-filter: blur(1.5px);
+  }
+  body.touch.menu-open #hudMenuBackdrop { display: block; }
+  body.touch.hud-off #hudNavEl, body.touch.hud-off #hudMenuBackdrop { display: none; }
+  /* En el telefono, los datos finos (tris, fps) y el boton Construir se van del
+     alto: el carril del juego ya tiene Construir, y las cifras caben en la
+     linea de datos plegable. Asi el alto queda para el menu y el estado. */
+  body.touch #buildToggleBtn { display: none; }
   body.touch #hudFootCtn {
     width: 100%; max-width: none; flex-direction: column; align-items: flex-start; gap: 2px;
     cursor: pointer;
@@ -994,13 +1032,28 @@ self.onclose = function (msg) {
   .spFoot p { margin: 7px 0 0; }
   .spFoot b { color: #cfe0f6; }
   .spFoot code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; opacity: 0.85; }
-  body.touch .spCard { padding: 15px 13px 11px; gap: 11px; border-radius: 15px; }
+  body.touch .spCard { padding: 15px 13px 13px; gap: 11px; border-radius: 15px; }
   body.touch .spHead h1 { font-size: 18px; }
   body.touch .spMark { width: 40px; height: 40px; border-radius: 11px; font-size: 15px; }
-  body.touch .spRow { flex-direction: column; align-items: stretch; gap: 4px; }
-  body.touch .spLab { flex: 0 0 auto; }
-  body.touch .spRow input, body.touch .spRow select { font-size: 16px; padding: 8px 9px; }
+  /* En el telefono cada campo pasa a ocupar su propia linea (etiqueta encima).
+     Se le da aire: con `gap: 4px` la etiqueta se pegaba a la caja de arriba y
+     todo el formulario se leia como un bloque apretado. */
+  body.touch .spSec { gap: 11px; }
+  body.touch .spRow { flex-direction: column; align-items: stretch; gap: 5px; }
+  body.touch .spLab { flex: 0 0 auto; font-size: 11.5px; letter-spacing: 0.2px; }
+  body.touch .spRow input, body.touch .spRow select { font-size: 16px; padding: 9px 10px; }
+  /* Objetivos tactiles: en un movil 7px de separacion entre botones hace que
+     se pulse el de al lado. */
+  body.touch .spBtns { gap: 9px; }
+  body.touch .spBtns .bbtn { padding: 12px 12px; font-size: 14px; }
+  body.touch .spPrimary { font-size: 14px; }
+  body.touch .spNote { font-size: 11.5px; line-height: 1.5; }
   body.touch .spLog { max-height: 92px; }
+  body.touch .spFoot { font-size: 11px; }
+  body.touch #startPanelCtn {
+    padding: 14px 12px calc(22px + env(safe-area-inset-bottom, 0px));
+    -webkit-overflow-scrolling: touch;
+  }
 
   /* Chip de la sesión con el retransmisor. */
   #slStatEl { display: inline-flex; align-items: center; gap: 6px; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1116,6 +1169,9 @@ self.onclose = function (msg) {
     opacity: 0.6; padding-bottom: 3px; border-bottom: 1px solid rgba(140, 175, 230, 0.14);
   }
   .gLegend { font-size: 11.5px; opacity: 0.72; line-height: 1.35; }
+  /* La leyenda de teclas no pinta nada en un movil (no hay teclado): ahi solo
+     interesa la de gestos. */
+  body.touch .gKeys { display: none; }
   .gBtns { display: flex; flex-wrap: wrap; gap: 6px; }
   .gChip {
     font: inherit; font-size: 11.5px; padding: 4px 10px; border-radius: 999px; cursor: pointer;
@@ -1262,8 +1318,9 @@ self.onclose = function (msg) {
 
 <div id="hudTopCtn">
   <div class="hud" id="hudBarCtn">
+    <button type="button" id="hudMenuBtn" aria-label="Men&uacute;" title="Men&uacute;">&#9776;</button>
     <span class="title" id="hudTitleEl">Visor de Second Life</span>
-    <nav>
+    <nav id="hudNavEl">
       <a href="#sl" id="navStartEl">Iniciar sesión</a>
       <a href="#viewer" id="navViewerEl">Arena de pruebas</a>
       <a href="#primtest" id="navGalleryEl"><span class="wide-only">Galería de prims</span><span class="touch-only-inline">Galería</span></a>
@@ -1278,14 +1335,16 @@ self.onclose = function (msg) {
       <span id="netDotEl"></span><span id="netTextEl">…</span>
     </button>
     <button type="button" class="bbtn" id="buildToggleBtn" title="Modo construcción (B)">Construir</button>
-    <span><span id="hudRouteEl" class="dim"></span> &middot; <span id="hudTrisEl" class="dim"></span> &middot; <span id="hudFpsEl" class="dim"></span></span>
   </div>
 
   <div class="hud" id="hudFootCtn">
     <span id="viewStatEl">Cargando&hellip;</span>
     <span id="hudInfoEl" class="dim"></span>
+    <span id="hudPerfEl" class="dim"><span id="hudRouteEl" class="dim"></span> &middot; <span id="hudTrisEl" class="dim"></span> &middot; <span id="hudFpsEl" class="dim"></span></span>
     <span class="touch-only dim" id="touchHintEl">joystick izquierdo para andar (el borde corre) &middot; arrastra la derecha para mirar &middot; pellizca para acercar</span>
   </div>
+
+  <div id="hudMenuBackdrop"></div>
 </div>
 
 <div class="hud" id="hudHelpCtn">

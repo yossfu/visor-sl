@@ -35,6 +35,222 @@
     version: "0.1.0",
   };
 
+  // -------------------------------------------------------- vigia de arranque
+  // El visor es un <script type="module"> con decenas de modulos que se
+  // importan unos a otros. Si a los assets de la app les falta UNO solo, el
+  // navegador no carga el modulo, no arranca ni una linea de JavaScript y la
+  // pantalla se queda clavada en "Preparando el mundo..." con el HTML de
+  // escritorio de fondo (barra de navegacion, atajos WASD, el chat suelto).
+  // Desde fuera parece que la app "esta cargando" para siempre, y no hay ni un
+  // mensaje que diga que pasa.
+  //
+  // Lo mas habitual es que al subir el proyecto a GitHub no se subiera `src/`
+  // entera (esa es justo la causa de que el APK salga "mudo"), pero tambien
+  // pasa si un archivo llega corrupto o si se compila con el visor a medias.
+  // Este vigia convierte ese silencio en un diagnostico:
+  //
+  //   * si el visor no avisa de que ha arrancado (`window.__visorListo()`) en
+  //     9 segundos, o si se ve un error de carga, se tapa la pantalla;
+  //   * se comprueba, archivo por archivo, contra `manifiesto.json` (la lista
+  //     que escribe `build-viewer.mjs` al compilar el APK) y se dicen los
+  //     nombres EXACTOS de los que faltan.
+  //
+  // Se desactiva solo en cuanto el visor arranca: no se ve en el uso normal.
+  var ARRANQUE = { listo: false, aviso: null, faltan: null, total: null, comprobando: false };
+  window.__SL_ARRANQUE__ = ARRANQUE;
+
+  var TIEMPO_LIMITE = 9000;
+
+  // Dos señales distintas de "el visor arranco": la que le da `__visorListo()`
+  // (src/app.js lo llama al terminar de arrancar) y la que deja el propio visor
+  // en el DOM (`body[data-ready]`). Con las dos, el vigia no puede equivocarse
+  // aunque el orden de carga se tuerza.
+  function appArrancada() {
+    if (ARRANQUE.listo) return true;
+    var b = document.body;
+    return !!(b && b.dataset && b.dataset.ready === "1");
+  }
+
+  window.__visorListo = function () {
+    ARRANQUE.listo = true;
+    quitarVigia();
+  };
+
+  window.__visorFallo = function (msg) {
+    if (appArrancada()) return;                 // ya iba bien: no tapamos nada
+    ARRANQUE.aviso = msg ? String(msg) : "error sin mensaje";
+    pintarVigia();
+  };
+
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function quitarVigia() {
+    var el = document.getElementById("vigiaCtn");
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+  }
+
+  // Compara los archivos que deberia tener el APK con los que responde de
+  // verdad el servidor interno. Es la parte que convierte "no arranca" en
+  // "faltan src/world.js, src/net.js y 41 mas".
+  function comprobarManifiesto() {
+    if (ARRANQUE.comprobando || appArrancada()) return;
+    ARRANQUE.comprobando = true;
+    fetch("manifiesto.json", { cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("el APK responde " + r.status + " pidiendo manifiesto.json");
+        return r.json();
+      })
+      .then(function (data) {
+        var lista = Array.isArray(data) ? data : ((data && data.modulos) || []);
+        ARRANQUE.total = lista.length;
+        return Promise.all(lista.map(function (rel) {
+          return fetch(rel, { cache: "no-store" }).then(
+            function (r) { return r.ok ? null : rel + "   (responde " + r.status + ")"; },
+            function () { return rel + "   (no responde)"; }
+          );
+        }));
+      })
+      .then(function (res) {
+        ARRANQUE.faltan = res.filter(Boolean);
+        pintarVigia();
+      })
+      .catch(function (e) {
+        ARRANQUE.total = null;
+        ARRANQUE.faltan = ["(no se pudo leer manifiesto.json: " + (e && e.message ? e.message : e) + ")"];
+        pintarVigia();
+      });
+  }
+
+  function pintarVigia() {
+    if (appArrancada()) return;
+    var host = document.body || document.documentElement;
+    if (!host) return;
+    var el = document.getElementById("vigiaCtn");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "vigiaCtn";
+      host.appendChild(el);
+    }
+
+    var faltan = ARRANQUE.faltan;
+    var listaHtml;
+    if (faltan === null) {
+      listaHtml = "<p class='vEsp'>Comprobando si al APK le falta algún archivo del visor&hellip;</p>";
+    } else if (!faltan.length && ARRANQUE.total) {
+      listaHtml = "<p class='vOk'>El visor tiene los " + ARRANQUE.total +
+        " archivos que debería: no falta ninguno. Entonces el problema está en el " +
+        "propio código, no en la instalación: míranos el informe de depuración.</p>";
+    } else {
+      listaHtml = "<p class='vBad'>Faltan <b>" + faltan.length + "</b> archivos del visor" +
+        (ARRANQUE.total ? " de los " + ARRANQUE.total + " que debería tener" : "") + ":</p><ul>" +
+        faltan.slice(0, 16).map(function (s) { return "<li>" + esc(s) + "</li>"; }).join("") +
+        (faltan.length > 16 ? "<li>&hellip;y " + (faltan.length - 16) + " más</li>" : "") +
+        "</ul>";
+    }
+
+    el.innerHTML =
+      "<div class='vBox'>" +
+      "<h1>El visor no ha arrancado</h1>" +
+      "<p>Se quedó en «Preparando el mundo…» porque <b>no se llegó a ejecutar " +
+      "JavaScript</b>: el HTML se ve, pero ningún módulo del visor cargó.</p>" +
+      (ARRANQUE.aviso ? "<p class='vErr'>Detalle: " + esc(ARRANQUE.aviso) + "</p>" : "") +
+      listaHtml +
+      "<p>Casi siempre significa que al subir el proyecto a GitHub <b>no se subió " +
+      "la carpeta <code>src/</code> completa</b>, y el APK se compiló con el visor a " +
+      "medias. Sube <code>src/</code> entera al repositorio y vuelve a lanzar " +
+      "«Build APK» en GitHub Actions.</p>" +
+      "<div class='vBtns'>" +
+      "<button id='vigiaReintentar' class='vB1'>Reintentar</button>" +
+      "<button id='vigiaCopiar' class='vB2'>Copiar informe</button>" +
+      "</div>" +
+      "<p class='vPie'>Para ver el detalle técnico: conecta el móvil por USB y abre " +
+      "<code>chrome://inspect</code> en el ordenador.</p>" +
+      "</div>";
+
+    var rb = document.getElementById("vigiaReintentar");
+    if (rb) rb.onclick = function () { location.reload(); };
+    var cb = document.getElementById("vigiaCopiar");
+    if (cb) cb.onclick = function () {
+      var texto = "Visor SL no arranca.\n" +
+        "aviso: " + (ARRANQUE.aviso || "(ninguno)") + "\n" +
+        "manifiesto: " + (ARRANQUE.total === null ? "no legible" : ARRANQUE.total + " archivos") + "\n" +
+        "faltan: " + (ARRANQUE.faltan === null ? "(comprobando)" :
+          (ARRANQUE.faltan.length ? "\n  " + ARRANQUE.faltan.join("\n  ") : "ninguno")) + "\n" +
+        "url: " + location.href + "\n" +
+        "agente: " + navigator.userAgent + "\n";
+      var listo = function () { cb.textContent = "Copiado"; };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(texto).then(listo, function () { cb.textContent = texto; });
+      } else {
+        cb.textContent = texto;
+      }
+    };
+
+    if (!document.getElementById("vigiaEstilo")) {
+      var st = document.createElement("style");
+      st.id = "vigiaEstilo";
+      st.textContent =
+        "#vigiaCtn{position:fixed;inset:0;z-index:2147483000;background:#0b0f18;color:#dfe6f2;" +
+        "font:14px/1.5 system-ui,sans-serif;overflow:auto;-webkit-overflow-scrolling:touch;padding:18px}" +
+        "#vigiaCtn .vBox{max-width:640px;margin:0 auto;padding-bottom:24px}" +
+        "#vigiaCtn h1{font-size:18px;margin:0 0 10px;color:#ffb4b4}" +
+        "#vigiaCtn p{margin:8px 0}" +
+        "#vigiaCtn code{background:#1a2233;padding:1px 5px;border-radius:4px;font-size:12px}" +
+        "#vigiaCtn .vErr{color:#ffd479;word-break:break-word}" +
+        "#vigiaCtn .vEsp{color:#9fb0c8}" +
+        "#vigiaCtn .vOk{color:#9ff0c4}" +
+        "#vigiaCtn .vBad{color:#ffb4b4}" +
+        "#vigiaCtn ul{margin:6px 0 6px 18px;padding:0;font-family:ui-monospace,monospace;font-size:12px;" +
+        "color:#cfe0f5;max-height:34vh;overflow:auto}" +
+        "#vigiaCtn .vBtns{display:flex;gap:8px;margin:14px 0}" +
+        "#vigiaCtn button{flex:1;padding:12px;border:0;border-radius:10px;font-size:15px;font-weight:600}" +
+        "#vigiaCtn .vB1{background:#2f7fd6;color:#fff}" +
+        "#vigiaCtn .vB2{background:#1e2a3d;color:#cfe0f5}" +
+        "#vigiaCtn .vPie{font-size:12px;color:#8b9bb4}";
+      (document.head || document.documentElement).appendChild(st);
+    }
+    if (ARRANQUE.faltan === null) comprobarManifiesto();
+  }
+  window.__visorVigia = pintarVigia;
+
+  // Un modulo o un archivo que no carga. El navegador no dice cual en el
+  // mensaje, pero si deja ver el elemento culpable: de ahi el `src`.
+  function esDelVisor(url) {
+    return typeof url === "string" && url.indexOf("src/") !== -1;
+  }
+
+  window.addEventListener("error", function (ev) {
+    var t = ev && ev.target;
+    if (t && t !== window && (t.tagName === "SCRIPT" || t.tagName === "LINK")) {
+      var url = t.src || t.href || "";
+      if (esDelVisor(url)) {
+        ARRANQUE.aviso = "no se pudo cargar " + String(url).split("/").slice(-3).join("/");
+        setTimeout(pintarVigia, 1500);   // margen por si el visor arranca igual
+        return;
+      }
+    }
+    if (!appArrancada() && ev && ev.message) {
+      ARRANQUE.aviso = ev.message + (ev.lineno ? " (línea " + ev.lineno + ")" : "");
+      setTimeout(pintarVigia, 800);
+    }
+  }, true);
+
+  window.addEventListener("unhandledrejection", function (ev) {
+    if (appArrancada()) return;
+    var r = ev && ev.reason;
+    ARRANQUE.aviso = "promesa rechazada: " + (r && r.message ? r.message : r);
+    setTimeout(pintarVigia, 800);
+  });
+
+  setTimeout(function () {
+    if (appArrancada()) return;
+    if (ARRANQUE.aviso === null) ARRANQUE.aviso = "el visor no arrancó en " + (TIEMPO_LIMITE / 1000) + " segundos";
+    pintarVigia();
+    comprobarManifiesto();
+  }, TIEMPO_LIMITE);
+
   // ---------------------------------------------------------------- IndexedDB
   // Un unico almacen `kv` con clave completa `carpeta + "\u0000" + clave`. El
   // separador es el mismo que usa el plugin de perchance, y las consultas por
