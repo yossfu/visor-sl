@@ -24,9 +24,7 @@ import java.nio.ByteBuffer
 class RelayServer(
     port: Int,
     private val log: (String) -> Unit,
-) : WebSocketServer(InetSocketAddress("127.0.0.1", port)) {
 
-    val port: Int get() = address.port
 
     // Cuenta de latidos: se apunta el primero y luego uno de cada 60, para que
     // el informe diga si el enlace sigue vivo sin llenar el registro.
