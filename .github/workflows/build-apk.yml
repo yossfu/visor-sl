@@ -1,0 +1,37 @@
+name: Compilar APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Preparar el visor dentro de la app
+        run: node build-viewer.mjs
+
+      - name: Incluir el modelo del avatar real (cuerpo de sistema)
+        run: node fetch-character-assets.mjs
+
+      - name: Compilar el APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Dejar el APK para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: visor-sl-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
