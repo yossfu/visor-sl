@@ -107,6 +107,7 @@ export function createSession(opts = {}) {
     state.link = rs.link;
     state.region = rs.region || state.region;
     state.mock = rs.mock;
+    state.mockLabel = (rs.welcome && rs.welcome.label) || state.mockLabel;
     state.pingMs = rs.rtt || 0;
     state.kbIn = Math.round(rs.bytesIn / 1024);
     state.kbOut = Math.round(rs.bytesOut / 1024);
@@ -732,7 +733,7 @@ export function createSession(opts = {}) {
   function stats() {
     return {
       link: state.link, phase: state.phase, text: state.text, ready: state.ready,
-      region: state.region, mock: state.mock, error: state.error,
+      region: state.region, mock: state.mock, mockLabel: state.mockLabel, error: state.error,
       patches: state.patches, objects: state.objects, avatars: state.avatars,
       assets: state.assets, chats: state.chats, poseSent: state.poseSent,
       interacts: state.interacts, kbIn: state.kbIn, kbOut: state.kbOut,

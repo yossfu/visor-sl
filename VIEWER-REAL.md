@@ -1,4 +1,4 @@
-# El visor de Second Life de verdad (Fase 8)
+# El visor de Second Life de verdad (Fases 8 y 12)
 
 Este documento existe porque el código lo cita: `main.pjs`, `index.html` y las
 cabeceras de `src/sl/relay.js`, `src/sl/login.js`, `src/sl/session.js` y
@@ -7,9 +7,15 @@ por medio, **qué** habla el navegador con él, **qué** tiene que hacer la mita
 que no está en el navegador, y **qué** falta para estar dentro de una región de
 Second Life de verdad.
 
-Resumen en una línea: el visor ya está entero salvo la pieza que un navegador
-no puede ser — el proceso que habla UDP con el simulador — y ese proceso está
-especificado aquí, trama a trama.
+> **Estado (Fase 12).** El retransmisor **ya está escrito en JavaScript**
+> (`src/sl/lludp/gateway.js`, con el resto del núcleo LLUDP en `src/sl/lludp/`),
+> y ya entra en regiones de verdad: login, circuito UDP, handshake, terreno,
+> objetos, avatares, chat, toque, movimiento y teletransporte dentro de la
+> región. Lo único que queda fuera del navegador es **mover datagramas UDP**: lo
+> hace el puente tonto de la app Android (`UdpBridgeServer.kt`), y en el
+> escritorio lo suple un simulador de región en JavaScript (`?udp=sim`). Las
+> secciones §6 y §7 se conservan como referencia del protocolo del enlace y de
+> la lista de trabajo (hoy cumplida salvo assets/caps y cambio de región).
 
 ---
 
@@ -42,22 +48,23 @@ fuera del navegador**: hace falta un proceso que tenga un socket UDP y que
 pueda abrir las capabilities.
 
 ```
-   navegador                        retransmisor (gateway)             simulador
-  (esto)                 ┌──────────────────────────────┐        de Second Life
-  ┌─────────────┐        │  circuito LLUDP (UDP+acks)   │        ┌──────────┐
-  │ index.html  │◄─WSS──►│  capabilities por HTTP       │◄──UDP──►│  sim      │
-  │ src/sl/*    │        │  EventQueueGet (cola larga)  │        │  (región)  │
-  │ three.js    │        │  assets, terreno, parcelas   │        └──────────┘
-  └─────────────┘        └──────────────────────────────┘
-      esto ya existe           ESTO ES LO QUE FALTA
+   navegador / WebView                     retransmisor LLUDP              simulador
+  (el visor JS)                 ┌──────────────────────────────┐        de Second Life
+  ┌─────────────┐               │  circuito LLUDP (UDP+acks)   │        ┌──────────┐
+  │ index.html  │◄──enlace─────►│  src/sl/lludp/gateway.js     │◄──UDP──►│  sim      │
+  │ src/sl/*    │  (relay.js)   │  (TODO en JavaScript)        │  puente │  (región)  │
+  │ three.js    │               │  caps/EventQueue (falta)     │        └──────────┘
+  └─────────────┘               └──────────────────────────────┘
+      hecho                      hecho (menos caps/assets)      hecho en la app Android
 ```
 
 El retransmisor **no traduce el mundo** a un protocolo propio complejo: manda
-justo lo que hace falta para dibujar, en las tramas de `src/sl/relay.js`.
-Tampoco hay que escribirlo desde cero: el protocolo LLUDP está implementado en
-**[Hippolyzer](https://github.com/SaladDais/Hippolyzer)** (Python) y en
-**[rustmetaverse](https://github.com/rustmetaverse)** (Rust), y ambos sirven de
-referencia para cada mensaje.
+justo lo que hace falta para dibujar, en las tramas de `src/sl/relay.js`. Y no
+es un binario aparte: es **JavaScript**, el mismo código que corre en el
+navegador y que se prueba con el simulador de `src/sl/lludp/sim.js`. Las
+referencias del protocolo real que se usaron fueron las fuentes de Linden Lab
+(`message_template.msg`, etc.) y, como contraste,
+**[Hippolyzer](https://github.com/SaladDais/Hippolyzer)** (Python).
 
 ## 2. Las dos mitades
 
@@ -65,12 +72,15 @@ referencia para cada mensaje.
   define las tramas y el transporte; `src/sl/session.js` es el puente entre el
   enlace y el mundo (`world.applyRemote`, el mismo camino que usa el
   multijugador, así que no hay dos mundos distintos); `src/sl/startPanel.js` es
-  la pantalla de arranque con los tres modos de entrada.
-- **Lado retransmisor (por hacer).** Un proceso nativo que: hace de cliente
-  LLUDP contra el simulador, abre las capabilities, y reenvía terreno/objetos/
-  avatares/chat/assets al navegador en las tramas de la §6. La especificación
-  ejecutable de ese lado es `src/sl/mockServer.js`: quién manda cada trama, en
-  qué orden y con qué campos.
+  la pantalla de arranque con los modos de entrada.
+- **Lado retransmisor (hecho, en JavaScript).** `src/sl/lludp/gateway.js` hace
+  de cliente LLUDP contra el simulador y reenvía terreno/objetos/avatares/chat/
+  toque/movimiento al visor en las tramas de la §6. Debajo están las plantillas,
+  el códec, el circuito, el terreno, los objetos y el agente (`src/sl/lludp/*`).
+  Lo que aún no hace: capabilities/EventQueueGet y assets (§7 punto 3 y §9).
+- **Transporte (nativo, mínimo).** Un navegador no puede abrir UDP; el puente de
+  la app Android mueve datagramas y nada más. En el escritorio lo suple el
+  simulador en JS de `src/sl/lludp/sim.js`.
 
 El mismo cliente sirve para el retransmisor de verdad y para el simulador de
 pruebas: `relay.js` **no sabe nada de Second Life**, solo de bytes.
@@ -201,6 +211,9 @@ TELEPORT:5, DISCONNECTED:6}` — los textos en castellano están en `PHASE_TEXT`
 
 ## 7. Qué tiene que hacer el retransmisor de verdad (lista de trabajo)
 
+> Cumplida salvo los puntos 3 (capabilities) y 7 (assets/J2C), que son los que
+> quedan pendientes. El resto está en `src/sl/lludp/gateway.js`.
+
 1. **Circuito LLUDP.** Abrir un socket UDP al `sim_ip:sim_port`, mandar
    `UseCircuitCode(circuit_code, session_id, agent_id)`, esperar
    `RegionHandshake`, contestar `RegionHandshakeReply`, y mantener el reloj de
@@ -303,31 +316,34 @@ todavía no usa:
 
 ## 11. Cómo probarlo hoy
 
-No hace falta cuenta ni gateway:
+Tres caminos, de menos a más real:
 
-1. En la pantalla de arranque (`#sl`) pulsa **«Simulador de pruebas»**. La
-   región «Bahía de Pruebas» la sirve el propio navegador (`mockServer.js`):
-   terreno con colinas, una plaza de ~72 prims, residentes paseando, chat que
-   responde y texturas RGBA8. No es Second Life, pero habla el protocolo exacto.
-2. Para el camino real, sin cuenta: el panel valida la URL del retransmisor y
-   explica en castellano qué falta si no hay ninguna o no es un WebSocket.
-3. **Autotests** (sin navegador ni red — se pueden correr desde la consola o un
-   worker):
+1. **Simulador de pruebas** (`mockServer.js`): en la pantalla de arranque (`#sl`)
+   pulsa «Simulador de pruebas». Región «Bahía de Pruebas», servida por el propio
+   navegador. No es Second Life, pero habla el protocolo exacto.
+2. **Núcleo LLUDP contra un simulador de región en JS**: añade `?udp=sim` a la
+   URL (p. ej. `?udp=sim#sl`). El visor habla LLUDP **de verdad** (plantillas,
+   circuito, DCT de terreno, `ObjectUpdate`, `AgentUpdate`, chat, toque) con
+   `sim.js`. Es lo que se puede hacer sin móvil, y con lo que se verifica todo.
+3. **Second Life real**: en la app Android, `MainActivity` carga el visor con
+   `?udp=ws://127.0.0.1:PUERTO#sl` y el puente UDP abre el socket al
+   `sim_ip:sim_port` que devolvió el login. Entra con tu cuenta y ya se puede
+   andar, chatear y tocar prims.
 
-   | Módulo | Entrada | Resultado |
-   |---|---|---|
-   | `src/sl/md5.js` | `runMd5SelfTest()` | 6/6 |
-   | `src/sl/llsd.js` | `runLlsdSelfTest()` | 25/25 |
-   | `src/sl/login.js` | `runLoginSelfTest()` | 21/21 |
-   | `src/sl/relay.js` | `runRelaySelfTest()` | 26/26 |
-   | `src/sl/mockServer.js` | `runMockSelfTest()` | 19/19 |
+**Autotests** (sin navegador ni red — desde la consola o un worker):
 
-   La sesión completa contra el simulador de pruebas se verificó en el editor:
-   entra en la región en ~4,3 s, recibe 72 prims, 6 avatares y 256 parches, la
-   parcela «Plaza de la Bahía», y el chat funciona.
+| Módulo | Entrada | Resultado |
+|---|---|---|
+| `src/sl/md5.js` | `runMd5SelfTest()` | 6/6 |
+| `src/sl/llsd.js` | `runLlsdSelfTest()` | 25/25 |
+| `src/sl/login.js` | `runLoginSelfTest()` | 21/21 |
+| `src/sl/relay.js` | `runRelaySelfTest()` | 26/26 |
+| `src/sl/mockServer.js` | `runMockSelfTest()` | 19/19 |
+| `src/sl/lludp/*` | (12 suites, ver `scratch/lludp-runner.js`) | **812/812** |
 
-Con el gateway de verdad, lo único que cambia es la URL del retransmisor: el
-visor no cambia ni una línea.
+La sesión contra `sim.js` se verificó en el editor: entra en la región en ~2 s,
+recibe 256 parches de terreno, decenas de prims y 18 residentes, y el chat, el
+toque y el movimiento (AgentUpdate) van y vuelven por el circuito.
 
 ## 12. Los avatares reales (cuerpos y cabezas mesh, ropa y animaciones)
 

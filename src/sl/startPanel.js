@@ -107,7 +107,64 @@ function create(opts) {
     return (relayEl && relayEl.value ? relayEl.value : "").trim();
   }
 
+  // --- el puente UDP --------------------------------------------------------
+  // Un navegador no puede abrir un socket UDP, y sin UDP no se puede hablar
+  // LLUDP con un simulador de Second Life. El puente lo trae la app Android
+  // (`?udp=ws://127.0.0.1:PUERTO`, el `UdpBridgeServer` nativo) o, para poder
+  // recorrer el camino LLUDP entero sin movil, `?udp=sim`, que monta una region
+  // de prueba en JavaScript con el MISMO protocolo. Sin puente, el visor
+  // necesita un retransmisor (wss://) como antes.
+  function puenteUdp() {
+    let v = "";
+    try { if (window.__SL_APP__ && window.__SL_APP__.udpUrl) v = window.__SL_APP__.udpUrl; } catch (e) { /* nada */ }
+    if (!v) {
+      try { v = new URLSearchParams(location.search || "").get("udp") || ""; } catch (e) { /* nada */ }
+    }
+    if (!v) { try { v = window.__visorPuente || ""; } catch (e) { /* nada */ } }
+    v = String(v).trim();
+    if (/^(sim|demo|prueba|1|si|true)$/i.test(v)) return "sim";
+    return v;
+  }
+
+  function esPuenteWebSocket(v) {
+    if (!/^wss?:\/\//i.test(v)) return false;
+    if (/^ws:\/\//i.test(v) && location.protocol === "https:") return false;
+    return true;
+  }
+
+  // Monta el retransmisor LLUDP local (`src/sl/lludp/gateway.js`). Se carga
+  // aqui y no al arrancar porque `templates.js` son 68 KB de plantillas del
+  // protocolo: quien no use el puente no paga por ellas.
+  async function montarPuente(puente, credentials, session) {
+    const mod = await import("./lludp/gateway.js");
+    const opts = {
+      credentials,
+      regionName: (session && session.start && session.start.region) || "",
+      onLog: (t) => log(t),
+    };
+    if (puente === "sim") {
+      const simMod = await import("./lludp/sim.js");
+      const sim = simMod.createRegionSim({ seed: (Date.now() >>> 0) % 100000, log: () => {} });
+      sim.start();
+      opts.udp = sim.pair.a;
+      opts.sim = sim;
+      opts.mock = true;
+    } else {
+      opts.udpUrl = puente;
+    }
+    return mod.createLldpRelay(opts);
+  }
+
   function describeRelay() {
+    const puente = puenteUdp();
+    if (puente) {
+      if (relayNoteEl) {
+        relayNoteEl.textContent = puente === "sim"
+          ? "Región LLUDP de prueba en JavaScript: el visor habla el protocolo de Second Life por el mismo camino que el mundo real, pero la región es simulada. No es Second Life."
+          : "Puente UDP detectado (" + puente + "). No hace falta retransmisor: el visor abrirá el circuito UDP con el simulador de Second Life a través de él.";
+      }
+      return true;
+    }
     const url = relayUrl();
     if (!url) {
       if (relayNoteEl) {
@@ -197,7 +254,14 @@ function create(opts) {
     if (busy) return;
     const form = readForm();
     if (!form) return;
-    if (!requireRelay()) return;
+    const puente = puenteUdp();
+    if (!puente && !requireRelay()) return;
+    if (puente && puente !== "sim" && !esPuenteWebSocket(puente)) {
+      fail({ title: "El puente UDP no sirve",
+        hint: "Tiene que ser ws://… (el puente de la app Android) o «sim» (región LLUDP de prueba en JavaScript).",
+        message: puente });
+      return;
+    }
     setBusy(true);
     notice("");
     log("Iniciando sesion con " + (login.GRIDS[form.grid] ? login.GRIDS[form.grid].name : form.grid) + "…");
@@ -230,6 +294,33 @@ function create(opts) {
     const credentials = login.relayCredentials(s);
     credentials.displayName = s.displayName;
     credentials.start = form.start;
+
+    // Con puente UDP no hay retransmisor externo: el propio visor monta el
+    // circuito LLUDP (gateway.js) y le cuelga el puente.
+    if (puente) {
+      status("Preparando el circuito LLUDP…");
+      log(puente === "sim"
+        ? "Puente UDP: región LLUDP simulada en JavaScript (no es Second Life)."
+        : "Puente UDP: " + puente + ". El circuito UDP lo abrirá la app.");
+      let lldp = null;
+      try {
+        lldp = await montarPuente(puente, credentials, s);
+      } catch (e) {
+        fail({ title: "No se pudo preparar el circuito LLUDP", message: String((e && e.message) || e) });
+        return;
+      }
+      setBusy(false);
+      onEnter({
+        mode: "lldp",
+        relay: { url: lldp.url, socketFactory: lldp.socketFactory },
+        lldp,
+        credentials,
+        displayName: s.displayName,
+        grid: s.grid,
+      });
+      return;
+    }
+
     onEnter({
       mode: "session",
       relay: { url: relayUrl() },

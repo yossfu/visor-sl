@@ -638,6 +638,26 @@ export function generateVolume(volParams, lod = 3) {
   };
 }
 
+// Numero de caras del volumen: es exactamente `generateVolume().faces.length`
+// pero sin construir la malla (la usan los objetos de LLUDP, que reciben la
+// apariencia de cada cara en un "texture entry" y necesitan saber cuantas caras
+// tiene el prim). No depende del nivel de detalle, asi que va con el minimo.
+export function volumeFaceCount(volParams, lod = 0) {
+  const detail = LOD_DETAIL[Math.max(0, Math.min(3, lod | 0))];
+  const pp = volParams.profile;
+  const pa = volParams.path;
+  let split = Math.floor(detail * 0.66);
+  const base = pp.baseCurve;
+  if (pa.curveType === PATH_LINE && (pa.scaleX !== 1 || pa.scaleY !== 1) &&
+      (base === PROFILE_SQUARE || base === PROFILE_ISOTRI ||
+       base === PROFILE_EQUALTRI || base === PROFILE_RIGHTTRI)) {
+    split = 0;
+  }
+  const path = generatePath(pa, detail, split);
+  const prof = generateProfile(pp, path.open, detail, split);
+  return prof.faces.length;
+}
+
 // LLVolumeFace::createSide -- sweeps the profile range along the whole path.
 function buildSide(face, prof, path, meshFlat, meshRefFlat, sizeS, sizeT, pathOpen, out) {
   const beginS = face.index;

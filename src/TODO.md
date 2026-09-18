@@ -333,18 +333,48 @@ de juego" en el README).
       joystick, racimo, chat, editor de construcción), verificado con `vision` y
       midiendo las cajas con `getBoundingClientRect`.
 
-## Fase 11 — App Android (en curso)
+## Fase 11 — App Android
 
 - [x] Proyecto Android escrito en `src/android/` y `scratch/visor-sl-app/`:
-      WebView + servidores locales que sirven el visor, más el plan del núcleo
-      nativo para el socket UDP. Ver `src/ANDROID.md`.
+      WebView + servidores locales que sirven el visor. Ver `src/ANDROID.md`.
 - [x] Puente de depuración e informes en la app (`VisorDiag.kt`): `window.VisorDiag`,
       informes en `Android/data/org.visor.sl/files/informes/`, compartir por texto
       y registro nativo. Ver `src/DIAGNOSTICS.md`.
 - [x] El modelo del avatar dentro del APK (`fetch-character-assets.mjs` en el
       flujo de compilación) para que la forma funcione sin conexión.
+- [x] **Puente UDP** (`UdpBridgeServer.kt`): WebSocket local + `DatagramSocket`
+      (1 trama binaria = 1 datagrama). Sustituye al antiguo `RelayServer.kt` +
+      `FrameCodec.kt`, que se borraron. `MainActivity` carga el visor con
+      `?udp=ws://127.0.0.1:PUERTO#sl`.
 - [ ] Compilar el APK (GitHub Actions o Android Studio) y probarlo en el móvil.
 - [ ] Traer un informe del móvil y arreglar lo que salga.
+
+## Fase 12 — Núcleo LLUDP (mundo real)
+
+Todo el protocolo de Second Life en JavaScript (`src/sl/lludp/`), con el nativo
+reducido a mover datagramas. Ver "Modelo del núcleo LLUDP" en el README y
+`src/VIEWER-REAL.md`. **812 comprobaciones en verde.**
+
+- [x] Plantillas del protocolo (`templates.js`, 483 mensajes) y códec binario
+      (`codec.js`), verificados contra datagramas REALES (`recapturas.js`) y
+      vectores de campos (`vectors.js`).
+- [x] Circuito UDP (`circuit.js`): secuencia, pendientes, reenvíos, acks de
+      gorra, ping y RTT.
+- [x] Terreno (`terrain.js`, DCT/IDCT) y objetos (`objects.js`: `ObjectUpdate`,
+      comprimido, terse, `TextureEntry`).
+- [x] Agente (`agent.js`) y el retransmisor (`gateway.js`), que traduce entre
+      `relay.js` y LLUDP.
+- [x] Simulador de región en JS (`sim.js`) que habla LLUDP de verdad: la
+      especificación ejecutable del lado servidor.
+- [x] Transportes (`udp.js`): par en memoria y el puente WebSocket de la app.
+- [x] Modo `?udp=sim` y cableado del modo real en la pantalla de arranque.
+- [x] Verificado de extremo a extremo: login → circuito → 256 parches de
+      terreno, decenas de prims, 18 residentes; **chat, toque y movimiento**
+      (AgentUpdate) con ida y vuelta contra el simulador.
+- [ ] `caps.js`: *seed capability* + LLSD + EventQueueGet (inventario, IM,
+      descarga de assets).
+- [ ] Decodificador **JPEG2000**: texturas de prims y bakes (BoM).
+- [ ] Cambio de región (teletransporte a otro simulador: circuito nuevo).
 
 ## Deuda / notas
 - El anillo converge despacio al volumen de Pappus con el LOD (es un artefacto

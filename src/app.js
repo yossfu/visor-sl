@@ -103,6 +103,12 @@ let chatPanel = null;
 let peers = null;       // avatares de los demas jugadores
 let net = null;         // multijugador de perchance
 let session = null;     // sesion con el retransmisor (region de Second Life)
+// El retransmisor LLUDP montado en este navegador (modo "lldp"): el puente UDP
+// hacia el simulador. Se guarda para que el informe de depuracion pueda contar
+// cuantos datagramas han ido y venido y que mensajes han llegado (y para quien
+// venga despues: es lo unico que permite entender un fallo de protocolo sin
+// cable USB).
+let lldpRelay = null;
 let gh = null;          // mandos de juego: minimapa, menus (inventario, armario, mapa, sitios, ajustes)
 
 // Lo que deja la pantalla de inicio (#sl) para que la ruta del visor (#viewer)
@@ -193,7 +199,7 @@ function paintSessionChip() {
   slStatEl.classList.toggle("off", !!st.error);
   slStatEl.classList.toggle("mock", !!st.mock);
   if (slTextEl) slTextEl.textContent = session.statusText();
-  slStatEl.title = (st.mock ? "Simulador de pruebas (no es Second Life)" : "Sesión con el retransmisor") +
+  slStatEl.title = (st.mock ? (st.mockLabel || "Simulador de pruebas (no es Second Life)") : "Sesión con el retransmisor") +
     "\n" + (st.region && st.region.name ? "región: " + st.region.name : "sin región") +
     (st.parcel && st.parcel.name ? "\nparcela: " + st.parcel.name : "") +
     (st.pingMs ? "\n" + st.pingMs + " ms" : "") +
@@ -434,6 +440,7 @@ function boot() {
     get net() { return net; },
     get peers() { return peers; },
     get session() { return session; },
+    get lldp() { return lldpRelay; },
     get gameHud() { return gh; },
     hud: () => mount && mount.hud && mount.hud(),
     probe: (cases, o) => mount && mount.probeCases && mount.probeCases(cases, o),
@@ -458,6 +465,7 @@ function startRegionSession(cfg) {
     isBuildMode: () => !!(bt && bt.state.active),
     mock: cfg.mode === "mock",
     url: cfg.relay ? cfg.relay.url : "",
+    socketFactory: cfg.relay ? cfg.relay.socketFactory : null,
     spawn: cfg.spawn || null,
     onStatus: () => paintSessionChip(),
     onLog: (text, cls) => {
@@ -470,7 +478,7 @@ function startRegionSession(cfg) {
     },
     onAvatar: () => paintSessionChip(),
   });
-  if (cfg.mode === "session") {
+  if (cfg.mode === "session" || cfg.mode === "lldp") {
     session.setCredentials({ mode: "session", session: cfg.credentials });
   } else if (cfg.mode === "credentials") {
     session.setCredentials(Object.assign({ mode: "credentials" }, cfg.credentials));
@@ -480,13 +488,19 @@ function startRegionSession(cfg) {
   }
   session.connect();
   paintSessionChip();
+  lldpRelay = cfg.lldp || null;
   if (chatPanel) {
-    chatPanel.line({
-      kind: "region", speaker: "visor",
-      text: cfg.mode === "mock"
-        ? "Conectando con el simulador de pruebas (región inventada, no es Second Life)…"
-        : "Conectando con el retransmisor " + (cfg.relay ? cfg.relay.url : "") + "…",
-    });
+    let texto;
+    if (cfg.mode === "mock") {
+      texto = "Conectando con el simulador de pruebas (región inventada, no es Second Life)…";
+    } else if (cfg.mode === "lldp") {
+      const r = (session.state.region && session.state.region.name) || "";
+      texto = "Conectando por LLUDP con " + (r ? "la región «" + r + "»" : "la región de Second Life") +
+        (cfg.relay && cfg.relay.mock ? " (región simulada en JavaScript, no es Second Life)" : "") + "…";
+    } else {
+      texto = "Conectando con el retransmisor " + (cfg.relay ? cfg.relay.url : "") + "…";
+    }
+    chatPanel.line({ kind: "region", speaker: "visor", text: texto });
   }
 }
 

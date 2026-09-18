@@ -1,10 +1,17 @@
 // MainActivity.kt -- la app entera cabe aqui.
 //
-// Arranca dos servidores locales (el del visor y el del retransmisor interno),
-// crea un WebView y le carga el visor desde http://127.0.0.1. El visor se
-// conecta despues, el solo, a ws://127.0.0.1:PUERTO (el puerto viaja en la
-// direccion como `?relay=`). Con eso la app es autonoma: un solo APK, sin
-// ninguna otra app ni proceso de por medio.
+// Arranca dos servidores locales (el del visor y el PUENTE UDP), crea un WebView
+// y le carga el visor desde http://127.0.0.1. El visor se conecta despues, el
+// solo, al puente en ws://127.0.0.1:PUERTO (el puerto viaja en la direccion
+// como `?udp=`). Con eso la app es autonoma y habla LLUDP con un simulador de
+// Second Life DE VERDAD: un solo APK, sin ninguna otra app ni proceso de por
+// medio, y sin retransmisor externo.
+//
+// El reparto es a proposito: aqui (Kotlin) solo se mueven datagramas UDP, y el
+// protocolo de Second Life entero vive en `viewer/src/sl/lludp/` en JavaScript,
+// que es el mismo codigo que corre en el navegador y que se prueba con el
+// simulador en JS. Menos codigo nativo = menos que pueda fallar sin dejar
+// rastro en un telefono.
 
 package org.visor.sl
 
@@ -24,7 +31,7 @@ import java.net.URLEncoder
 class MainActivity : Activity() {
 
     private var viewer: ViewerServer? = null
-    private var relay: RelayServer? = null
+    private var puente: UdpBridgeServer? = null
     private var webView: WebView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,23 +91,25 @@ class MainActivity : Activity() {
             v.start()
             viewer = v
 
-            // El puerto del retransmisor lo elegimos aqui y se lo pasamos; no
-            // se pregunta a RelayServer (su clase base ya tiene un getPort() y
+            // El puerto del puente lo elegimos aqui y se lo pasamos; no se
+            // pregunta a UdpBridgeServer (su clase base ya tiene un getPort() y
             // pedirlo por nombre daria un choque de firmas en Kotlin).
-            val relayPort = freePort()
-            val r = RelayServer(relayPort, ::log)
-            r.start()
-            relay = r
+            val puertoPuente = freePort()
+            val p = UdpBridgeServer(puertoPuente, ::log)
+            p.start()
+            puente = p
 
-            val relayUrl = "ws://127.0.0.1:" + relayPort
-            // `#sl` abre directamente la pantalla de entrada (nombre, contraseña
-            // y retransmisor), que es la pantalla natural de la app: es la unica
-            // forma de entrar en Second Life, y el retransmisor interno ya llega
-            // relleno. Sin el `#sl` el visor arrancaria en el mundo vacio y
-            // habria que buscar "Iniciar sesion" en la barra de arriba.
-            val url = "http://127.0.0.1:" + v.port + "/index.html?relay=" +
-                URLEncoder.encode(relayUrl, "UTF-8") + "#sl"
+            val puenteUrl = "ws://127.0.0.1:" + puertoPuente
+            // `?udp=` es lo que le dice al visor que abra el circuito LLUDP por
+            // este puente: no hace falta retransmisor ni escribir ninguna
+            // direccion a mano. `#sl` abre directamente la pantalla de entrada
+            // (nombre y contraseña), que es la pantalla natural de la app. Sin
+            // el `#sl` el visor arrancaria en el mundo vacio y habria que buscar
+            // "Iniciar sesion" en la barra de arriba.
+            val url = "http://127.0.0.1:" + v.port + "/index.html?udp=" +
+                URLEncoder.encode(puenteUrl, "UTF-8") + "#sl"
             log("visor en " + url)
+            log("puente UDP: " + puenteUrl + " (el visor hablara LLUDP por aqui)")
             runOnUiThread { webView?.loadUrl(url) }
         } catch (e: Exception) {
             val detalle = e.message ?: e.toString()
@@ -133,7 +142,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        try { relay?.stop() } catch (e: Exception) { /* ya parado */ }
+        try { puente?.stop() } catch (e: Exception) { /* ya parado */ }
         try { viewer?.stop() } catch (e: Exception) { /* ya parado */ }
         try { webView?.destroy() } catch (e: Exception) { /* ya destruido */ }
         super.onDestroy()

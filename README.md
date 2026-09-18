@@ -2,27 +2,41 @@
 
 Una app Android que lleva dentro el visor de Second Life del proyecto: una
 `WebView` a pantalla completa con el visor web, un servidor local que le sirve
-los archivos, y un nucleo nativo que abre el socket UDP que el navegador no
-puede abrir. El objetivo es tener el visor en el bolsillo sin depender de un
-retransmisor externo.
+los archivos, un **puente UDP** que abre el socket que el navegador no puede
+abrir, y el panel de depuración e informes. Un solo APK, un solo icono, **sin
+retransmisor externo ni ninguna otra app**.
 
-## Que hace esta version (Fase 1)
+## Que hace esta version
 
-- Arranca el visor web completo (mundo de pruebas, constructor de prims,
-  inventario, aspecto del avatar, importar mallas `.glb`/`.obj`/`.llm`).
-- Guarda de verdad en el telefono: la region, el inventario y los avatares se
+- Arranca el visor web completo: render de la región, avatar con su forma real,
+  constructor de prims, inventario local, apariencia, LSL y mallas `.glm`.
+- **Entra en Second Life de verdad.** En la pantalla de entrada escribes tu
+  nombre y contraseña y el visor hace el login real (XML-RPC), abre el circuito
+  UDP con el simulador con el que te toca y te deja **andar, correr, volar,
+  chatear, tocar prims y teletransportarte dentro de la región**.
+- El **protocolo LLUDP entero (el de Second Life) está en JavaScript**, dentro
+  del visor (`src/sl/lludp/`). Aquí, en Kotlin, solo vive un puente tonto:
+  recibe un datagrama UDP y lo manda como una trama binaria por un WebSocket
+  local, y al revés. ~150 líneas y no entiende ni una palabra del protocolo. La
+  ventaja: el mismo código de protocolo corre en el navegador de escritorio, se
+  prueba sin móvil y solo se mantiene una vez.
+- Guarda de verdad en el teléfono: la región, el inventario y los avatares se
   guardan en el almacenamiento del WebView (IndexedDB), asi que sobreviven al
   cierre de la app.
-- Levanta un **enlace interno** (un servidor WebSocket en `127.0.0.1`) que habla
-  el mismo protocolo que hablaba el retransmisor. La app le pasa su direccion al
-  visor automaticamente, asi que el campo del retransmisor aparece ya relleno.
-- **Todavia no entra en el mundo real de Second Life**: el nucleo nativo
-  contesta al enlace y mantiene la conexion, pero aun no habla LLUDP con los
-  simuladores. Eso es la Fase 2 (ver mas abajo), y es la parte grande.
+- Trae un **panel de depuracion** (Ajustes → Depuracion e informes) que genera un
+  informe de texto con lo que pasa dentro y fuera del visor, para poder mandarlo
+  cuando algo va mal.
 
-En resumen: esta version sirve para comprobar que el visor funciona bien dentro
-de Android, que el enlace interno esta en pie y que el APK se compila y se
-instala. El mundo real viene despues, sobre estos mismos cimientos.
+## Lo que aun no hace (y esta documentado, no es un fallo)
+
+- Las **texturas de la region y los bakes del avatar** son **JPEG2000** y el
+  navegador no las decodifica. Los prims usan su material por defecto y el cuerpo
+  lleva su **forma** real (altura, corpulencia, cara) pero no la textura cocida.
+  Hace falta un decodificador J2C y las *capabilities* de la region.
+- El **inventario, los IM de grupo y la descarga de assets** dependen de las
+  *capabilities* (`seed_capability` + `EventQueueGet`), que aun no estan.
+- El **teletransporte a OTRA region** aun no cambia de circuito: si lo intentas,
+  el visor lo dice y hay que volver a entrar desde la pantalla de inicio.
 
 ## Compilarlo en tu ordenador (opcional)
 
@@ -60,7 +74,7 @@ empiezan por punto. Descomprime el `.zip` del proyecto, y:
 2. *File → Clone repository* → elige `yossfu/visor-sl` y una carpeta local.
 3. Copia TODO el contenido del `.zip` descomprimido encima del clon
    (sobrescribiendo lo que haya).
-4. En GitHub Desktop escribe un resumen ("Visor completo + icono + arreglos"),
+4. En GitHub Desktop escribe un resumen ("Visor completo + puente UDP + arreglos"),
    pulsa *Commit to main* y luego *Push origin*.
 5. Pestana **Actions** del repositorio → *Build APK* → *Run workflow* (o espera
    al que se lanza solo con el push).
@@ -92,7 +106,7 @@ Debe quedar en la raiz del repositorio: `.github/`, `.gitignore`, `app/`,
 ```bash
 git init
 git add -A
-git commit -m "Visor SL: primera version Android"
+git commit -m "Visor SL con puente UDP"
 git branch -M main
 git remote add origin https://github.com/TU-USUARIO/TU-REPO.git
 git push -u origin main
@@ -127,9 +141,9 @@ En el repositorio (que arma `prepare-repo.mjs`) la raiz es a la vez el visor y e
 proyecto Android:
 
 ```
-index.html                    <- pagina del visor (sin el bloque de servidor)
-env.js                        <- rellena `window.root` (kv, superFetch, relay)
-src/                          <- todo el codigo del visor
+index.html                    <- pagina del visor
+env.js                        <- rellena `window.root` y `window.__SL_APP__`
+src/                          <- todo el codigo del visor (incluye src/sl/lludp/)
 build-viewer.mjs              <- copia index.html + env.js + src/** a los assets
 fetch-character-assets.mjs    <- baja el modelo real del avatar a los assets
 prepare-repo.mjs              <- arma ESTA carpeta para subirla a GitHub
@@ -140,8 +154,8 @@ app/src/main/
     MainActivity.kt           <- la WebView, el arranque y el ciclo de vida
     ViewerServer.kt           <- sirve los assets por http://127.0.0.1
                                  (y el puente de red /proxy?url=... de env.js)
-    RelayServer.kt            <- enlace WebSocket interno con el visor
-    FrameCodec.kt             <- el formato binario de los mensajes del enlace
+    UdpBridgeServer.kt        <- EL PUENTE UDP: WebSocket local + DatagramSocket
+                                 (1 trama binaria = 1 datagrama)
     VisorDiag.kt              <- depuracion e informes (window.VisorDiag)
   res/drawable/ic_launcher_foreground.xml   <- el icono: un "prim" isometrico
   res/mipmap-anydpi-v26/ic_launcher.xml     <- icono adaptativo (Android 8+)
@@ -153,10 +167,29 @@ settings.gradle.kts
 gradle.properties
 ```
 
-El enlace interno habla el mismo protocolo que antes hablaba el retransmisor
-(las mismas tramas que `src/sl/relay.js` y `src/sl/bin.js`
-definen). Eso es a proposito: cuando el nucleo nativo aprenda a hablar LLUDP,
-no hay que tocar ni una linea del visor.
+### El puente UDP, en una pantalla
+
+`MainActivity` arranca `ViewerServer` (los assets) y `UdpBridgeServer`; a este
+ultimo le elige un puerto libre y carga el visor con la direccion del puente:
+
+```
+http://127.0.0.1:<puertoVisor>/index.html?udp=ws://127.0.0.1:<puertoPuente>#sl
+```
+
+El visor ve `?udp=...`, monta el nucleo LLUDP y abre el circuito a traves de ese
+WebSocket. El protocolo del puente es minusculo:
+
+1. La primera trama **de texto** es `{"cmd":"connect","host":H,"port":P}` y el
+   puente responde `{"ok":true,"localPort":N}` o `{"error":"..."}`.
+2. A partir de ahi, **cada trama binaria es un datagrama**, en los dos sentidos.
+3. `{"cmd":"close"}` cierra; `{"cmd":"status"}` pide un resumen.
+
+El `DatagramSocket` es *unconnected* (recibe de cualquiera y manda a `host:port`),
+con `soTimeout` de 500 ms y bufer de recepcion de 1 MB. Repetir `connect` con
+otro destino **reapunta** sin cambiar el puerto local (para el teletransporte).
+
+El enlace de red del visor (`src/sl/relay.js`) sigue existiendo para los modos
+antiguos (retransmisor `wss://`), pero la app ya no lo usa.
 
 ## El icono del lanzador
 
@@ -179,8 +212,7 @@ a PNG con `convertToBlob`, escalando por `tamano/108`.
 ## La interfaz en el movil
 
 La app **abre directamente la pantalla de entrada** (`#sl`: nombre, contrasena,
-2FA y retransmisor, con el enlace interno ya relleno), que es su pantalla
-natural: es la unica forma de entrar en Second Life.
+2FA), que es su pantalla natural: es la unica forma de entrar en Second Life.
 
 Todo el aspecto tactil cuelga de la clase `body.touch`, y esa clase la decide
 `src/app.js` al cargar —no el visor al montarse—, porque si no la pantalla de
@@ -215,36 +247,39 @@ cuenta lo que pasa y genera un **informe de texto**. Dentro del APK, `VisorDiag`
 expone `window.VisorDiag` al visor: los informes se guardan en
 `Android/data/org.visor.sl/files/informes/` (sin pedir permisos de
 almacenamiento) y se pueden **compartir** o **copiar** para mandarlos. El informe
-incluye tambien un registro nativo (arranque de servidores, pings del enlace,
-404 del servidor de assets), que es lo que la consola del navegador no veria.
-Todo el detalle esta en [`DIAGNOSTICS.md`](DIAGNOSTICS.md) en el proyecto.
+incluye tambien un registro nativo (arranque de servidores, datagramas que pasan
+por el puente, 404 del servidor de assets), que es lo que la consola del
+navegador no veria. Todo el detalle esta en [`DIAGNOSTICS.md`](DIAGNOSTICS.md) en
+el proyecto.
 
 ## Errores de compilacion ya resueltos
 
-- **`Accidental override: ... same JVM signature (getPort()I)` en
-  `RelayServer.kt`.** `WebSocketServer` ya expone `getPort()`; un
-  `val port: Int` en la subclase tiene la misma firma JVM y Kotlin lo rechaza.
-  Pero **no** basta con borrar esa linea: un parametro de constructor sin `val`
-  no se ve desde los metodos y `onStart()` necesita el puerto, y ademas
-  `) : WebSocketServer(InetSocketAddress("127.0.0.1", relayPort)) {` es
-  imprescindible (borrarla deja el constructor abierto y se lleva por delante
-  toda la clase, con una cascada de errores en `MainActivity.kt`). La forma
-  correcta es la que esta ahora: `private val relayPort` en el constructor
-  (nombre distinto al getter heredado), la clase base recibe `relayPort`, y
-  `MainActivity` guarda el puerto que eligio en una variable local.
+- **`Accidental override: ... same JVM signature (getPort()I)`.** Pasaba en el
+  antiguo `RelayServer.kt`: `WebSocketServer` ya expone `getPort()`, y un
+  `val port: Int` en la subclase tiene la misma firma JVM. En
+  `UdpBridgeServer.kt` el puerto es un parametro de constructor
+  (`private val puertoEscucha`) y el puerto de escucha real se pregunta por
+  `getPort()` (heredado). `MainActivity` no adivina puertos: elige uno libre con
+  un `ServerSocket(0)` y se lo pasa al construirlo.
+- **El APK no puede abrir `ws://` si el WebView se sirve por `https`.** No pasa
+  aqui (todo es `http://127.0.0.1`), pero si algun dia se sirve por TLS habria
+  que usar `wss://` o habilitar contenido mixto (ya esta en `ALWAYS_ALLOW`).
 
-## Fase 2: el mundo real
+## El mundo real: como funciona por dentro
 
-El protocolo de Second Life (LLUDP) es grande — login, circuito de mensajes,
-capabilities, colas de eventos, transferencia de assets, terreno, prims,
-avatares — y ya existe un proyecto que lo tiene resuelto en Kotlin:
-[Linkpoint](https://github.com/Kaleaon/Linkpoint) (licencia MIT). Su parte de
-protocolo funciona; lo que le falla es justo lo que a nosotros nos sobra: el
-renderizado 3D. El plan es portar su capa de protocolo al `RelayServer` de esta
-app, mensaje a mensaje, empezando por el login y el circuito, y comprobando cada
-paso contra un simulador real.
+En una frase: **el protocolo, en JavaScript; el socket UDP, en Kotlin.**
 
-## Licencia
+1. El visor hace el login real con tu nombre y contrasena y recibe del servidor
+   el `circuit_code`, el `session_id`, el `agent_id` y el `sim_ip:sim_port`.
+2. `src/sl/lludp/gateway.js` pide al puente `connect(host, port)` y manda
+   `UseCircuitCode`.
+3. Llega `RegionHandshake`, se contesta, se manda `AgentThrottle` y
+   `CompleteAgentMovement`, y empiezan a llegar `LayerData` (terreno) y
+   `ObjectUpdate` (prims) y `AvatarAppearance` (residentes).
+4. Ya esta: `AgentUpdate` a 10 Hz lleva tu posicion al simulador, `ChatFromViewer`
+   manda lo que escribes, `ObjectGrab`/`ObjectDeGrab` tocan prims y
+   `TeleportLocationRequest` te mueve dentro de la region.
 
-El visor es codigo propio. La parte que se reutilice de Linkpoint conserva su
-licencia MIT (ver `LICENSE-LINKPOINT` cuando se incorpore).
+Todo eso se puede probar **sin movil** en el navegador con `?udp=sim`, que pone
+un simulador de region en JavaScript que habla el protocolo de verdad. Es la
+razon de que el nucleo sea JavaScript: se verifica antes de tocar el telefono.

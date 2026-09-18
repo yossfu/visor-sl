@@ -12,11 +12,16 @@ No hay build step: son módulos ES que el navegador carga directamente.
 
 Fases 1 (geometría), 2 (visor), 3 (construcción), 4 (apariencia), 5 (mini-LSL),
 6 (multijugador con `server-plugin`), 7 (metadatos, responsive y rendimiento),
-8 (visor de Second Life de verdad, salvo el retransmisor) y 9 (avatares reales:
-cuerpo de sistema, texturas, mallas `.llm` y animaciones `.anim`) terminadas y
-verificadas. La única pieza que no puede vivir en el navegador —el proceso que
-habla LLUDP con el simulador— sigue especificada, trama a trama, en
-[`VIEWER-REAL.md`](VIEWER-REAL.md).
+8 (visor de Second Life de verdad), 9 (avatares reales: cuerpo de sistema,
+texturas, mallas `.llm` y animaciones `.anim`) y 10 (el núcleo **LLUDP en
+JavaScript** y la app Android, que **entra en regiones de Second Life reales**)
+terminadas y verificadas.
+
+Hable con un simulador de Second Life de verdad (mover, chatear, tocar prims,
+teletransporte dentro de la región) se hace con **todo el protocolo LLUDP escrito
+en JavaScript** (`src/sl/lludp/`). La única pieza que no puede vivir en el
+navegador es mover datagramas UDP: la trae la **app Android** (un puente tonto de
+~150 líneas de Kotlin). Ver "Modelo del núcleo LLUDP" y [`ANDROID.md`](ANDROID.md).
 
 > **Forma del avatar (Fase 9).** El visor deforma el cuerpo real de sistema con
 > los MISMOS parámetros de `avatar_lad.xml` que usa Second Life, así que el
@@ -31,20 +36,22 @@ habla LLUDP con el simulador— sigue especificada, trama a trama, en
 > un informe que se guarda/comparte/copia. En el APK el informe se escribe en una
 > carpeta del teléfono y se puede mandar. Ver [`DIAGNOSTICS.md`](DIAGNOSTICS.md).
 
-> **App Android (fase 10).** Para tener el visor en el movil sin depender de un
-> retransmisor externo se esta construyendo una app Android que lleva el visor
-> dentro (WebView + servidores locales) y un nucleo nativo que abriria el socket
-> UDP. El diseno completo y las fases estan en [`ANDROID.md`](ANDROID.md), y el
-> proyecto Android ya escrito vive en [`android/`](android/) (su README explica
-> como compilarlo o subirlo a GitHub para que lo compile Actions).
+> **App Android (fase 10).** El visor está dentro de una app Android (WebView +
+> servidores locales) y lo único nativo que queda es un **puente UDP** que mueve
+> datagramas entre el WebView y el simulador de Second Life; el protocolo LLUDP
+> entero corre en JavaScript, en el mismo código que se prueba con el simulador
+> de `src/sl/lludp/sim.js`. Un APK, sin retransmisor externo. El diseño está en
+> [`ANDROID.md`](ANDROID.md) y el proyecto Android vive en [`android/`](android/)
+> (su README explica cómo compilarlo o subirlo a GitHub para que lo compile
+> Actions).
 
 > **Fase 8 — visor real.** `src/sl/` trae el lado del navegador de un visor de
-> Second Life: login real (`login.js`), protocolo y transporte con el
-> retransmisor (`relay.js`), sesión (`session.js`), pantalla de arranque
-> (`startPanel.js`) y un simulador de pruebas que sirve una región inventada
-> desde el propio navegador (`mockServer.js`). Lo único que no puede vivir en el
-> navegador —el proceso que habla LLUDP con el simulador— está especificado en
-> [`VIEWER-REAL.md`](VIEWER-REAL.md), trama a trama.
+> Second Life: login real (`login.js`), el protocolo del enlace (`relay.js`),
+> sesión (`session.js`), pantalla de arranque (`startPanel.js`), un simulador de
+> pruebas que sirve una región inventada desde el propio navegador
+> (`mockServer.js`) y el **núcleo LLUDP** (`src/sl/lludp/`: plantillas, códec,
+> circuito UDP, terreno, objetos, avatares y el retransmisor `gateway.js`). Ver
+> "Modelo del núcleo LLUDP".
 
 - [x] `src/llvolume.js` — port del teselador de LL (`generateVolume`).
 - [x] `src/prims.js` — tabla de formas de SL y `PrimParams` (los campos del
@@ -126,6 +133,12 @@ habla LLUDP con el simulador— sigue especificada, trama a trama, en
       - `src/sl/anim.js` — animaciones de SL (`.anim`): rotaciones y posiciones
         por hueso, prioridades, bucle, `ease` y mezcla sobre el esqueleto;
         autotest 41/41.
+      - `src/sl/lludp/` — **el núcleo LLUDP** (Fase 10): plantillas del protocolo,
+        códec binario, circuito UDP con acks/reenvíos/ping, terreno (DCT),
+        objetos, avatares, el retransmisor `gateway.js` y un simulador de región
+        real (`sim.js`). 812 comprobaciones en verde. Ver "Modelo del núcleo
+        LLUDP".
+      - `src/sl/avatarLad.js` / `src/sl/avatarMesh.js` — forma real del avatar.
 - [x] `src/avatarRealBody.js` + `src/sl/slAppearance.js` + `src/sl/avatarLad.js` —
       la **forma real** del avatar: resuelve los parámetros de `avatar_lad.xml`
       sobre el cuerpo de sistema (morphs y deltas de hueso), deriva el **sexo del
@@ -434,9 +447,11 @@ asumen ese comportamiento.
 ## Modelo del visor real (Fase 8)
 
 El visor puede, además de su región local y del multijugador, **entrar en una
-región de Second Life de verdad**. La pieza que no puede vivir en el navegador
-—el proceso que habla LLUDP con el simulador— está especificada en
-[`VIEWER-REAL.md`](VIEWER-REAL.md). Lo que sí vive aquí:
+región de Second Life de verdad**. Dentro de un navegador no se puede abrir un
+socket UDP, así que el protocolo LLUDP (`src/sl/lludp/`, ver "Modelo del núcleo
+LLUDP") habla con un **transporte** que es o un simulador de región en JavaScript
+(`?udp=sim`) o el **puente UDP** de la app Android (`?udp=ws://127.0.0.1:PUERTO`).
+Lo que vive aquí:
 
 - **`src/sl/login.js`** — login real: XML-RPC `login_to_simulator` a
   `login.agni.lindenlab.com` (o aditi) a través de `superFetch` (el servidor de
@@ -532,12 +547,65 @@ de `avatarBody.js` (que se queda como respaldo cuando no hay activos). Piezas:
   (Horn/Kabsch)** con escala, y retransmisión de rotaciones **y traslaciones**
   (así la malla acompaña el balanceo de la pelvis al andar); 17/17.
 
-Lo que **no** se puede hacer sin el retransmisor: traer los activos *de una
-cuenta* (inventario, mallas y animaciones que el usuario compró, bakes de su
+Lo que **no** se puede hacer sin una sesión autenticada: traer los activos *de
+una cuenta* (inventario, mallas y animaciones que el usuario compró, bakes de su
 cara). Eso exige su sesión autenticada; el camino está en `VIEWER-REAL.md` §12.
 Lo que sí se trae sin sesión: el cuerpo/ cabeza de sistema y sus texturas (del
 repositorio del visor) y cualquier fichero que el usuario suelte (`.llm`,
 `.anim`, `.glb`, `.obj`).
+
+## Modelo del núcleo LLUDP
+
+Todo el protocolo de Second Life (LLUDP: paquetes UDP, acks, reenvíos, ping,
+handshake de región, terreno, objetos, avatares, chat, toque, teletransporte)
+vive en **JavaScript**, en `src/sl/lludp/`. La regla de oro: **lo nativo solo
+mueve bytes**. Un navegador no puede abrir un socket UDP, así que el circuito le
+habla a un objeto de transporte con `send(bytes)` y un evento `message`, y ese
+transporte es:
+
+- **`?udp=sim`** — un simulador de región entero en JavaScript (`sim.js`), que
+  habla LLUDP de verdad por el cable (coordenadas SL reales, DCT de terreno,
+  `ObjectUpdate` con el blob binario de SL…). Es la **especificación ejecutable
+  del lado servidor** y con él se depura todo sin móvil.
+- **`?udp=ws://127.0.0.1:PUERTO`** — el **puente UDP** de la app Android
+  (`UdpBridgeServer.kt`): un WebSocket en el que cada trama binaria es un
+  datagrama, y una primera trama de texto `{"cmd":"connect","host":…,"port":…}`.
+  Ahí sí se habla con un simulador de Second Life de verdad.
+
+Piezas (todas con autotest, **812 comprobaciones en verde**):
+
+- `templates.js` (68 KB, **483 mensajes** del protocolo), `template.js`
+  (`TemplateSet`) y `codec.js` (bloques, compresión de ceros, uuids, utf8 fijo).
+- `circuit.js` — el circuito: numeración de secuencia, cola de pendientes,
+  reenvío a los 3 s (×10), acks de gorra cada 11 paquetes, ping automático y
+  medida de RTT/pérdida.
+- `terrain.js` — terreno (`LayerData` con DCT/IDCT, 16×16 parches de 17×17).
+- `objects.js` — objetos: `ObjectUpdate` (blob compacto), comprimido, terse,
+  update de propiedades, `TextureEntry` y las conversiones SL↔visor.
+- `agent.js` — todo lo que manda el visor: `UseCircuitCode`, `AgentThrottle`,
+  `CompleteAgentMovement`, `AgentUpdate`, `ChatFromViewer`, `ObjectGrab`/
+  `ObjectDeGrab`, `TeleportLocationRequest`, `LogoutRequest`.
+- `gateway.js` — **el retransmisor**: mantiene el circuito, traduce entre el
+  protocolo del enlace (`relay.js`) y LLUDP, y expone todo al visor. Aquí está
+  el estado de la sesión (fase, región, terreno, prims, residentes, chat).
+- `sim.js` — el simulador de región (72 prims de ejemplo, residentes, chat que
+  responde, terreno, `RegionHandshake`, `SimStats`…).
+- `udp.js` — los transportes (par de pruebas en memoria y el puente WebSocket).
+
+En modo real, el flujo es: login XML-RPC → `simIp`/`simPort`/`circuitCode`/
+`sessionId` → el gateway abre el puente UDP y manda `UseCircuitCode` →
+`RegionHandshake` (+ su respuesta, `AgentThrottle`, `CompleteAgentMovement`) →
+terreno y objetos en cola → **listo**. A partir de ahí el visor manda
+`AgentUpdate` a 10 Hz y puede chatear, tocar prims (por uuid) y teletransportarse
+dentro de la región. Verificado de extremo a extremo contra el simulador.
+
+Límites honestos (documentados, no bugs): las texturas de Second Life son
+**JPEG2000** y el navegador no las decodifica, así que el visor no pide assets y
+los prims usan su material por defecto (falta un `caps.js` con la *seed
+capability* y un decodificador J2C); los **bakes** (BoM) son J2C por lo mismo, así
+que se aplica la *forma* real pero no la textura cocida; y el teletransporte a
+**otra región** todavía no cambia de circuito (avisa claro y se vuelve a entrar
+desde la pantalla de inicio). Todo el detalle en [`VIEWER-REAL.md`](VIEWER-REAL.md).
 
 ## Modelo de la forma real del avatar (SL, Bento y BoM)
 

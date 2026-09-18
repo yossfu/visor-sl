@@ -35,7 +35,9 @@
 //
 // SEGURIDAD: la carpeta es la de la propia app (`getExternalFilesDir`), no hace
 // falta ningun permiso de almacenamiento, y los informes NO contienen la
-// contrasena (RelayServer.kt solo registra el MODO de login, nunca la clave).
+// contrasena: el login (con la clave) lo hace el propio visor contra Linden Lab
+// por HTTPS, y al lado nativo solo le llegan los datagramas del protocolo del
+// mundo, que llevan el identificador de sesion pero nunca la contrasena.
 
 package org.visor.sl
 

@@ -17,23 +17,32 @@
 //                             no mandan cabeceras CORS, asi que la peticion la
 //                             hace el lado nativo desde fuera del navegador.
 //   * `root.createServerSocket` -> NO se define: el multijugador de la app va
-//                             por dentro del enlace con el nucleo nativo
-//                             (`RelayServer`), no por el servidor de perchance.
-//                             `src/net.js` detecta su ausencia y degrada solo.
+//                             por dentro del enlace con el puente UDP nativo
+//                             (`UdpBridgeServer`), no por el servidor de
+//                             perchance. `src/net.js` detecta su ausencia y
+//                             degrada solo.
 //
 // Ademas lee el parametro `?relay=ws://127.0.0.1:PUERTO` que le pasa
 // `MainActivity` (el enlace interno con el nucleo nativo) y lo deja escrito en
 // el campo del retransmisor, para que el usuario no tenga que copiarlo a mano.
+//
+// Y lee `?udp=ws://127.0.0.1:PUERTO`: el puente de datagramas UDP que abre
+// `UdpBridgeServer` en el propio telefono. Con el, el visor habla LLUDP con un
+// simulador de Second Life DE VERDAD: el nucleo nativo solo mueve bytes UDP, y
+// todo el protocolo lo lleva `viewer/src/sl/lludp/`. (`?relay=` sigue valiendo
+// para el retransmisor de siempre, que ya no hace falta.)
 
 (function () {
   "use strict";
 
   var params = new URLSearchParams(window.location.search || "");
   var relayUrl = (params.get("relay") || "").trim();
+  var udpUrl = (params.get("udp") || "").trim();
 
   window.__SL_APP__ = {
     android: true,
     relayUrl: relayUrl,
+    udpUrl: udpUrl,
     version: "0.1.0",
   };
 
@@ -497,5 +506,5 @@
   // La prueba de salida va en segundo plano: no retrasa el arranque.
   setTimeout(probarSalida, 1500);
 
-  console.log("[env] app Android lista. Enlace interno:", relayUrl || "(sin relay)");
+  console.log("[env] app Android lista. Enlace interno:", relayUrl || "(sin relay)", "· puente UDP:", udpUrl || "(sin puente)");
 })();
