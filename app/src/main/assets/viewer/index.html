@@ -1,0 +1,915 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Visor SL</title>
+</head>
+<body>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden; background: #10141c;
+    color: #e8eef8; text-align: left;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  #viewCanvas { position: fixed; inset: 0; display: block; touch-action: none; }
+  .hud {
+    position: fixed; z-index: 10; display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; border-radius: 10px; font-size: 13px; line-height: 1.35;
+    background: rgba(12, 16, 24, 0.68); border: 1px solid rgba(120, 150, 200, 0.22);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    pointer-events: auto;
+  }
+  /* Barra superior + linea de datos en una sola columna fija: asi se apilan
+     solas y no hay que adivinar la altura de la barra (que cambia al pasar
+     linea en pantallas estrechas). */
+  #hudTopCtn {
+    position: fixed; z-index: 10; top: 10px; left: 10px; right: 10px;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+    pointer-events: none;
+  }
+  #hudTopCtn .hud { position: static; }
+  /* En pantallas muy anchas la barra no se estira hasta el borde: se queda
+     pegada a la izquierda con un ancho maximo legible. */
+  #hudBarCtn { width: 100%; max-width: 1180px; justify-content: space-between; flex-wrap: wrap; }
+  #hudBarCtn .title { font-weight: 600; letter-spacing: 0.2px; }
+  .dim { opacity: 0.72; }
+  #hudBarCtn nav { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+  #hudBarCtn nav a {
+    color: #bcd4f6; text-decoration: none; padding: 3px 8px; border-radius: 7px;
+    border: 1px solid rgba(120, 150, 200, 0.25); font-size: 12px; white-space: nowrap;
+  }
+  #hudBarCtn nav a:hover { background: rgba(120, 160, 220, 0.18); }
+  #hudBarCtn nav a.on { background: rgba(120, 160, 220, 0.28); border-color: rgba(160, 200, 255, 0.5); }
+  #hudFootCtn { font-size: 12px; max-width: min(620px, 72vw); }
+  #hudHelpCtn { bottom: 10px; right: 10px; font-size: 12px; flex-direction: column; align-items: flex-start; gap: 2px; }
+  #hudHelpCtn kbd {
+    background: rgba(150, 180, 230, 0.16); border: 1px solid rgba(150, 180, 230, 0.3);
+    border-radius: 4px; padding: 0 4px; font-size: 11px; font-family: inherit;
+  }
+  #viewStatEl { font-variant-numeric: tabular-nums; }
+  /* --- mando tactil: joystick analogico flotante + racimo de acciones ------ */
+  #touchCtn { position: fixed; inset: 0; z-index: 12; pointer-events: none; display: none; }
+  body.touch.in-viewer #touchCtn { display: block; }
+  /* La zona del joystick es la mitad izquierda de abajo: el dedo se apoya donde
+     le viene comodo y la base aparece justo debajo (como en Genshin), en vez de
+     tener que acertarle a un circulo fijo. */
+  #joyPad {
+    position: absolute; left: 0; bottom: 0; width: 50%; height: 186px;
+    pointer-events: auto; touch-action: none;
+  }
+  #joyBase {
+    position: fixed; left: -999px; top: -999px; width: 120px; height: 120px;
+    margin: -60px 0 0 -60px; border-radius: 50%;
+    border: 1px solid rgba(150, 185, 240, 0.3);
+    background: radial-gradient(circle at 50% 50%, rgba(20, 28, 42, 0.32), rgba(10, 14, 22, 0.22));
+    opacity: 0.85; transition: opacity 0.12s ease, border-color 0.12s ease;
+  }
+  body.joy #joyBase { opacity: 1; border-color: rgba(185, 214, 255, 0.55); }
+  #joyKnob {
+    position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; margin: -27px 0 0 -27px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 50% 34%, rgba(200, 222, 255, 0.72), rgba(118, 152, 202, 0.5));
+    border: 1px solid rgba(225, 238, 255, 0.6);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    transition: transform 0.05s linear;
+  }
+  /* Racimo de acciones abajo a la derecha, en arco alrededor del boton grande
+     (como el ataque de un MOBA): saltar manda, y correr/volar/subir/bajar se
+     reparten por su izquierda y por encima. */
+  #actCtn {
+    position: absolute; right: 12px; bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    width: 172px; height: 146px; pointer-events: none;
+  }
+  .actBtn {
+    position: absolute; width: 56px; height: 56px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    font: inherit; font-size: 11px; font-weight: 600; letter-spacing: 0.2px; color: #e8eef8;
+    background: radial-gradient(circle at 50% 30%, rgba(62, 78, 106, 0.5), rgba(12, 17, 26, 0.5));
+    border: 1px solid rgba(150, 185, 240, 0.34);
+    box-shadow: 0 3px 12px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
+    pointer-events: auto; touch-action: none; -webkit-tap-highlight-color: transparent;
+    transition: transform 0.08s ease, border-color 0.12s ease, background 0.12s ease;
+  }
+  .actBtn:active { transform: scale(0.94); }
+  .actBtn.on {
+    background: radial-gradient(circle at 50% 30%, rgba(104, 146, 208, 0.8), rgba(30, 50, 80, 0.74));
+    border-color: rgba(195, 222, 255, 0.72);
+    box-shadow: 0 0 14px rgba(140, 190, 255, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  }
+  #actJumpBtn { right: 0; bottom: 0; width: 80px; height: 80px; font-size: 13.5px; }
+  /* El aro suave del boton grande: se ve la jerarquia sin gritar. */
+  #actJumpBtn::after {
+    content: ""; position: absolute; inset: -7px; border-radius: 50%;
+    border: 1px solid rgba(150, 185, 240, 0.16); pointer-events: none;
+  }
+  #actRunBtn { right: 88px; bottom: 0; }
+  #actFlyBtn { right: 66px; bottom: 76px; }
+  #actUpBtn, #actDownBtn { display: none; }
+  #actUpBtn { right: 66px; bottom: 76px; }
+  #actDownBtn { right: 88px; bottom: 0; }
+  body.avatar-flying #actRunBtn { display: none; }
+  body.avatar-flying #actUpBtn, body.avatar-flying #actDownBtn { display: flex; }
+
+  /* --- panel de construccion (build.js) --------------------------------- */
+  #buildCtn {
+    position: fixed; z-index: 11; top: 96px; right: 10px;
+    width: min(320px, 86vw); max-height: calc(100% - 108px);
+    display: flex; flex-direction: column; gap: 8px; overflow-y: auto;
+    overscroll-behavior: contain; pointer-events: auto;
+  }
+  #buildCtn[hidden] { display: none; }
+  #buildCtn .bpanel {
+    position: static; flex-direction: column; align-items: stretch; gap: 6px; font-size: 12px;
+  }
+  .bhead { font-weight: 600; opacity: 0.92; }
+  .bheadbtn {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    cursor: pointer; user-select: none; -webkit-user-select: none;
+    padding: 2px 0; border-bottom: 1px solid rgba(140, 175, 230, 0.16);
+  }
+  .bheadbtn .bfold { opacity: 0.75; font-size: 11px; }
+  .bbody { display: flex; flex-direction: column; gap: 6px; padding-top: 2px; }
+  .bbody[hidden] { display: none; }
+  .bdanger { border-color: rgba(255, 150, 140, 0.45); color: #ffd9d4; }
+  .binvlist { flex-direction: column; align-items: stretch; gap: 3px; }
+  .binvlist .brow { gap: 4px; }
+  .binvbtn { flex: 1 1 auto; text-align: left; overflow: hidden; text-overflow: ellipsis; }
+  .binvdel { flex: 0 0 auto; padding: 3px 8px; color: #ffd9d4; }
+  .bmsg { font-size: 11px; color: #dff0ff; border-color: rgba(150, 200, 255, 0.5); }
+  .bmsg[hidden] { display: none; }
+  .bsub { opacity: 0.72; font-size: 11px; margin-top: 2px; }
+  .bnote { opacity: 0.6; font-size: 11px; line-height: 1.3; }
+  .blabel { opacity: 0.8; font-size: 11px; }
+  .brow { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+  .bbtn {
+    font: inherit; font-size: 11px; color: #e8eef8; padding: 4px 7px; border-radius: 7px;
+    background: rgba(20, 28, 42, 0.65); border: 1px solid rgba(120, 150, 200, 0.28);
+    cursor: pointer; white-space: nowrap;
+  }
+  .bbtn:hover { background: rgba(90, 130, 200, 0.28); }
+  .bbtn.on { background: rgba(120, 165, 230, 0.45); border-color: rgba(170, 205, 255, 0.7); }
+  .bfield { flex-wrap: nowrap; }
+  .bfield .blabel { flex: 1 1 42%; }
+  .brange { flex: 1 1 auto; min-width: 60px; accent-color: #7fb2ff; }
+  .bval { width: 46px; text-align: right; font-variant-numeric: tabular-nums; opacity: 0.85; }
+  .bnum {
+    font: inherit; font-size: 11px; color: #e8eef8; background: rgba(8, 12, 20, 0.7);
+    border: 1px solid rgba(120, 150, 200, 0.3); border-radius: 6px; padding: 2px 4px; width: 56px;
+  }
+  .bsel {
+    font: inherit; font-size: 11px; color: #e8eef8; background: rgba(8, 12, 20, 0.7);
+    border: 1px solid rgba(120, 150, 200, 0.3); border-radius: 6px; padding: 2px 4px;
+    flex: 1 1 auto;
+  }
+  .bcheck { display: flex; align-items: center; gap: 4px; font-size: 11px; opacity: 0.85; }
+  .bsw { width: 18px; height: 18px; border-radius: 5px; border: 1px solid rgba(255, 255, 255, 0.25); cursor: pointer; padding: 0; }
+  .bsw.on { outline: 2px solid #cfe0ff; }
+  /* La paleta del panel de apariencia tiene 16 muestras: un poco mas pequenas y
+     con menos hueco para que entren en una sola fila tambien en el telefono. */
+  .bswrow { gap: 4px; }
+  .bswrow .bsw { width: 16px; height: 16px; border-radius: 4px; }
+  .bpick { width: 28px; height: 21px; padding: 0; background: none; border: 1px solid rgba(120, 150, 200, 0.3); border-radius: 6px; }
+  .bfaces { max-height: 140px; overflow-y: auto; }
+  .bfacesbtn { font-size: 10px; padding: 3px 6px; }
+  /* Rejilla de texturas: miniaturas cuadradas, con la elegida marcada. */
+  .btexgrid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; }
+  .btex {
+    position: relative; aspect-ratio: 1 / 1; width: 100%; padding: 0; cursor: pointer;
+    border: 1px solid rgba(120, 150, 200, 0.35); border-radius: 6px;
+    background-color: rgba(8, 12, 20, 0.7); background-size: cover; background-position: center;
+    color: #dfe9f7; font-size: 8px; line-height: 1.05; overflow: hidden;
+  }
+  .btex.on { outline: 2px solid #cfe0ff; border-color: #cfe0ff; }
+  .btex span { display: block; padding: 2px; }
+  .btext {
+    font: inherit; font-size: 11px; color: #e8eef8; background: rgba(8, 12, 20, 0.7);
+    border: 1px solid rgba(120, 150, 200, 0.3); border-radius: 6px; padding: 3px 5px;
+    flex: 1 1 60%; min-width: 0;
+  }
+  #buildToggleBtn { font-size: 11px; }
+  body.build #hudHelpCtn { display: none; }
+  body.touch #buildCtn { top: auto; left: 8px; right: 8px; bottom: 178px; width: auto; max-height: 52vh; }
+  /* Sobre el cielo claro el panel necesita mas cuerpo para que el texto se lea. */
+  body.touch #buildCtn .bpanel { background: rgba(10, 14, 22, 0.85); }
+
+  /* --- texto flotante de los scripts (llSetText y burbujas de chat) --- */
+  #lslTextCtn { position: fixed; inset: 0; z-index: 9; pointer-events: none; overflow: hidden; }
+  .lslLabel {
+    position: absolute; left: 0; top: 0; white-space: pre; font-weight: 600;
+    letter-spacing: 0.2px; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  }
+  .lslBubble {
+    white-space: pre-wrap; font-weight: 500; color: #eaf2ff; max-width: min(340px, 62vw);
+    background: rgba(10, 14, 22, 0.74); border: 1px solid rgba(140, 180, 240, 0.35);
+    border-radius: 10px; padding: 3px 8px; text-shadow: none;
+  }
+  /* Nombre flotante de los otros jugadores (multijugador). */
+  .peerLabel {
+    position: absolute; left: 0; top: 0; white-space: nowrap; font-weight: 600;
+    color: #dff0ff; letter-spacing: 0.2px; padding: 0 5px; border-radius: 8px;
+    background: rgba(10, 14, 22, 0.5); text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  }
+  /* Chip de conexion: punto de color + numero de jugadores. */
+  #netStatEl { display: inline-flex; align-items: center; gap: 6px; }
+  #netDotEl { width: 8px; height: 8px; border-radius: 50%; background: #7a8696; flex: 0 0 auto; }
+  #netStatEl.on #netDotEl { background: #6ee08a; box-shadow: 0 0 6px rgba(110, 224, 138, 0.7); }
+  #netStatEl.busy #netDotEl { background: #ffcc66; }
+  #netStatEl.off #netDotEl { background: #ff8f80; }
+
+  /* --- chat local: lo que dicen los scripts y lo que escribe el usuario --- */
+  #chatCtn {
+    position: fixed; z-index: 10; left: 10px; bottom: 10px;
+    width: min(330px, 46vw); display: flex; flex-direction: column; gap: 5px;
+    padding: 6px 9px; font-size: 12px;
+    /* .hud centra a sus hijos (align-items:center), y en columna eso deja las
+       lineas de chat con ancho de contenido: no parten y se salen del recuadro.
+       Estiradas ocupan el ancho del panel y el texto ya envuelve bien. */
+    align-items: stretch; text-align: left;
+    /* Un poco mas opaco que el resto de HUD: el chat se lee sobre el mundo en
+       movimiento y con el fondo de .hud el texto del 3D se transparentaba. */
+    background: rgba(10, 14, 22, 0.82);
+  }
+  #chatHeadEl { cursor: pointer; display: flex; align-items: center; gap: 6px; font-weight: 600; }
+  #chatHeadEl .grow { flex: 1 1 auto; }
+  #chatHeadEl .bfold { opacity: 0.75; font-size: 11px; }
+  #chatBodyEl { display: flex; flex-direction: column; gap: 4px; }
+  #chatBodyEl[hidden] { display: none; }
+  #chatLogEl {
+    max-height: 22vh; overflow-y: auto; display: flex; flex-direction: column;
+    gap: 2px; font-size: 12px; line-height: 1.3; overscroll-behavior: contain;
+  }
+  .chatLine { word-break: break-word; }
+  .chatWho { opacity: 0.85; }
+  .k-user .chatWho { color: #cfe0ff; }
+  .k-say { color: #e8eef8; }
+  .k-whisper { color: #c9d4e6; font-style: italic; }
+  .k-shout { color: #ffd9a8; }
+  .k-owner { color: #ffd479; }
+  .k-region { color: #b9d5ff; font-style: italic; }
+  .k-debug { color: #ffb3a7; }
+  /* Lo que dicen otros jugadores (multijugador). */
+  .k-peer { color: #d7f7e0; }
+  .k-peer .chatWho { color: #9fe8b4; }
+  .chatLine.out { opacity: 0.5; }
+  .chatFar { opacity: 0.6; font-size: 10px; }
+  #chatRow { display: flex; gap: 4px; align-items: center; }
+  #chatChannelEl { width: 52px; }
+  body.hud-off #chatCtn { display: none; }
+  /* En el movil el chat va por encima del joystick, y mientras se construye
+     (que ya ocupa la franja de abajo) se esconde: ahi manda el editor. */
+  body.touch #chatCtn { left: 8px; right: 8px; width: auto; bottom: calc(186px + env(safe-area-inset-bottom, 0px)); }
+  body.touch #chatLogEl { max-height: 15vh; }
+  /* En el movil, mientras se construye, el chat deja de flotar y se muda dentro
+     del panel (lo hace `placeChat`, en build.js): asi no tapa el joystick ni el
+     panel, y el editor de scripts y la salida de los scripts quedan juntos. */
+  body.touch.build #chatCtn {
+    position: static; left: auto; right: auto; bottom: auto; top: auto;
+    width: auto; z-index: auto; margin: 0 0 6px 0;
+    /* Dentro del panel el chat necesita el mismo fondo opaco que las demas
+       secciones: si no, el texto flotante del mundo se transparenta y estorba. */
+    background: rgba(10, 14, 22, 0.85);
+  }
+  body.touch.build #chatLogEl { max-height: 16vh; }
+
+  /* --- editor de codigo del panel de construccion --- */
+  .bcode {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px; line-height: 1.35; color: #e8eef8; box-sizing: border-box;
+    background: rgba(6, 10, 16, 0.85); border: 1px solid rgba(120, 150, 200, 0.3);
+    border-radius: 6px; padding: 5px 6px; width: 100%; resize: vertical;
+  }
+  .bcode:focus { outline: 1px solid rgba(150, 200, 255, 0.5); }
+  /* En el telefono el panel entero mide ~52vh: el editor no puede crecer mas de
+     la cuenta o empuja el chat local fuera de la seccion visible. */
+  body.touch .bcode { max-height: 30vh; }
+
+  /* Telefono/tableta: las esquinas de abajo son para el mando tactil, asi que
+     los datos suben a la franja superior, la ayuda de teclado se cambia por una
+     pista de gestos y todo se hace un poco mas compacto. */
+  .touch-only { display: none; }
+  .touch-only-inline { display: none; }
+  body.touch .wide-only { display: none; }
+  body.touch .touch-only-inline { display: inline; }
+  body.touch .touch-only { display: block; }
+  body.touch #hudHelpCtn { display: none; }
+  body.touch .hud { font-size: 12px; padding: 6px 9px; gap: 7px; }
+  body.touch #hudBarCtn { align-items: center; gap: 3px 6px; }
+  body.touch #hudBarCtn .title { flex: 0 1 auto; font-size: 12px; }
+  /* El menu de rutas se queda en una sola linea que se desliza con el dedo, en
+     vez de plegarse en tres o cuatro lineas y comerse la franja alta entera. */
+  body.touch #hudBarCtn nav {
+    flex: 1 1 60%; flex-wrap: nowrap; min-width: 0; gap: 4px;
+    overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  body.touch #hudBarCtn nav::-webkit-scrollbar { display: none; }
+  body.touch #hudBarCtn nav a { flex: 0 0 auto; white-space: nowrap; padding: 2px 6px; font-size: 11px; }
+  body.touch #hudFootCtn {
+    width: 100%; max-width: none; flex-direction: column; align-items: flex-start; gap: 2px;
+    cursor: pointer;
+  }
+  /* En el telefono la franja de datos del visor se pliega (un toque la
+     despliega): el mundo respira y las cifras quedan a un toque de distancia. */
+  body.touch #hudFootCtn #viewStatEl {
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+  }
+  body.touch #hudFootCtn #viewStatEl::after { content: " ▸"; opacity: 0.5; }
+  body.touch:not(.foot-fold) #hudFootCtn #viewStatEl::after { content: " ▾"; }
+  body.touch.foot-fold #hudFootCtn > :not(#viewStatEl) { display: none; }
+  body.hud-off .hud { display: none; }
+  body.hud-off.in-viewer #touchCtn { display: none; }
+  #bootErrorEl {
+    position: fixed; z-index: 20; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    max-width: min(560px, 88vw); padding: 14px 18px; border-radius: 12px;
+    background: rgba(60, 16, 20, 0.92); border: 1px solid rgba(255, 130, 130, 0.4);
+    font-size: 13px; white-space: pre-wrap;
+  }
+  #loadingEl {
+    position: fixed; z-index: 15; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    padding: 14px 20px; border-radius: 12px; font-size: 14px;
+    background: rgba(12, 16, 24, 0.8); border: 1px solid rgba(120, 150, 200, 0.25);
+  }
+  #loadingEl .spin {
+    display: inline-block; width: 12px; height: 12px; margin-right: 8px; vertical-align: -1px;
+    border: 2px solid rgba(180, 210, 255, 0.35); border-top-color: #cfe0ff; border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Capa de carga del avatar real (#bodytest): los ficheros de personaje son
+     ~400 KB y tardan un momento, así que se avisa con el mismo girador. */
+  .raOverlay {
+    position: absolute; z-index: 12; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    padding: 14px 20px; border-radius: 12px; font-size: 14px; pointer-events: none;
+    background: rgba(12, 16, 24, 0.85); border: 1px solid rgba(120, 150, 200, 0.25);
+  }
+  .raOverlay .spin {
+    display: inline-block; width: 12px; height: 12px; margin-right: 8px; vertical-align: -1px;
+    border: 2px solid rgba(180, 210, 255, 0.35); border-top-color: #cfe0ff; border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+
+  /* --- editor de forma del avatar real (#bodytest/forma) ------------------- */
+  /* Son los mandos REALES del editor de forma de Second Life (los mismos
+     parámetros de avatar_lad.xml), así que deforman el cuerpo como en SL. */
+  .raShape {
+    position: fixed; z-index: 12; right: 10px; bottom: 84px;
+    width: min(340px, 92vw); max-height: min(56vh, calc(100% - 170px));
+    display: flex; flex-direction: column; gap: 6px; overflow-y: auto;
+    overscroll-behavior: contain; font-size: 12px; text-align: left;
+  }
+  .raShape .raTabs { display: flex; flex-wrap: wrap; gap: 5px; }
+  .raShape .raTabs button { flex: 1 1 auto; }
+  .raShape .raTabs button.on { outline: 1px solid rgba(190, 220, 255, 0.85); }
+  .raShape select { width: 100%; }
+  .raShape .raSlider { display: flex; flex-direction: column; gap: 0; margin: 3px 0; }
+  .raShape .raLab { display: flex; justify-content: space-between; gap: 8px; opacity: 0.88; }
+  .raShape .raLab .raVal { font-variant-numeric: tabular-nums; opacity: 0.8; }
+  .raShape input[type=range] { width: 100%; margin: 1px 0 3px; }
+  .raShape .raEnds { display: flex; justify-content: space-between; font-size: 10px; opacity: 0.6; margin: -2px 0 2px; }
+  .raShape .raSlider.raGender { border-left: 2px solid rgba(190, 220, 255, 0.5); padding-left: 6px; }
+  .raShape .raCount { font-size: 11px; opacity: 0.75; font-variant-numeric: tabular-nums; white-space: pre-wrap; }
+  .raShape .raHint { font-size: 11px; opacity: 0.7; }
+  /* La misma forma del editor, pero dentro de un cajon del HUD (no flotante). */
+  .raShape.raInPanel {
+    position: static; right: auto; bottom: auto; width: 100%; max-height: none;
+    overflow: visible; gap: 5px; font-size: 12px;
+  }
+
+  /* --- panel de mallas de fuera (#meshtest) -------------------------------- */
+  .mgPanel {
+    position: fixed; z-index: 11; top: 96px; left: 10px;
+    width: min(366px, 90vw); max-height: min(58vh, calc(100% - 250px));
+    display: flex; flex-direction: column; gap: 7px; overflow-y: auto;
+    overscroll-behavior: contain; font-size: 12px; align-items: stretch; text-align: left;
+  }
+  .mgRow { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+  .mgRow input[type=text] { flex: 1 1 140px; min-width: 0; }
+  .mgFileBtn { display: inline-flex; align-items: center; cursor: pointer; }
+  .mgDrop {
+    border: 1px dashed rgba(150, 190, 245, 0.45); border-radius: 9px;
+    padding: 9px; text-align: center; font-size: 11px; opacity: 0.8;
+  }
+  .mgDrop.hot { background: rgba(120, 165, 230, 0.22); border-color: rgba(200, 225, 255, 0.85); opacity: 1; }
+  .mgInfo { white-space: pre-wrap; font-size: 11px; line-height: 1.45; opacity: 0.85; font-variant-numeric: tabular-nums; }
+  .mgFiles:empty { display: none; }
+  .mgChip {
+    display: inline-flex; align-items: center; gap: 5px; max-width: 100%;
+    padding: 3px 4px 3px 8px; border-radius: 999px; font-size: 11px;
+    background: rgba(120, 165, 230, 0.16); border: 1px solid rgba(150, 190, 245, 0.35);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .mgChipX { padding: 1px 6px; font-size: 11px; line-height: 1.1; }
+  body.touch .mgPanel { top: 120px; left: 8px; right: 8px; width: auto; max-height: 46vh; }
+
+  /* --- pantalla de inicio de sesión (#sl) --------------------------------- */
+  /* Es la primera cosa que se ve, así que se le da un fondo propio: el visor
+     se pinta detrás del canvas, que aquí está oculto. */
+  body.start { background: radial-gradient(120% 90% at 15% -10%, #1d3557 0%, #101822 55%, #080b12 100%); }
+  body.start #viewCanvas,
+  body.start #hudTopCtn,
+  body.start #hudHelpCtn,
+  body.start #chatCtn,
+  body.start #buildCtn,
+  body.start #touchCtn,
+  body.start #lslTextCtn,
+  body.start #loadingEl { display: none; }
+  #startPanelCtn {
+    position: fixed; inset: 0; z-index: 30; overflow-y: auto;
+    display: flex; align-items: flex-start; justify-content: center; padding: 24px 14px;
+  }
+  #startPanelCtn[hidden] { display: none; }
+  /* `margin: auto` centra la tarjeta cuando cabe y deja llegar arriba cuando no
+     cabe (con `align-items:center` el sobrante se recortaba por arriba y la
+     cabecera quedaba fuera de la pantalla). */
+  .spCard { margin: auto; }
+  .spCard {
+    width: 100%; max-width: 580px; text-align: left;
+    background: rgba(9, 13, 20, 0.82);
+    border: 1px solid rgba(120, 165, 230, 0.22); border-radius: 18px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    padding: 22px 22px 16px;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .spHead { display: flex; align-items: center; gap: 12px; }
+  .spHead h1 { margin: 0; font-size: 20px; letter-spacing: 0.2px; }
+  .spSub { margin: 2px 0 0; font-size: 12px; opacity: 0.68; }
+  .spMark {
+    flex: 0 0 auto; width: 46px; height: 46px; border-radius: 13px;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 17px; letter-spacing: 0.5px; color: #08111c;
+    background: linear-gradient(150deg, #8fd3f4 0%, #6ea8e8 45%, #b9a7f0 100%);
+    box-shadow: 0 6px 18px rgba(110, 168, 232, 0.35);
+  }
+  .spNotice {
+    font-size: 12px; line-height: 1.45; border-radius: 10px; padding: 9px 11px;
+    background: rgba(120, 84, 20, 0.22); border: 1px solid rgba(255, 200, 120, 0.38); color: #ffe6bd;
+  }
+  .spSec { display: flex; flex-direction: column; gap: 8px; }
+  .spRow { display: flex; align-items: center; gap: 9px; }
+  .spLab { flex: 0 0 96px; font-size: 12px; opacity: 0.72; }
+  .spRow input, .spRow select { flex: 1 1 auto; min-width: 0; font-size: 12px; padding: 6px 8px; }
+  .spBtns { gap: 7px; }
+  .spPrimary {
+    background: linear-gradient(180deg, rgba(110, 168, 232, 0.5), rgba(78, 128, 196, 0.42));
+    border-color: rgba(170, 205, 255, 0.6); font-size: 12px; padding: 8px 10px;
+  }
+  .spPrimary:hover { background: linear-gradient(180deg, rgba(126, 184, 246, 0.62), rgba(88, 140, 212, 0.5)); }
+  .spMock { border-style: dashed; border-color: rgba(140, 220, 180, 0.45); color: #d6f6e6; }
+  .spNote { margin: 0; font-size: 11px; line-height: 1.45; opacity: 0.62; }
+  .spNote b { color: #ffd9a8; }
+  .spStatusHead { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .spStatusHead .spin { flex: 0 0 auto; }
+  .spLog {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px; line-height: 1.5; color: #cfe0f6;
+    background: rgba(4, 7, 12, 0.66); border: 1px solid rgba(120, 150, 200, 0.18);
+    border-radius: 9px; padding: 6px 8px; max-height: 128px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .spLog:empty { display: none; }
+  .spLog .err { color: #ffb3a7; }
+  .spLog .warn { color: #ffd9a8; }
+  .spLog .ok { color: #a6e8bb; }
+  .spFoot { font-size: 10.5px; line-height: 1.5; opacity: 0.62; border-top: 1px solid rgba(120, 150, 200, 0.16); padding-top: 9px; }
+  .spFoot summary { cursor: pointer; font-size: 11px; opacity: 0.9; outline: none; }
+  .spFoot summary:hover { color: #cfe0f6; }
+  .spFoot p { margin: 7px 0 0; }
+  .spFoot b { color: #cfe0f6; }
+  .spFoot code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; opacity: 0.85; }
+  body.touch .spCard { padding: 15px 13px 11px; gap: 11px; border-radius: 15px; }
+  body.touch .spHead h1 { font-size: 18px; }
+  body.touch .spMark { width: 40px; height: 40px; border-radius: 11px; font-size: 15px; }
+  body.touch .spRow { flex-direction: column; align-items: stretch; gap: 4px; }
+  body.touch .spLab { flex: 0 0 auto; }
+  body.touch .spRow input, body.touch .spRow select { font-size: 16px; padding: 8px 9px; }
+  body.touch .spLog { max-height: 92px; }
+
+  /* Chip de la sesión con el retransmisor. */
+  #slStatEl { display: inline-flex; align-items: center; gap: 6px; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #slStatEl[hidden] { display: none; }
+  #slDotEl { width: 8px; height: 8px; border-radius: 50%; background: #7a8696; flex: 0 0 auto; }
+  #slStatEl.on #slDotEl { background: #6ee08a; box-shadow: 0 0 6px rgba(110, 224, 138, 0.7); }
+  #slStatEl.busy #slDotEl { background: #ffcc66; }
+  #slStatEl.off #slDotEl { background: #ff8f80; }
+  #slStatEl.mock { border-style: dashed; border-color: rgba(140, 220, 180, 0.45); }
+
+  /* --- interfaz de juego: minimapa, carril de menus y cajones -------------- */
+  #gameUi { position: fixed; inset: 0; z-index: 13; pointer-events: none; display: none; }
+  body.in-viewer #gameUi { display: block; }
+  body.hud-off #gameUi { display: none; }
+  /* Mientras el editor de construccion ocupa la derecha (escritorio), el
+     minimapa y el carril se apartan a su izquierda en vez de quedar debajo. */
+  body.build:not(.touch) #gameUi { right: calc(10px + min(320px, 86vw) + 8px); }
+  /* En el telefono el editor de construccion es una hoja que sube desde abajo y
+     tapa parte del carril y del minimapa; bajando el HUD por debajo de el, los
+     controles que quedan al aire siguen vivos y los tapados dejan pasar el toque
+     al editor en vez de robarselo. */
+  body.touch.build #gameUi { z-index: 10; }
+
+  #gMiniCtn {
+    position: absolute; top: 46px; left: 10px; width: 150px;
+    display: flex; flex-direction: column; gap: 4px; align-items: center;
+    padding: 5px 5px 4px; border-radius: 12px; pointer-events: auto;
+    background: rgba(10, 14, 22, 0.62); border: 1px solid rgba(140, 175, 230, 0.26);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+  .gMiniCanvas { width: 138px; height: 138px; display: block; border-radius: 8px; cursor: pointer; touch-action: none; }
+  .gMiniFoot { display: flex; align-items: center; justify-content: space-between; gap: 4px; width: 100%; }
+  #gMiniCoordEl { font-size: 10px; opacity: 0.78; font-variant-numeric: tabular-nums; }
+  .gMiniBtn {
+    font: inherit; font-size: 11px; color: #cfe0ff; cursor: pointer;
+    background: rgba(30, 42, 62, 0.62); border: 1px solid rgba(140, 175, 230, 0.3);
+    border-radius: 7px; padding: 1px 6px; pointer-events: auto;
+  }
+  .gMiniBtn:hover { background: rgba(70, 100, 150, 0.55); }
+
+  #gRail {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    display: flex; flex-direction: column; gap: 6px;
+    max-height: min(82vh, 470px); overflow-y: auto; padding: 2px;
+  }
+  .gRailBtn {
+    position: relative; width: 44px; height: 44px; border-radius: 13px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; color: #dbe7fb;
+    background: rgba(12, 17, 26, 0.62); border: 1px solid rgba(140, 175, 230, 0.3);
+    pointer-events: auto; -webkit-tap-highlight-color: transparent;
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  .gRailBtn svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .gRailBtn:hover { background: rgba(60, 88, 132, 0.55); }
+  .gRailBtn.on { background: rgba(88, 126, 184, 0.7); border-color: rgba(195, 222, 255, 0.66); }
+  .gRailTip {
+    position: absolute; right: calc(100% + 8px); top: 50%; transform: translateY(-50%);
+    white-space: nowrap; font-size: 11px; padding: 3px 7px; border-radius: 7px;
+    background: rgba(8, 12, 20, 0.9); border: 1px solid rgba(140, 175, 230, 0.3);
+    opacity: 0; pointer-events: none; transition: opacity 0.12s ease;
+  }
+  .gRailBtn:hover .gRailTip { opacity: 1; }
+  body.touch .gRailTip { display: none; }
+  body.touch .gRailBtn { width: 46px; height: 46px; }
+
+  #gPanelCtn { position: fixed; inset: 0; z-index: 14; pointer-events: none; display: none; }
+  body.gpanel-open #gPanelCtn { display: block; }
+  body.start #gPanelCtn { display: none; }
+  /* Aviso pasajero del visor (sitios, armario, ajustes...). Va en la franja
+     alta para no taparse con el chat ni con los mandos. */
+  #gToastEl {
+    position: fixed; z-index: 18; left: 50%; top: 26%; transform: translateX(-50%);
+    max-width: min(440px, 86vw); padding: 7px 15px; border-radius: 999px;
+    font-size: 12.5px; text-align: center; color: #e8eef8;
+    background: rgba(10, 14, 22, 0.88); border: 1px solid rgba(150, 185, 240, 0.35);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42); pointer-events: none;
+  }
+  #gToastEl[hidden] { display: none; }
+  body.hud-off #gToastEl, body.start #gToastEl { display: none; }
+  .gBackdrop { position: absolute; inset: 0; background: rgba(4, 7, 12, 0.42); pointer-events: auto; display: none; }
+  body.touch .gBackdrop { display: block; }
+  .gpanel {
+    position: absolute; left: 10px; bottom: 10px; width: min(440px, 92vw);
+    max-height: min(72vh, 620px); display: flex; flex-direction: column;
+    pointer-events: auto; overflow: hidden; border-radius: 16px;
+    color: #e8eef8; font-size: 12.5px;
+    background: linear-gradient(180deg, rgba(16, 22, 33, 0.95), rgba(10, 14, 22, 0.97));
+    border: 1px solid rgba(140, 175, 230, 0.28);
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  }
+  .gpanel[hidden] { display: none; }
+  body.touch .gpanel {
+    left: 6px; right: 6px; width: auto;
+    bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+    max-height: 58vh; border-radius: 18px;
+  }
+  .gHead { display: flex; align-items: center; gap: 8px; padding: 9px 12px 8px; border-bottom: 1px solid rgba(140, 175, 230, 0.18); }
+  .gTitle { flex: 1 1 auto; font-size: 14px; font-weight: 600; letter-spacing: 0.3px; }
+  .gClose {
+    width: 30px; height: 30px; border-radius: 9px; font-size: 14px; line-height: 1; cursor: pointer;
+    color: #dbe7fb; background: rgba(30, 42, 62, 0.62); border: 1px solid rgba(140, 175, 230, 0.28);
+  }
+  .gClose:hover { background: rgba(96, 70, 78, 0.6); }
+  .gBody {
+    padding: 10px 12px 14px; overflow-y: auto; overscroll-behavior: contain;
+    display: flex; flex-direction: column; gap: 9px; text-align: left;
+  }
+  .gSec { display: flex; flex-direction: column; gap: 6px; }
+  .gSecHead {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.6px; text-transform: uppercase;
+    opacity: 0.6; padding-bottom: 3px; border-bottom: 1px solid rgba(140, 175, 230, 0.14);
+  }
+  .gLegend { font-size: 11.5px; opacity: 0.72; line-height: 1.35; }
+  .gBtns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .gChip {
+    font: inherit; font-size: 11.5px; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+    color: #dbe7fb; background: rgba(26, 36, 54, 0.72); border: 1px solid rgba(140, 175, 230, 0.3);
+  }
+  .gChip:hover { background: rgba(62, 90, 134, 0.62); }
+  .gChip.on { background: rgba(96, 136, 196, 0.78); border-color: rgba(195, 222, 255, 0.7); }
+  .gList { display: flex; flex-direction: column; gap: 5px; }
+  .gRow { display: flex; gap: 5px; align-items: stretch; }
+  .gRowMain {
+    flex: 1 1 auto; display: flex; align-items: center; gap: 7px; text-align: left; min-width: 0;
+    padding: 6px 9px; border-radius: 9px; cursor: pointer; font: inherit; color: #e8eef8;
+    background: rgba(24, 33, 49, 0.72); border: 1px solid rgba(140, 175, 230, 0.22);
+  }
+  .gRowMain:hover { background: rgba(60, 88, 132, 0.55); }
+  .gRowMain .gIcon { opacity: 0.85; }
+  .gRowMain .gName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gRowSub { font-size: 10.5px; opacity: 0.6; }
+  .gRowDel {
+    flex: 0 0 auto; width: 30px; border-radius: 9px; cursor: pointer; font: inherit;
+    color: #ffd9d4; background: rgba(48, 24, 26, 0.6); border: 1px solid rgba(255, 150, 140, 0.28);
+  }
+  /* Marcador de sitio: rombo de color + nombre + coordenada. */
+  .gSite { display: flex; align-items: center; gap: 8px; }
+  .gSiteDot { flex: 0 0 auto; width: 9px; height: 9px; transform: rotate(45deg); border-radius: 2px; }
+  .gSiteTxt { flex: 1 1 auto; min-width: 0; }
+  .gSiteName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* --- mapa grande del cajon --- */
+  .gMapWrap { display: flex; flex-direction: column; gap: 7px; }
+  .gMapCanvas {
+    width: min(100%, 58vh); aspect-ratio: 1 / 1; display: block; margin: 0 auto; border-radius: 12px; cursor: crosshair;
+    background: #0b0f16; border: 1px solid rgba(140, 175, 230, 0.22); touch-action: none;
+  }
+  body.touch .gMapCanvas { width: min(100%, 42vh); }
+  .gMapInfo { font-size: 11.5px; font-variant-numeric: tabular-nums; opacity: 0.85; }
+  .gMapInfo b { color: #ffd479; font-weight: 600; }
+  .gMapLegend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 10.5px; opacity: 0.7; }
+  .gMapLegend i { display: inline-block; width: 8px; height: 8px; margin-right: 4px; transform: rotate(45deg); border-radius: 2px; }
+
+  /* --- armario (lo comparte con wardrobe.js) ------------------------------- */
+  .wrSec { border: 1px solid rgba(140, 175, 230, 0.16); border-radius: 10px; overflow: hidden; }
+  .wrHead {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 7px 10px; cursor: pointer; font-weight: 600; font-size: 12.5px;
+    background: rgba(26, 36, 54, 0.5);
+  }
+  .wrHead:hover { background: rgba(40, 56, 84, 0.6); }
+  .wrBody { display: flex; flex-direction: column; gap: 7px; padding: 8px 10px 10px; }
+  .wrBody[hidden] { display: none; }
+  .wrRow { display: flex; align-items: center; gap: 7px; }
+  .wrMode { flex-wrap: wrap; }
+  .wrLab { flex: 0 0 auto; min-width: 84px; font-size: 11.5px; opacity: 0.85; }
+  .wrVal { flex: 0 0 auto; min-width: 46px; text-align: right; font-size: 11px; opacity: 0.72; font-variant-numeric: tabular-nums; }
+  .wrRange { flex: 1 1 auto; min-width: 0; accent-color: #7fb0ff; height: 20px; }
+  .wrLabel { font-size: 11px; opacity: 0.64; margin-top: 2px; }
+  .wrNote { font-size: 11px; opacity: 0.68; line-height: 1.35; }
+  .wrSwatches { display: flex; flex-wrap: wrap; gap: 5px; }
+  .wrSwatch { width: 24px; height: 24px; border-radius: 7px; cursor: pointer; padding: 0; border: 1px solid rgba(220, 235, 255, 0.28); }
+  .wrSwatches.small .wrSwatch { width: 20px; height: 20px; }
+  .wrSwatch.on { outline: 2px solid #cfe0ff; outline-offset: 1px; }
+  .wrChips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .wrChip {
+    font: inherit; font-size: 11px; padding: 3px 8px; border-radius: 999px; cursor: pointer;
+    color: #dbe7fb; background: rgba(26, 36, 54, 0.72); border: 1px solid rgba(140, 175, 230, 0.28);
+  }
+  .wrChip:hover { background: rgba(62, 90, 134, 0.62); }
+  .wrChip.on { background: rgba(96, 136, 196, 0.8); border-color: rgba(195, 222, 255, 0.7); }
+  .wrSlot { display: flex; flex-direction: column; gap: 5px; padding: 6px 0; border-top: 1px dashed rgba(140, 175, 230, 0.14); }
+  .wrSlot:first-child { border-top: none; padding-top: 0; }
+  .wrName { flex: 1 1 auto; }
+  .wrSaved { display: flex; flex-direction: column; gap: 5px; }
+  .wrSavedBtn { flex: 1 1 auto; text-align: left; }
+  .wrCheck { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; }
+
+  /* En pantallas bajas (movil en horizontal) el carril se tumba encima del
+     racimo de acciones y el minimapa se encoge, para no comerse el mundo. */
+  @media (max-height: 520px) {
+    #gRail {
+      flex-direction: row; right: 10px; left: auto; top: auto; transform: none;
+      bottom: calc(166px + env(safe-area-inset-bottom, 0px)); max-height: none; overflow: visible;
+    }
+    .gRailBtn, body.touch .gRailBtn { width: 38px; height: 38px; border-radius: 11px; }
+    .gRailBtn svg { width: 19px; height: 19px; }
+    #gMiniCtn { width: 104px; }
+    .gMiniCanvas { width: 94px; height: 94px; }
+    #gMiniCoordEl { display: none; }
+    /* El chat se arrima a la izquierda para no meterse bajo el carril, que en
+       horizontal se tumba justo encima del racimo de acciones. */
+    body.touch #chatCtn { right: auto; width: min(46vw, 380px); }
+    body.touch #chatLogEl { max-height: 12vh; }
+    body.touch .gpanel { max-height: 74vh; }
+  }
+
+  /* --- depuracion e informes (src/diag.js) --------------------------------- */
+  /* La ventana se monta dentro del cajon de Ajustes, asi que aqui solo tiene
+     que apilarse y dejar que el registro y el informe se desplacen solos. */
+  .dgHost { display: block; }
+  .dgPanel { display: flex; flex-direction: column; gap: 7px; text-align: left; }
+  .dgHead { display: none; }
+  .dgBar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .dgBar select, .dgBar input[type=search] {
+    font: inherit; font-size: 11px; color: #e8eef8; background: rgba(8, 12, 20, 0.7);
+    border: 1px solid rgba(120, 150, 200, 0.3); border-radius: 6px; padding: 3px 5px;
+  }
+  .dgBar input[type=search] { flex: 1 1 120px; min-width: 0; }
+  .dgCats { display: flex; flex-wrap: wrap; gap: 3px 9px; font-size: 10.5px; opacity: 0.84; }
+  .dgCats[hidden] { display: none; }
+  .dgCat { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .dgInfo { font-size: 10.5px; opacity: 0.7; font-variant-numeric: tabular-nums; }
+  .dgInfo[hidden] { display: none; }
+  .dgLog {
+    height: 190px; overflow-y: auto; overscroll-behavior: contain;
+    background: rgba(6, 9, 15, 0.72); border: 1px solid rgba(120, 150, 200, 0.2);
+    border-radius: 9px; padding: 5px 6px; font-size: 10.5px; line-height: 1.4;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .dgLog[hidden] { display: none; }
+  .dgRow { display: flex; flex-wrap: wrap; gap: 5px; padding: 1px 0; border-bottom: 1px solid rgba(120, 150, 200, 0.07); }
+  .dgTime { flex: 0 0 auto; opacity: 0.45; }
+  .dgCatTag { flex: 0 0 auto; opacity: 0.8; color: #a9c6ef; }
+  .dgText { flex: 1 1 auto; min-width: 0; word-break: break-word; }
+  .dgData { flex: 1 1 100%; opacity: 0.55; padding-left: 14px; word-break: break-word; }
+  .dgErr .dgText { color: #ffb3aa; }
+  .dgWarn .dgText { color: #ffd79a; }
+  .dgTr .dgText { opacity: 0.66; }
+  .dgBtns { display: flex; flex-wrap: wrap; gap: 5px; }
+  .dgViewer { display: flex; flex-direction: column; gap: 6px; }
+  .dgViewer[hidden] { display: none; }
+  .dgViewerHead { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .dgViewerHead span { flex: 1 1 auto; font-weight: 600; font-size: 12px; }
+  .dgReport {
+    width: 100%; min-height: 220px; max-height: 46vh; resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10px; line-height: 1.35; color: #dfe9f8;
+    background: rgba(6, 9, 15, 0.8); border: 1px solid rgba(120, 150, 200, 0.24);
+    border-radius: 9px; padding: 6px; white-space: pre; overflow: auto;
+    -webkit-user-select: text; user-select: text;
+  }
+
+</style>
+
+<canvas id="viewCanvas"></canvas>
+
+<div id="hudTopCtn">
+  <div class="hud" id="hudBarCtn">
+    <span class="title" id="hudTitleEl">Visor de Second Life</span>
+    <nav>
+      <a href="#sl" id="navStartEl">Iniciar sesión</a>
+      <a href="#viewer" id="navViewerEl">Arena de pruebas</a>
+      <a href="#primtest" id="navGalleryEl"><span class="wide-only">Galería de prims</span><span class="touch-only-inline">Galería</span></a>
+      <a href="#primtest/hoja" id="navSheetEl"><span class="wide-only">Hoja de formas</span><span class="touch-only-inline">Formas</span></a>
+      <a href="#bodytest" id="navBodyEl"><span class="wide-only">Avatar real</span><span class="touch-only-inline">Avatar</span></a>
+      <a href="#meshtest" id="navMeshEl"><span class="wide-only">Mallas de fuera</span><span class="touch-only-inline">Mallas</span></a>
+    </nav>
+    <button type="button" class="bbtn" id="slStatEl" hidden title="Estado de la sesión con el retransmisor">
+      <span id="slDotEl"></span><span id="slTextEl">…</span>
+    </button>
+    <button type="button" class="bbtn" id="netStatEl" title="Jugadores en la región (clic para cambiar tu nombre)">
+      <span id="netDotEl"></span><span id="netTextEl">…</span>
+    </button>
+    <button type="button" class="bbtn" id="buildToggleBtn" title="Modo construcción (B)">Construir</button>
+    <span><span id="hudRouteEl" class="dim"></span> &middot; <span id="hudTrisEl" class="dim"></span> &middot; <span id="hudFpsEl" class="dim"></span></span>
+  </div>
+
+  <div class="hud" id="hudFootCtn">
+    <span id="viewStatEl">Cargando&hellip;</span>
+    <span id="hudInfoEl" class="dim"></span>
+    <span class="touch-only dim" id="touchHintEl">joystick izquierdo para andar (el borde corre) &middot; arrastra la derecha para mirar &middot; pellizca para acercar</span>
+  </div>
+</div>
+
+<div class="hud" id="hudHelpCtn">
+  <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> andar &middot; <kbd>Mayús</kbd> correr &middot; <kbd>Espacio</kbd> saltar</span>
+  <span>arrastrar para mirar (arriba = mirar arriba) &middot; rueda/pinza para acercar</span>
+  <span><kbd>C</kbd> volar &middot; <kbd>E</kbd>/<kbd>Q</kbd> subir/bajar &middot; <kbd>F</kbd> cámara libre &middot; <kbd>1</kbd>-<kbd>4</kbd> hora &middot; <kbd>P</kbd> pausa &middot; <kbd>H</kbd> ocultar</span>
+  <span><kbd>B</kbd> construir &middot; <kbd>G</kbd> rejilla &middot; <kbd>Ctrl</kbd>+<kbd>D</kbd> duplicar &middot; <kbd>Supr</kbd> borrar &middot; <kbd>Ctrl</kbd>+<kbd>Z</kbd> deshacer</span>
+</div>
+
+<div id="lslTextCtn"></div>
+
+<div class="hud" id="chatCtn">
+  <div id="chatHeadEl"><span class="grow">Chat local</span><span class="dim" id="chatWhoEl"></span><span class="bfold" id="chatToggleEl">▾</span></div>
+  <div id="chatBodyEl">
+    <div id="chatLogEl"></div>
+    <div id="chatRow">
+      <span class="blabel">canal</span>
+      <input class="bnum" id="chatChannelEl" type="number" value="0" title="Canal de chat">
+      <input class="btext" id="chatInputEl" type="text" placeholder="Escribe y pulsa Enter" autocomplete="off">
+      <button type="button" class="bbtn" id="chatSendBtn">Enviar</button>
+    </div>
+  </div>
+</div>
+
+<div id="buildCtn" hidden>
+  <div class="hud bpanel bmsg" id="buildMsgEl" hidden></div>
+  <div class="hud bpanel" id="buildStatusEl"></div>
+  <div class="hud bpanel" id="buildToolsEl"></div>
+  <div class="hud bpanel" id="buildParamsEl"></div>
+  <div class="hud bpanel" id="buildFacesEl"></div>
+  <div class="hud bpanel" id="buildFaceAppEl"></div>
+  <div class="hud bpanel" id="buildScriptEl"></div>
+  <div class="hud bpanel" id="buildTerrainEl"></div>
+  <div class="hud bpanel" id="buildInvEl"></div>
+  <div class="hud bpanel" id="buildRegionEl"></div>
+</div>
+
+<div id="gameUi">
+  <div id="gMiniCtn">
+    <canvas id="gMiniCanvas" class="gMiniCanvas" width="138" height="138"></canvas>
+    <div class="gMiniFoot">
+      <span id="gMiniCoordEl">&mdash;</span>
+      <button type="button" class="gMiniBtn" id="gMiniRecenterBtn" title="Recentrar la cámara detrás del avatar">&#8982;</button>
+    </div>
+  </div>
+  <div id="gRail"></div>
+</div>
+
+<div id="gPanelCtn">
+  <div class="gBackdrop" id="gBackdropEl"></div>
+</div>
+
+<div id="gToastEl" hidden></div>
+
+<div id="touchCtn">
+  <div id="joyPad"><div id="joyBase"><div id="joyKnob"></div></div></div>
+  <div id="actCtn">
+    <button type="button" class="actBtn" id="actRunBtn">Correr</button>
+    <button type="button" class="actBtn" id="actFlyBtn">Volar</button>
+    <button type="button" class="actBtn" id="actUpBtn">Subir</button>
+    <button type="button" class="actBtn" id="actDownBtn">Bajar</button>
+    <button type="button" class="actBtn" id="actJumpBtn">Saltar</button>
+  </div>
+</div>
+
+<div id="startPanelCtn" hidden>
+  <div id="startPanel" class="spCard">
+    <header class="spHead">
+      <div class="spMark">SL</div>
+      <div>
+        <h1>Visor de Second Life</h1>
+        <p class="spSub">Visor en el navegador &middot; mundo real de Second Life &middot; sin instalar nada</p>
+      </div>
+    </header>
+
+    <div id="startNoticeEl" class="spNotice" hidden></div>
+
+    <section class="spSec">
+      <div class="spRow">
+        <label class="spLab" for="slGridEl">Cuadrícula</label>
+        <select class="bsel" id="slGridEl">
+          <option value="agni">agni &mdash; Second Life (producción)</option>
+          <option value="aditi">aditi &mdash; beta (Aditi)</option>
+        </select>
+      </div>
+      <div class="spRow">
+        <label class="spLab" for="slNameEl">Nombre</label>
+        <input class="btext" id="slNameEl" type="text" placeholder="Nombre Apellido" autocomplete="username" spellcheck="false">
+      </div>
+      <div class="spRow">
+        <label class="spLab" for="slPassEl">Contraseña</label>
+        <input class="btext" id="slPassEl" type="password" placeholder="contraseña de Second Life" autocomplete="current-password">
+      </div>
+      <div class="spRow">
+        <label class="spLab" for="slTokenEl">Código 2FA</label>
+        <input class="btext" id="slTokenEl" type="text" inputmode="numeric" placeholder="opcional (solo si lo tienes activado)">
+      </div>
+      <div class="spRow">
+        <label class="spLab" for="slRelayEl">Retransmisor</label>
+        <input class="btext" id="slRelayEl" type="text" placeholder="wss://tu-servidor:puerto/visor" spellcheck="false">
+      </div>
+      <p class="spNote" id="slRelayNoteEl"></p>
+    </section>
+
+    <section class="spSec spBtns">
+      <button type="button" class="bbtn spPrimary" id="slEnterLocalBtn">Entrar (la contraseña no sale del navegador)</button>
+      <button type="button" class="bbtn" id="slEnterRelayBtn">Entrar dejando el login al retransmisor</button>
+      <button type="button" class="bbtn spMock" id="slMockBtn">Probar con el simulador de pruebas</button>
+      <p class="spNote" id="slMockNoteEl">El simulador de pruebas es una región inventada que corre dentro de esta página. Sirve para ver y manejar el visor entero sin cuenta ni servidor. <b>No es Second Life.</b></p>
+    </section>
+
+    <section class="spSec">
+      <div class="spStatusHead">
+        <span id="slSpinnerEl" class="spin" hidden></span>
+        <span id="slStatusEl">Sin sesión.</span>
+      </div>
+      <div class="spLog" id="slLogEl"></div>
+    </section>
+
+    <footer class="spFoot">
+      <details>
+        <summary>Por qué hace falta un retransmisor (y qué pasa con tu contraseña)</summary>
+        <p>El navegador no puede abrir el socket UDP de un simulador de Second Life: eso solo lo hace un programa nativo. Aquí el visor habla por WebSocket con un <b>retransmisor</b> que hace de puente con la red de Second Life. Sin ese retransmisor se puede ver y manejar el visor con el simulador de pruebas, pero no entrar en el mundo real.</p>
+        <p>Tu contraseña no se guarda en ningún sitio. Si eliges «Entrar», el login lo hace esta página directamente con Linden Lab y al retransmisor solo le llega el identificador de sesión; si eliges la otra opción, la contraseña va al retransmisor que tú mismo hayas puesto en el campo de arriba.</p>
+        <p>Del mundo real se traen los prims con su geometría LLVolume, el terreno por parches, los avatares de los demás y el chat. Las texturas en formato J2C (JPEG 2000) necesitan un decodificador aparte: hay más detalles en el archivo <code>VIEWER-REAL.md</code> del proyecto.</p>
+      </details>
+    </footer>
+  </div>
+</div>
+
+<div id="loadingEl"><span class="spin"></span>Preparando el mundo&hellip;</div>
+
+<div id="bootErrorEl" hidden></div>
+
+<script src="env.js"></script>
+<script type="module" src="src/app.js"></script>
+
+</body>
+</html>
