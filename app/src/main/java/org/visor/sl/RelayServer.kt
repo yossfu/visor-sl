@@ -22,16 +22,25 @@ import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 
 class RelayServer(
-    port: Int,
+    private val relayPort: Int,
     private val log: (String) -> Unit,
+) : WebSocketServer(InetSocketAddress("127.0.0.1", relayPort)) {
 
+    // POR QUE EL PARAMETRO ES `relayPort` Y NO `port`
+    // `WebSocketServer` ya expone `getPort()`. Un `val port` aqui tendria la
+    // misma firma JVM (`getPort()I`) y Kotlin lo rechaza como "accidental
+    // override". Y un parametro de constructor SIN `val` no se ve desde los
+    // metodos... y `onStart()` necesita el puerto. De ahi las dos cosas: se
+    // guarda como propiedad con OTRO nombre, y el puerto viaja explicitamente
+    // a la clase base. No hay nada mas que tocar: MainActivity pasa el puerto
+    // que ya eligio.
 
     // Cuenta de latidos: se apunta el primero y luego uno de cada 60, para que
     // el informe diga si el enlace sigue vivo sin llenar el registro.
     private var pings = 0L
 
     override fun onStart() {
-        log("retransmisor interno escuchando en 127.0.0.1:$port")
+        log("retransmisor interno escuchando en 127.0.0.1:$relayPort")
     }
 
     override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {

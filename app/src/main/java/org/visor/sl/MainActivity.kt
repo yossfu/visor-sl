@@ -84,11 +84,15 @@ class MainActivity : Activity() {
             v.start()
             viewer = v
 
-            val r = RelayServer(freePort(), ::log)
+            // El puerto del retransmisor lo elegimos aqui y se lo pasamos; no
+            // se pregunta a RelayServer (su clase base ya tiene un getPort() y
+            // pedirlo por nombre daria un choque de firmas en Kotlin).
+            val relayPort = freePort()
+            val r = RelayServer(relayPort, ::log)
             r.start()
             relay = r
 
-            val relayUrl = "ws://127.0.0.1:" + r.port
+            val relayUrl = "ws://127.0.0.1:" + relayPort
             val url = "http://127.0.0.1:" + v.port + "/index.html?relay=" +
                 URLEncoder.encode(relayUrl, "UTF-8")
             log("visor en " + url)
