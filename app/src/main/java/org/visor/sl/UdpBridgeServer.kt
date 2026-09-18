@@ -34,6 +34,23 @@
 // perderia respuestas. Se envia a host:puerto explicito y se recibe de
 // cualquiera; el numero de puerto local es el que el simulador usa para
 // identificar al cliente, exactamente como hace un visor de verdad.
+//
+// EL SOCKET NO SE ATA AL BUCLE (el fallo del 18-09-2026)
+// ------------------------------------------------------
+// Se abre con `DatagramSocket(0)` -- comodin 0.0.0.0 -- y NO con
+// `DatagramSocket(0, 127.0.0.1)`. Un socket atado a 127.0.0.1 solo puede hablar
+// por la interfaz de bucle: cualquier `sendto` hacia la IP publica de un
+// simulador de Second Life lo rechaza el kernel con EINVAL ("Invalid argument")
+// en el acto. El informe que mando el usuario desde el movil lo ensenaba con
+// toda claridad -- el circuito abierto, el login hecho, y diez lineas seguidas
+// de "puente UDP: no se pudo enviar (sendto failed: EINVAL)" con cero paquetes
+// llegando del simulador --, porque la app estaba intentando salir a internet
+// por el bucle. Se ata al comodin y el sistema elige puerto y direccion de
+// origen, que es lo que hace cualquier visor de Second Life.
+//
+// Y como un fallo de envio no se puede distinguir "desde fuera" de un puerto
+// bloqueado, el puente ahora AVISA al visor de ese fallo ({"sendError":...}),
+// para que el informe del propio visor lo diga sin depender del registro nativo.
 
 package org.visor.sl
 
@@ -79,6 +96,11 @@ class UdpBridgeServer(
         @Volatile var descartes: Long = 0
         @Volatile var ultimoRecv: Long = 0
         @Volatile var ultimoEnvio: Long = 0
+        // Fallos de `send` (no de la red de arriba): si el socket no puede
+        // sacar los datagramas, esto es lo unico que lo dice.
+        @Volatile var fallosEnvio: Long = 0
+        @Volatile var ultimoFallo: String = ""
+        @Volatile var avisoEnvio: Boolean = false
 
         fun abierto(): Boolean {
             val s = socket
@@ -99,7 +121,8 @@ class UdpBridgeServer(
             return "puerto local " + s + " -> " + (if (host.isEmpty()) "(cualquiera)" else host + ":" + port) +
                 " · recibidos " + datagramasIn + " (" + bytesIn + " B)" +
                 " · enviados " + datagramasOut + " (" + bytesOut + " B)" +
-                (if (descartes > 0) " · descartados " + descartes else "")
+                (if (descartes > 0) " · descartados " + descartes else "") +
+                (if (fallosEnvio > 0) " · FALLOS DE ENVIO " + fallosEnvio + " (" + ultimoFallo + ")" else "")
         }
     }
 
@@ -168,7 +191,7 @@ class UdpBridgeServer(
             return
         }
 
-        val s = try { DatagramSocket(0, InetAddress.getByName("127.0.0.1")) } catch (e: Exception) {
+        val s = try { abrirSocketUdp() } catch (e: Exception) {
             val detalle = e.message ?: e.toString()
             log("puente UDP: no se pudo abrir el socket UDP: " + detalle)
             responder(conn, "{\"error\":" + json("no se pudo abrir el socket UDP: " + detalle) + "}")
@@ -192,9 +215,26 @@ class UdpBridgeServer(
         p.hilo = hilo
         hilo.start()
 
-        log("puente UDP: socket listo en el puerto local " + s.localPort +
+        log("puente UDP: socket listo en " + s.localAddress.hostAddress + ":" + s.localPort +
+            " (" + (if (s.localAddress.address.size == 16) "IPv6" else "IPv4") + ")" +
             ", destino " + (if (host.isEmpty()) "(cualquiera)" else host + ":" + port))
         responder(conn, "{\"ok\":true,\"localPort\":" + s.localPort + "}")
+    }
+
+    // El socket de salida: comodin (0.0.0.0), puerto efimero, IPv4 si el sistema
+    // lo permite. Ni `connect()` ni atadura al bucle; ver la cabecera.
+    //
+    // La familia de la direccion importa: a un socket IPv6 no se le puede pasar
+    // una direccion IPv4 (el sockaddr se queda corto y el kernel contesta
+    // EINVAL), y las IPs de los simuladores de Second Life son IPv4. Con el
+    // comodin el sistema elige IPv4, pero se deja escrito en el registro lo que
+    // haya elegido para no tener que adivinarlo en el proximo informe.
+    private fun abrirSocketUdp(): DatagramSocket {
+        val s = DatagramSocket(0)
+        if (s.localAddress.address.size == 16) {
+            log("puente UDP: aviso, el socket ha salido IPv6; si el simulador no recibe nada, esta es la causa")
+        }
+        return s
     }
 
     // --- binario: un datagrama por trama --------------------------------------
@@ -227,7 +267,25 @@ class UdpBridgeServer(
             p.ultimoEnvio = System.currentTimeMillis()
         } catch (e: Exception) {
             p.descartes++
-            log("puente UDP: no se pudo enviar (" + (e.message ?: e.toString()) + ")")
+            p.fallosEnvio++
+            p.ultimoFallo = e.message ?: e.toString()
+            // El primer fallo (y luego uno de cada diez) va al registro con el
+            // destino y el tamano: es lo que hace falta para saber si el
+            // problema es la red o el socket. No se escribe uno por datagrama,
+            // que el circuito reenvia cada pocos segundos y llenaria el informe.
+            if (p.fallosEnvio == 1L || p.fallosEnvio % 10L == 0L) {
+                log("puente UDP: no se pudo enviar (" + p.ultimoFallo + ") a " +
+                    p.host + ":" + p.port + " · " + datos.size + " B · fallos: " + p.fallosEnvio)
+            }
+            // Y se le dice al visor, la primera vez: asi el informe del propio
+            // visor dice "el puente no pudo enviar" en vez de dejar al usuario
+            // pensando en un puerto bloqueado del simulador.
+            if (!p.avisoEnvio) {
+                p.avisoEnvio = true
+                responder(p.conn, "{\"sendError\":" + json(p.ultimoFallo) +
+                    ",\"host\":" + json(p.host) + ",\"port\":" + p.port +
+                    ",\"localPort\":" + s.localPort + "}")
+            }
         }
     }
 

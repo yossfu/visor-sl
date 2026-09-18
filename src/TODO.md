@@ -359,12 +359,25 @@ de juego" en el README).
       mitad de entrar), aviso de circuito caducado y el puente UDP visible en el
       informe. Verificado en vivo: 45 s seguidos dentro sin caerse, y caída
       forzada recuperada en ~0,8 s. Falta volver a compilar el APK y probarlo.
+- [x] **Segundo informe del móvil** (17:21): el arreglo del latido funciona
+      (`enlace: ready`, sin «enlace cerrado»), y salió el bloque `puente` del
+      informe con el fallo de verdad: **`sendto failed: EINVAL`** en los diez
+      envíos, con el socket atado a `127.0.0.1`. Un socket atado al bucle no
+      puede salir a internet: el kernel rechaza cada `sendto` a la IP pública del
+      simulador, así que el circuito se abría, mandaba sus diez paquetes y ninguno
+      salía del teléfono (`datagramasIn: 0`). Arreglado abriendo el socket con
+      `DatagramSocket(0)` (comodín `0.0.0.0`), registrando dirección y familia del
+      socket, agrupando los fallos de envío en el registro nativo y avisando al
+      visor (`{"sendError":…}` → `erroresEnvio`/`ultimoErrorEnvio` en el informe y
+      en el mensaje de error de la sesión). Autotest 21/21 en `udp.js`. Versión de
+      la app 0.1.1 y `DIAG_VERSION` 1.1, para que el próximo informe diga si la
+      APK nueva es la que está corriendo. Falta compilar y probar en el móvil.
 
 ## Fase 12 — Núcleo LLUDP (mundo real)
 
 Todo el protocolo de Second Life en JavaScript (`src/sl/lludp/`), con el nativo
 reducido a mover datagramas. Ver "Modelo del núcleo LLUDP" en el README y
-`src/VIEWER-REAL.md`. **861 comprobaciones en verde (14 suites).**
+`src/VIEWER-REAL.md`. **864 comprobaciones en verde (14 suites).**
 
 - [x] Plantillas del protocolo (`templates.js`, 483 mensajes) y códec binario
       (`codec.js`), verificados contra datagramas REALES (`recapturas.js`) y

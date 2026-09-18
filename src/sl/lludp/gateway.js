@@ -884,8 +884,15 @@ export function createLldpGateway(opts = {}) {
         if (!st.simPackets) {
           if (!st.sinSimAvisado && t - st.startedAt > READY_TIMEOUT_MS + 5000) {
             st.sinSimAvisado = true;
+            // Si el puente ya ha avisado de que no puede ENVIAR, la causa no es
+            // el simulador ni un puerto bloqueado: es la salida de la app. Se
+            // dice con el motivo exacto en vez de mandar al usuario a mirar el
+            // router.
+            const falloEnvio = st.bridge && st.bridge.state.sendErrors
+              ? " · el puente NO pudo enviar los datagramas (" + st.bridge.state.lastSendError + ")"
+              : "";
             fallo("el simulador no ha enviado un solo paquete desde que se abrio el circuito " +
-              "(¿puerto UDP bloqueado, o el puente no llega al simulador?)", false);
+              "(¿puerto UDP bloqueado, o el puente no llega al simulador?)" + falloEnvio, false);
             setPhase(PHASE.ENTERING, 5, "el simulador no responde");
           }
           return;
@@ -1160,6 +1167,22 @@ export function createLldpGateway(opts = {}) {
     terrrenoGrid: () => grid,
     resumen() {
       const b = st.bridge ? st.bridge.state : null;
+      // El puente UDP nativo (la app Android): si arranco, a que puerto local,
+      // hacia donde, y cuantos datagramas han ido y vuelto. Sin esto, un
+      // "no pasa nada" en el movil no se puede distinguir de un puerto cerrado.
+      const puente = b ? {
+        enlace: b.link, listo: !!b.ready, error: b.error || null,
+        host: b.host, puerto: b.port, puertoLocal: b.localPort,
+        datagramasIn: b.packetsIn, datagramasOut: b.packetsOut,
+        kbIn: Math.round(b.bytesIn / 1024), kbOut: Math.round(b.bytesOut / 1024),
+      } : null;
+      // Los fallos de ENVIO que haya avisado el proceso local se anaden solo si
+      // los hay: un enlace perfecto que no saca ni un datagrama a la red es otra
+      // cosa que un puerto bloqueado, y es lo primero que hay que mirar.
+      if (puente && b.sendErrors) {
+        puente.erroresEnvio = b.sendErrors;
+        puente.ultimoErrorEnvio = b.lastSendError || null;
+      }
       return {
         phase: st.phase, ready: st.ready, region: st.region && st.region.name,
         patches: st.patches, objects: st.objects, avatars: st.avatars, chats: st.chats,
@@ -1170,15 +1193,7 @@ export function createLldpGateway(opts = {}) {
           rtt: st.circuit.state.rtt, resends: st.circuit.state.resends,
           silencioMs: Math.round(st.circuit.silentMs || 0),
         } : null,
-        // El puente UDP nativo (la app Android): si arranco, a que puerto local,
-        // hacia donde, y cuantos datagramas han ido y vuelto. Sin esto, un
-        // "no pasa nada" en el movil no se puede distinguir de un puerto cerrado.
-        puente: b ? {
-          enlace: b.link, listo: !!b.ready, error: b.error || null,
-          host: b.host, puerto: b.port, puertoLocal: b.localPort,
-          datagramasIn: b.packetsIn, datagramasOut: b.packetsOut,
-          kbIn: Math.round(b.bytesIn / 1024), kbOut: Math.round(b.bytesOut / 1024),
-        } : null,
+        puente: puente,
       };
     },
   };

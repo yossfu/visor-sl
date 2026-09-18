@@ -339,7 +339,7 @@ Tres caminos, de menos a más real:
 | `src/sl/login.js` | `runLoginSelfTest()` | 15/15 |
 | `src/sl/relay.js` | `runRelaySelfTest()` | 36/36 |
 | `src/sl/mockServer.js` | `runMockSelfTest()` | 19/19 |
-| `src/sl/lludp/*` | (14 suites, ver `scratch/lludp-runner.js`) | **861/861** |
+| `src/sl/lludp/*` | (14 suites, ver `scratch/lludp-runner.js`) | **864/864** |
 
 El núcleo LLUDP se prueba entero sin navegador ni red: plantillas y códec,
 circuito (acks, reenvíos, ping), terreno, objetos, avatares, el gateway real

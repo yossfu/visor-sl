@@ -136,7 +136,7 @@ navegador es mover datagramas UDP: la trae la **app Android** (un puente tonto d
       - `src/sl/lludp/` — **el núcleo LLUDP** (Fase 10): plantillas del protocolo,
         códec binario, circuito UDP con acks/reenvíos/ping, terreno (DCT),
         objetos, avatares, el retransmisor `gateway.js` y un simulador de región
-        real (`sim.js`). 861 comprobaciones en verde (14 suites). Ver "Modelo del
+        real (`sim.js`). 864 comprobaciones en verde (14 suites). Ver "Modelo del
         núcleo LLUDP".
       - `src/sl/avatarLad.js` / `src/sl/avatarMesh.js` — forma real del avatar.
 - [x] `src/avatarRealBody.js` + `src/sl/slAppearance.js` + `src/sl/avatarLad.js` —
@@ -572,7 +572,7 @@ transporte es:
   datagrama, y una primera trama de texto `{"cmd":"connect","host":…,"port":…}`.
   Ahí sí se habla con un simulador de Second Life de verdad.
 
-Piezas (todas con autotest, **861 comprobaciones en verde** en 14 suites):
+Piezas (todas con autotest, **864 comprobaciones en verde** en 14 suites):
 
 - `templates.js` (68 KB, **483 mensajes** del protocolo), `template.js`
   (`TemplateSet`) y `codec.js` (bloques, compresión de ceros, uuids, utf8 fijo).
@@ -648,8 +648,50 @@ Reglas ahora:
   para no dejar dos circuitos latiendo a la vez.
 - **Todo sale en el informe** (`diag`): estado y fase, parones y parón más largo,
   `simPackets`, `relogins`, y el bloque `puente` con los datagramas que han ido y
-  vuelto por el WebSocket local de la app. Sin eso, un «no pasa nada» en el móvil
-  no se distingue de un puerto cerrado.
+  vuelto por el WebSocket local de la app (`erroresEnvio`/`ultimoErrorEnvio`
+  incluidos). Sin eso, un «no pasa nada» en el móvil no se distingue de un puerto
+  cerrado, **ni de un socket que no puede salir a internet**.
+
+### El puente UDP no podía salir a internet (el fallo del 18-09-2026)
+
+El segundo informe del móvil quitó todas las dudas: la APK nueva (versión 0.1.0,
+con el arreglo del latido) **ya no perdía el enlace** —`enlace: ready`—, el login
+XML-RPC había funcionado (`sim_ip` y `sim_port` del simulador de verdad), el
+puente había abierto su socket… y el registro nativo enseñaba **diez líneas
+seguidas** de:
+
+```
+12:20:17.174  puente UDP: socket listo en el puerto local 49062, destino 54.188.100.243:13027
+12:20:17.215  puente UDP: no se pudo enviar (sendto failed: EINVAL (Invalid argument))
+```
+
+Causa: `UdpBridgeServer.kt` abría el socket con
+`DatagramSocket(0, InetAddress.getByName("127.0.0.1"))`, es decir **atado a la
+interfaz de bucle**. Un socket atado a `127.0.0.1` solo puede hablar por el
+bucle, así que cada `sendto` hacia la IP pública del simulador lo rechazaba el
+kernel con `EINVAL` en el acto. El visor mandaba los diez paquetes del circuito
+(`datagramasOut: 10`) y ninguno salía del teléfono (`datagramasIn: 0`), así que
+el simulador no contestaba y el gateway avisaba —con razón— de que «no ha
+enviado un solo paquete». El síntoma parecía un puerto bloqueado o un problema de
+la operadora; era la app hablando por el bucle a una dirección de internet.
+
+Arreglado: el socket se abre con `DatagramSocket(0)` (comodín `0.0.0.0`), que es
+lo que hace cualquier visor de Second Life, y el sistema elige puerto y dirección
+de origen. Además, para que esto no vuelva a parecer otra cosa:
+
+- el registro nativo dice ahora **en qué dirección y familia** quedó el socket
+  (`socket listo en 0.0.0.0:49062 (IPv4), destino …`), porque a un socket IPv6 no
+  se le puede dar una dirección IPv4 (el `sockaddr` se queda corto y vuelve a ser
+  `EINVAL`);
+- un fallo de envío ya **no se pierde en el registro nativo**: el puente avisa al
+  visor (`{"sendError":…}`, `udp.js`) y el informe del visor lo pone en el bloque
+  `puente` (`erroresEnvio`, `ultimoErrorEnvio`) y en el propio mensaje de error
+  de la sesión;
+- los fallos de envío se cuentan y se agrupan (el primero y uno de cada diez, con
+  destino y tamaño), para que el informe sea legible y diga la causa.
+
+Autotest: `runUdpSelfTest` cubre el aviso (`sendError`) — que se cuenta, que
+guarda motivo y destino, y que **no** tumba el enlace (21/21).
 
 Límites honestos (documentados, no bugs): las texturas de Second Life son
 **JPEG2000** y el navegador no las decodifica, así que el visor no pide assets y

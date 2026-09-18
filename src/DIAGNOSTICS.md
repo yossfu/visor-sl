@@ -36,7 +36,10 @@ el móvil:
   `simPackets`, **`relogins`**, el circuito (paquetes, RTT, reenvíos, silencio en
   ms) y el bloque **`puente`** con lo que ha ido y vuelto por el WebSocket local
   de la app (host, puertos, datagramas y KB en cada sentido). Si el puente no
-  arrancó, aquí se ve por qué.
+  arrancó, aquí se ve por qué. Si el puente **no pudo enviar** algún datagrama,
+  añade `erroresEnvio` y `ultimoErrorEnvio` (por ejemplo
+  `sendto failed: EINVAL (Invalid argument)`): eso significa que el enlace va
+  bien pero la salida a la red no, y es lo primero que hay que mirar.
 
 ## 2. Niveles y categorías
 

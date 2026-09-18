@@ -27,6 +27,10 @@
 //                                                        que traen un simulador nuevo)
 //   <- {"ok":true,"localPort":51234}
 //   <- {"error":"lo que haya pasado"}
+//   <- {"sendError":"sendto failed: EINVAL …","host":"1.2.3.4","port":9000,"localPort":51234}
+//        el proceso local no pudo sacar ESE datagrama a la red. No es un fallo
+//        del enlace (sigue abierto), es la salida a internet, y el visor lo
+//        apunta para poder decirlo en su informe en vez de culpar al simulador.
 //
 // A partir de ahi, cada trama BINARIA es un datagrama entero, en los dos
 // sentidos. Al cerrar se manda {"cmd":"close"}. Con esto el proceso local no
@@ -164,6 +168,12 @@ export function openUdpBridge(opts = {}) {
     host: null, port: 0, localPort: 0,
     packetsIn: 0, packetsOut: 0, bytesIn: 0, bytesOut: 0,
     lastRecvAt: 0, lastSendAt: 0, closedAt: 0, opens: 0,
+    // Fallos de ENVIO que avisa el proceso local ({"sendError":...}). Son otra
+    // cosa que `error`: el enlace puede estar perfecto y aun asi no salir ni un
+    // datagrama (un socket atado a la interfaz equivocada, por ejemplo). Sin
+    // esto, el visor solo puede decir "mando paquetes y no vuelve nada", que es
+    // exactamente lo que parece un puerto bloqueado.
+    sendErrors: 0, lastSendError: null,
   };
 
   let socket = null;
@@ -201,6 +211,16 @@ export function openUdpBridge(opts = {}) {
     let m = null;
     try { m = JSON.parse(text); } catch (e) { return; }
     if (!m) return;
+    if (m.sendError) {
+      // El proceso local no pudo meter el datagrama en la red. El enlace sigue
+      // en pie (por eso NO se toca `link`): lo que falla es la salida a la red.
+      st.sendErrors++;
+      st.lastSendError = String(m.sendError) +
+        (m.host ? " (" + m.host + ":" + m.port + " desde el puerto local " + (m.localPort || 0) + ")" : "");
+      log("puente: no se pudo enviar el datagrama: " + st.lastSendError);
+      emit("error", st.lastSendError);
+      return;
+    }
     if (m.error) {
       const t = String(m.error);
       const pend = esperandoConnect;
@@ -361,8 +381,19 @@ export function runUdpSelfTest() {
           }
           return;
         }
-        // Un datagrama del cliente: el servidor contesta con otro.
-        setTimeout(() => this.emit("message", { data: Uint8Array.of(0xaa, 0xbb).buffer }), 0);
+        // Un datagrama del cliente: el servidor contesta con otro y ademas
+        // avisa de que ese envio no pudo salir (lo que hace el puente nativo
+        // cuando `sendto` falla). El visor tiene que enterarse de las dos cosas
+        // sin que el aviso tumbe el enlace.
+        setTimeout(() => {
+          this.emit("message", { data: Uint8Array.of(0xaa, 0xbb).buffer });
+          this.emit("message", {
+            data: JSON.stringify({
+              sendError: "sendto failed: EINVAL (Invalid argument)",
+              host: "54.188.100.243", port: 13027, localPort: 40000,
+            }),
+          });
+        }, 0);
         return;
       }
       close() { this.readyState = 3; setTimeout(() => this.emit("close", { code: 1000, reason: "adios" }), 0); }
@@ -389,6 +420,14 @@ export function runUdpSelfTest() {
         eq("puente: el datagrama de vuelta llego al circuito", recibidos, [[0xaa, 0xbb]]);
         eq("puente: contadores de entrada", [puente.state.packetsIn, puente.state.bytesIn], [1, 2]);
         ok("puente: se sabe cuando fue el ultimo paquete", puente.silentMs >= 0, puente.silentMs);
+
+        // 3b. El aviso de que un envio no pudo salir: se apunta con su motivo y
+        //     su destino, se distingue del estado del enlace y no lo tumba.
+        eq("puente: se cuenta el fallo de envio", puente.state.sendErrors, 1);
+        ok("puente: el fallo de envio guarda motivo y destino",
+          /EINVAL/.test(puente.state.lastSendError || "") && /54\.188\.100\.243:13027/.test(puente.state.lastSendError || ""),
+          puente.state.lastSendError);
+        ok("puente: el enlace sigue en pie tras el fallo de envio", puente.ready, puente.state.link);
 
         const cerrado = [];
         puente.on("close", (e) => cerrado.push(e.wasReady));

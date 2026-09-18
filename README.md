@@ -188,6 +188,13 @@ El `DatagramSocket` es *unconnected* (recibe de cualquiera y manda a `host:port`
 con `soTimeout` de 500 ms y bufer de recepcion de 1 MB. Repetir `connect` con
 otro destino **reapunta** sin cambiar el puerto local (para el teletransporte).
 
+Se abre con **`DatagramSocket(0)` (comodin `0.0.0.0`), NUNCA atado a
+`127.0.0.1`**: un socket atado al bucle no puede salir a internet, y `sendto`
+hacia la IP publica del simulador devuelve `EINVAL`. Fue el fallo del
+18-09-2026 (diez `sendto failed: EINVAL` seguidos con el circuito abierto y cero
+paquetes del simulador). El puente ahora avisa al visor de los fallos de envio
+(`{"sendError":...}`) para que salgan en su informe, ademas del registro nativo.
+
 El enlace de red del visor (`src/sl/relay.js`) sigue existiendo para los modos
 antiguos (retransmisor `wss://`), pero la app ya no lo usa.
 

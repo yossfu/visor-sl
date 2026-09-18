@@ -58,7 +58,7 @@ JavaScript, a partir de las fuentes públicas de Linden Lab
 (`message_template.msg`, `indra_constants.h`, `llprimitive.cpp`,
 `lltextureentry.*`, `patch_dct.cpp`, `avatar_lad.xml`…) y **verificado contra
 datagramas reales** congelados en los autotests (`recapturas.js` y
-`vectors.js`). El resultado es `src/sl/lludp/` (861 comprobaciones en verde en
+`vectors.js`). El resultado es `src/sl/lludp/` (864 comprobaciones en verde en
 14 suites, más `src/sl/relay.js` con 36),
 que es el MISMO código en el escritorio y dentro del APK.
 
@@ -126,6 +126,15 @@ Lo comparten `src/sl/lludp/udp.js` (cliente) y `UdpBridgeServer.kt` (servidor):
 El `DatagramSocket` es *unconnected* (recibe de cualquiera y manda a `host:port`),
 con `soTimeout` de 500 ms y búfer de recepción de 1 MB. Repetir `connect` con
 otro destino **reapunta** sin cambiar el puerto local (para el teletransporte).
+
+Se abre con **`DatagramSocket(0)` (comodín `0.0.0.0`), nunca atado a
+`127.0.0.1`**: un socket atado al bucle solo puede hablar por el bucle, y
+`sendto` hacia la IP pública del simulador devuelve `EINVAL` en el acto (fue el
+fallo del 18-09-2026: el circuito abierto, el login hecho, diez `sendto failed:
+EINVAL` seguidos y cero paquetes del simulador). Si el socket saliera IPv6 se
+avisa en el registro, porque una dirección IPv4 en un socket IPv6 da el mismo
+`EINVAL`. Los fallos de envío se cuentan, se agrupan en el registro y se le
+avisan al visor (`{"sendError":…}`), que los pone en el informe.
 
 ### El modelo del avatar va dentro del APK
 

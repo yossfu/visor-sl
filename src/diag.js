@@ -21,7 +21,7 @@
 // (MainActivity.kt): `info()`, `saveReport(nombre, texto)` y
 // `shareReport(nombre, texto)`. Si no hay puente, se descarga el fichero.
 
-export const DIAG_VERSION = "1.0";
+export const DIAG_VERSION = "1.1";
 
 // Niveles, de mas grave a mas hablado. El nivel activo es un umbral: con
 // «aviso» (1) se guardan errores y avisos, y se tira el resto.
