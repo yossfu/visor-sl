@@ -1172,6 +1172,10 @@ export function createLldpGateway(opts = {}) {
     onSimMessage, onViewerFrame,
     get circuit() { return st.circuit; },
     get udp() { return st.udp; },
+    // El puente UDP de verdad (solo en la app Android, o con `udpUrl`): el unico
+    // objeto por el que se puede preguntar a la red si deja salir un datagrama
+    // (ver `probe()` en udp.js y `red.js`). Es null si la region es simulada.
+    get bridge() { return st.bridge; },
     get ready() { return st.ready; },
     get names() { return nombres; },
     get objects() { return objetosVistos; },
@@ -1184,6 +1188,7 @@ export function createLldpGateway(opts = {}) {
       const puente = b ? {
         enlace: b.link, listo: !!b.ready, error: b.error || null,
         host: b.host, puerto: b.port, puertoLocal: b.localPort,
+        familia: b.familia || null,
         datagramasIn: b.packetsIn, datagramasOut: b.packetsOut,
         kbIn: Math.round(b.bytesIn / 1024), kbOut: Math.round(b.bytesOut / 1024),
       } : null;

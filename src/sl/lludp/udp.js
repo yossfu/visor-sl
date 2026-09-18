@@ -32,6 +32,17 @@
 //        del enlace (sigue abierto), es la salida a internet, y el visor lo
 //        apunta para poder decirlo en su informe en vez de culpar al simulador.
 //
+// Y una orden de un solo uso, la sonda de red:
+//
+//   -> {"cmd":"probe","host":"stun.l.google.com","port":19302,"datos":[0,1,...]}
+//   <- {"probe":{"ok":true,"ms":123,"local":"0.0.0.0:53100","familia":"IPv4",
+//                "de":"1.2.3.4:19302","datos":[...]}}
+//   <- {"probe":{"ok":false,"ms":2505,"local":"…","familia":"…","error":"…"}}
+//        manda esos bytes a ese destino desde un socket UDP local y devuelve lo
+//        primero que llegue. El visor le da una peticion STUN (`red.js`) para
+//        averiguar si esta red deja salir UDP; el puente no entiende el
+//        contenido, solo mueve bytes.
+//
 // A partir de ahi, cada trama BINARIA es un datagrama entero, en los dos
 // sentidos. Al cerrar se manda {"cmd":"close"}. Con esto el proceso local no
 // tiene que entender LLUDP: es un simple relevador de bytes, y toda la
@@ -152,6 +163,9 @@ export const BRIDGE_CMD = {
   CONNECT: "connect",
   CLOSE: "close",
   STATUS: "status",
+  // La sonda de red: manda bytes a un destino y devuelve lo primero que llegue.
+  // Ver `probe()` y `red.js` (la peticion STUN que se le da).
+  PROBE: "probe",
 };
 
 // `url` = ws://127.0.0.1:PUERTO (la app Android) o wss://... (un retransmisor
@@ -166,6 +180,9 @@ export function openUdpBridge(opts = {}) {
   const st = {
     link: "idle", ready: false, error: null,
     host: null, port: 0, localPort: 0,
+    // La familia del socket local que abrio el proceso nativo ("IPv4"/"IPv6").
+    // Es el dato que decide si un simulador de Second Life puede contestar.
+    familia: null,
     packetsIn: 0, packetsOut: 0, bytesIn: 0, bytesOut: 0,
     lastRecvAt: 0, lastSendAt: 0, closedAt: 0, opens: 0,
     // Fallos de ENVIO que avisa el proceso local ({"sendError":...}). Son otra
@@ -179,6 +196,10 @@ export function openUdpBridge(opts = {}) {
   let socket = null;
   let handler = null;
   let esperandoConnect = null;    // {resolve, reject, timer}
+  // Una sonda en vuelo: {resolve, reject, timer}. Como el puente nativo manda
+  // la respuesta por la misma conexion, basta con una a la vez (y el visor solo
+  // lanza una al arrancar y otra si el usuario pulsa el boton).
+  let esperandoSonda = null;
   // Un cierre pedido por nosotros mismos tiene que poder decir si el puente
   // estaba vivo: para cuando llega el evento `close` de verdad, el enlace ya se
   // ha marcado como inactivo, asi que el dato se guarda antes.
@@ -232,8 +253,31 @@ export function openUdpBridge(opts = {}) {
       return;
     }
     if (m.status) { log("puente: " + m.status); return; }
+    if (m.probe) {
+      // La respuesta de la sonda de red (ver `probe()`). Los bytes van en un
+      // array de numeros 0..255 en JSON; se devuelven como Uint8Array.
+      const pr = m.probe;
+      const pend = esperandoSonda;
+      esperandoSonda = null;
+      const salida = Object.assign({}, pr, {
+        ok: !!pr.ok,
+        datos: (pr.datos || []).map((x) => x & 255),
+        // El puerto local que uso la sonda (lo ultimo tras el ultimo ":", que
+        // en IPv6 hay varios).
+        localPort: String(pr.local || "").replace(/^.*:/, ""),
+      });
+      if (pend) {
+        clearTimeout(pend.timer);
+        if (pr.ok) pend.resolve(salida); else pend.reject(new Error(pr.error || "la sonda no recibio respuesta"));
+      } else {
+        log("puente: llego una sonda que nadie esperaba");
+      }
+      emit("probe", salida);
+      return;
+    }
     if (m.ok) {
       st.localPort = m.localPort || 0;
+      if (m.familia) st.familia = String(m.familia);
       const pend = esperandoConnect;
       esperandoConnect = null;
       if (pend) { clearTimeout(pend.timer); pend.resolve(st.localPort); }
@@ -267,6 +311,9 @@ export function openUdpBridge(opts = {}) {
         const eraReady = cierreVoluntarioListo || st.ready;
         cierreVoluntarioListo = false;
         st.closedAt = now();
+        const pendSonda = esperandoSonda;
+        esperandoSonda = null;
+        if (pendSonda) { clearTimeout(pendSonda.timer); pendSonda.reject(new Error("el puente se cerro durante la sonda")); }
         setLink("idle", null);
         emit("close", { code: (ev && ev.code) || 0, reason: (ev && ev.reason) || "", wasReady: eraReady });
       });
@@ -303,6 +350,35 @@ export function openUdpBridge(opts = {}) {
     connect,
     /** Reapunta el puente a otro simulador (un teletransporte cambia de IP). */
     reconnect(host, port) { return connect(host, port); },
+    /**
+     * La sonda de red: manda `bytes` a `host:puerto` por un socket UDP del
+     * proceso local y devuelve lo primero que llegue (o rechaza con el motivo).
+     * Solo tiene sentido con un puente de verdad; el visor la usa para saber si
+     * ESTE movil, en ESTA red, puede sacar un datagrama UDP y recibir la
+     * respuesta. Devuelve `{ok, ms, local, familia, de, datos, localPort}`.
+     */
+    probe(host, port, bytes, opts = {}) {
+      const limite = opts.timeout === undefined ? 5000 : opts.timeout;
+      return new Promise((resolve, reject) => {
+        if (!socket || socket.readyState !== 1) { reject(new Error("el puente no esta abierto")); return; }
+        if (esperandoSonda) { reject(new Error("ya hay una sonda en vuelo")); return; }
+        esperandoSonda = {
+          resolve, reject,
+          timer: setTimeout(() => {
+            esperandoSonda = null;
+            reject(new Error("la sonda no obtuvo respuesta en " + limite + " ms"));
+          }, limite),
+        };
+        const datos = Array.from(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes), (b) => b & 255);
+        try {
+          socket.send(JSON.stringify({ cmd: BRIDGE_CMD.PROBE, host: host || "", port: port || 0, datos }));
+        } catch (e) {
+          const pend = esperandoSonda;
+          esperandoSonda = null;
+          if (pend) { clearTimeout(pend.timer); pend.reject(new Error("no se pudo pedir la sonda: " + (e && e.message ? e.message : e))); }
+        }
+      });
+    },
     send(u8) {
       if (!socket || socket.readyState !== 1) return false;
       const bytes = u8 instanceof Uint8Array ? u8 : new Uint8Array(u8);
@@ -314,6 +390,11 @@ export function openUdpBridge(opts = {}) {
     },
     close() {
       cierreVoluntarioListo = st.ready;
+      // Una sonda en vuelo se queda sin respuesta posible: se rechaza ya en vez
+      // de dejar al visor esperando el tiempo limite.
+      const pendSonda = esperandoSonda;
+      esperandoSonda = null;
+      if (pendSonda) { clearTimeout(pendSonda.timer); pendSonda.reject(new Error("el puente se cerro durante la sonda")); }
       if (socket && socket.readyState === 1) {
         try { socket.send(JSON.stringify({ cmd: BRIDGE_CMD.CLOSE })); } catch (e) { /* da igual */ }
         try { socket.close(1000, "adios"); } catch (e) { /* ya cerrado */ }
@@ -363,6 +444,10 @@ export function runUdpSelfTest() {
   return new Promise((resolve) => {
     const servidor = [];
     let serverSocketHandler = null;
+    // Cuantas sondas de red ha contestado el servidor de mentira: la segunda se
+    // deja sin respuesta a proposito (para probar el tiempo limite).
+    let sondasServidas = 0;
+    const espera = (ms) => new Promise((r) => setTimeout(r, ms));
     class WSFalso {
       constructor(u) {
         this.url = u; this.readyState = 0; this.binaryType = "blob";
@@ -377,7 +462,18 @@ export function runUdpSelfTest() {
         if (typeof d === "string") {
           const m = JSON.parse(d);
           if (m.cmd === "connect") {
-            setTimeout(() => { serverSocketHandler = true; this.emit("message", { data: JSON.stringify({ ok: true, localPort: 40000 }) }); }, 0);
+            setTimeout(() => { serverSocketHandler = true; this.emit("message", { data: JSON.stringify({ ok: true, localPort: 40000, familia: "IPv4" }) }); }, 0);
+          } else if (m.cmd === "probe" && sondasServidas === 0) {
+            // La sonda de red contestada como un STUN: devuelve la direccion de
+            // origen. La segunda sonda se deja a proposito sin respuesta.
+            sondasServidas++;
+            setTimeout(() => {
+              this.emit("message", {
+                data: JSON.stringify({
+                  probe: { ok: true, ms: 12, local: "0.0.0.0:53100", familia: "IPv4", de: "1.2.3.4:19302", datos: [1, 2, 255] },
+                }),
+              });
+            }, 0);
           }
           return;
         }
@@ -406,45 +502,65 @@ export function runUdpSelfTest() {
     puente.on("state", (s) => estados.push(s.link));
 
     ok("puente: todavia sin conectar", !puente.ready, puente.state.link);
-    puente.connect("1.2.3.4", 9000).then((puerto) => {
+    puente.connect("1.2.3.4", 9000).then(async (puerto) => {
       eq("puente: confirmado con su puerto local", puerto, 40000);
       ok("puente: listo", puente.ready, puente.state.link);
       eq("puente: se mando el connect", JSON.parse(servidor[0]), { cmd: "connect", host: "1.2.3.4", port: 9000 });
       ok("puente: el estado paso por abierto", estados.indexOf("open") >= 0, estados);
+      eq("puente: apunta la familia del socket local", puente.state.familia, "IPv4");
 
       puente.send(Uint8Array.of(1, 2, 3, 4));
       eq("puente: el datagrama salio como bytes", Array.from(servidor[1]), [1, 2, 3, 4]);
       eq("puente: contador de salida", puente.state.packetsOut, 1);
 
-      setTimeout(() => {
-        eq("puente: el datagrama de vuelta llego al circuito", recibidos, [[0xaa, 0xbb]]);
-        eq("puente: contadores de entrada", [puente.state.packetsIn, puente.state.bytesIn], [1, 2]);
-        ok("puente: se sabe cuando fue el ultimo paquete", puente.silentMs >= 0, puente.silentMs);
+      await espera(10);
+      eq("puente: el datagrama de vuelta llego al circuito", recibidos, [[0xaa, 0xbb]]);
+      eq("puente: contadores de entrada", [puente.state.packetsIn, puente.state.bytesIn], [1, 2]);
+      ok("puente: se sabe cuando fue el ultimo paquete", puente.silentMs >= 0, puente.silentMs);
 
-        // 3b. El aviso de que un envio no pudo salir: se apunta con su motivo y
-        //     su destino, se distingue del estado del enlace y no lo tumba.
-        eq("puente: se cuenta el fallo de envio", puente.state.sendErrors, 1);
-        ok("puente: el fallo de envio guarda motivo y destino",
-          /EINVAL/.test(puente.state.lastSendError || "") && /54\.188\.100\.243:13027/.test(puente.state.lastSendError || ""),
-          puente.state.lastSendError);
-        ok("puente: el enlace sigue en pie tras el fallo de envio", puente.ready, puente.state.link);
+      // 3b. El aviso de que un envio no pudo salir: se apunta con su motivo y
+      //     su destino, se distingue del estado del enlace y no lo tumba.
+      eq("puente: se cuenta el fallo de envio", puente.state.sendErrors, 1);
+      ok("puente: el fallo de envio guarda motivo y destino",
+        /EINVAL/.test(puente.state.lastSendError || "") && /54\.188\.100\.243:13027/.test(puente.state.lastSendError || ""),
+        puente.state.lastSendError);
+      ok("puente: el enlace sigue en pie tras el fallo de envio", puente.ready, puente.state.link);
 
-        const cerrado = [];
-        puente.on("close", (e) => cerrado.push(e.wasReady));
-        puente.close();
-        setTimeout(() => {
-          ok("puente: el cierre avisa de que estaba vivo", cerrado[0] === true, cerrado);
-          ok("puente: queda sin enlace", !puente.ready, puente.state.link);
+      // 3c. La sonda de red: pide su destino y sus bytes, y devuelve de vuelta
+      //     lo que llegue, con la familia del socket que la saco.
+      const sonda = puente.probe("stun.l.google.com", 19302, Uint8Array.of(0, 1, 0, 0));
+      await espera(0);
+      const orden = servidor.map((x) => (typeof x === "string" ? JSON.parse(x) : null)).filter((m) => m && m.cmd === "probe")[0];
+      eq("puente: la sonda pide destino y bytes", orden && [orden.host, orden.port, orden.datos], ["stun.l.google.com", 19302, [0, 1, 0, 0]]);
+      const r = await sonda;
+      eq("puente: la sonda devuelve los bytes de vuelta", r.datos, [1, 2, 255]);
+      eq("puente: la sonda dice ok, familia y puerto local", [r.ok, r.familia, r.localPort], [true, "IPv4", "53100"]);
 
-          // 4. Un puente a una direccion que no es WebSocket falla en el acto y
-          //    con un motivo legible, no dejando la interfaz girando.
-          const malo = openUdpBridge({ url: "http://ejemplo.com/udp", WebSocketClass: WSFalso, timeout: 100 });
-          malo.connect("1.1.1.1", 1).then(
-            () => { eq("puente: rechaza http", "resolvio", "un error"); terminar(); },
-            (e) => { ok("puente: rechaza http con motivo", /no es un WebSocket/.test(e.message), e.message); terminar(); },
-          );
-        }, 10);
-      }, 10);
+      // 3d. Una sonda sin respuesta se rechaza con su motivo (no cuelga).
+      let motivo = "";
+      await puente.probe("nadie.example", 1, Uint8Array.of(0), { timeout: 30 }).then(
+        () => { motivo = "(resolvio)"; },
+        (e) => { motivo = e.message; },
+      );
+      ok("puente: una sonda sin respuesta se rechaza con motivo", /no obtuvo respuesta/.test(motivo), motivo);
+
+      const cerrado = [];
+      puente.on("close", (e) => cerrado.push(e.wasReady));
+      puente.close();
+      await espera(10);
+      ok("puente: el cierre avisa de que estaba vivo", cerrado[0] === true, cerrado);
+      ok("puente: queda sin enlace", !puente.ready, puente.state.link);
+
+      // 4. Un puente a una direccion que no es WebSocket falla en el acto y
+      //    con un motivo legible, no dejando la interfaz girando.
+      const malo = openUdpBridge({ url: "http://ejemplo.com/udp", WebSocketClass: WSFalso, timeout: 100 });
+      try {
+        await malo.connect("1.1.1.1", 1);
+        eq("puente: rechaza http", "resolvio", "un error");
+      } catch (e) {
+        ok("puente: rechaza http con motivo", /no es un WebSocket/.test(e.message), e.message);
+      }
+      terminar();
     }, (e) => {
       checks.push({ name: "puente: no conecto", ok: false, got: e.message });
       terminar();

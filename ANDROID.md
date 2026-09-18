@@ -58,8 +58,9 @@ JavaScript, a partir de las fuentes públicas de Linden Lab
 (`message_template.msg`, `indra_constants.h`, `llprimitive.cpp`,
 `lltextureentry.*`, `patch_dct.cpp`, `avatar_lad.xml`…) y **verificado contra
 datagramas reales** congelados en los autotests (`recapturas.js` y
-`vectors.js`). El resultado es `src/sl/lludp/` (866 comprobaciones en verde en
-14 suites, más `src/sl/relay.js` con 36),
+`vectors.js`). El resultado es `src/sl/lludp/` (835 comprobaciones en verde en
+13 suites), más `src/sl/relay.js` (36) y `src/sl/red.js` (24, la sonda de red):
+**895 comprobaciones en 15 suites**,
 que es el MISMO código en el escritorio y dentro del APK.
 
 En un principio se estudió portar la capa de red de **Linkpoint**
@@ -68,6 +69,45 @@ sido mantener **dos** implementaciones del protocolo (una Kotlin en el móvil y
 otra JS en el navegador) que se desincronizan a la primera de cambio, y la parte
 nativa acababa siendo enorme. Con el puente tonto, el nativo cabe en una pantalla
 y el protocolo se prueba sin móvil.
+
+Eso sí: de Lumiya/Linkpoint **sí** se copió un hallazgo, el 18-09-2026, cuando el
+móvil mandaba paquetes que nunca llegaban — ver «IPv4 a la fuerza» más abajo. No
+es código portado: es un ajuste de dos líneas (`preferIPv4Stack`) y una
+comprobación de la familia del socket.
+
+## IPv4 a la fuerza (y la sonda de red)
+
+En datos móviles, Android puede abrir un socket **de doble pila (IPv6)** por
+defecto. Un socket así manda hacia la IP IPv4 de un simulador como
+IPv4-metido-en-IPv6, y la respuesta puede no encontrar el camino de vuelta por el
+NAT de la operadora (CGNAT): **«se envían paquetes y no llega ninguno»**, que se
+confunde con un puerto bloqueado. Lumiya lo resolvió en el constructor de su
+conexión, antes de crear ningún socket:
+
+```java
+System.setProperty("java.net.preferIPv4Stack", "true");
+System.setProperty("java.net.preferIPv6Addresses", "false");
+```
+
+(Linkpoint lo documenta igual en `UDPConnectionFixed.kt` con capturas reales.) La
+app hace lo mismo en dos capas:
+
+- `VisorApp.kt` (un `Application`) lo pone en `onCreate`, antes de que exista
+  ningún socket; `MainActivity` lo repite al arrancar y lo deja en el registro y
+  en el informe.
+- `UdpBridgeServer.abrirSocketUdp()` mira la familia del socket recién abierto y,
+  si ha salido IPv6, lo descarta y abre uno IPv4 explícito
+  (`DatagramChannel.open(StandardProtocolFamily.INET)`), avisando en el registro
+  si tampoco. La familia va al informe (`puente.familia`).
+
+Y para saber **sin** un simulador delante si la red deja salir UDP, está la sonda
+de red: el visor (`src/sl/red.js`) monta una petición **STUN** (RFC 5389) y el
+puente la manda con la orden `probe`, devolviendo lo primero que llegue. Si
+vuelve, la red deja salir UDP y volver la respuesta; además dice la IP y puerto
+**públicos** (que se comparan con el puerto local: en CGNAT suelen diferir, y la
+entrada del NAT puede caducar en 30-60 s si no se mantiene el circuito con
+pings). La sonda se lanza sola al abrirse el puente, y el panel de depuración
+tiene el botón **«Comprobar red»** para repetirla.
 
 ## 3. Arquitectura concreta de la app
 
@@ -78,9 +118,11 @@ android/
       AndroidManifest.xml            (INTERNET + un solo Activity)
       java/org/visor/sl/
         MainActivity.kt              (WebView + arranque + ciclo de vida)
+        VisorApp.kt                  (Application: fuerza IPv4 antes de nada)
         ViewerServer.kt              (sirve el visor por http://127.0.0.1:PORT)
         UdpBridgeServer.kt           (WebSocket local + DatagramSocket: 1 trama
-                                      binaria = 1 datagrama UDP)
+                                      binaria = 1 datagrama UDP, y la sonda
+                                      `probe`)
         VisorDiag.kt                 (puente de DEPURACIÓN E INFORMES)
       assets/viewer/                 (EL VISOR: index.html + env.js + src/**)
       assets/viewer/character/       (el MODELO real de SL, lo mete el build)

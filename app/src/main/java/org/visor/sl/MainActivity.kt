@@ -35,6 +35,10 @@ class MainActivity : Activity() {
     private var webView: WebView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Lo primero del todo: forzar IPv4 (ver VisorApp.kt). Va aqui tambien
+        // porque `MainActivity` puede arrancar en un proceso que ya hubiera
+        // tocado las clases de red antes de que corriera la Application.
+        val avisoRed = forzarIPv4()
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
@@ -79,6 +83,8 @@ class MainActivity : Activity() {
         VisorNativeLog.attach(File(getExternalFilesDir("informes") ?: filesDir, ""))
         webView?.addJavascriptInterface(VisorDiagBridge(this), "VisorDiag")
         log("app arrancada · puente de informes listo · carpeta: " + (getExternalFilesDir("informes")?.absolutePath ?: "?"))
+        log(avisoRed)
+        log(estadoPilaIpv4())
         VisorNativeLog.add("dispositivo: " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL +
             " · android " + android.os.Build.VERSION.RELEASE + " (sdk " + android.os.Build.VERSION.SDK_INT + ")")
 

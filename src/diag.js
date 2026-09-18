@@ -21,7 +21,7 @@
 // (MainActivity.kt): `info()`, `saveReport(nombre, texto)` y
 // `shareReport(nombre, texto)`. Si no hay puente, se descarga el fichero.
 
-export const DIAG_VERSION = "1.2";
+export const DIAG_VERSION = "1.3";
 
 // Niveles, de mas grave a mas hablado. El nivel activo es un umbral: con
 // «aviso» (1) se guardan errores y avisos, y se tira el resto.
@@ -85,6 +85,7 @@ export function createDiag(opts = {}) {
   const entries = [];            // {ms, level, cat, text, data, count, session}
   const counters = new Map();    // clave -> {level, cat, count, firstMs, lastMs, text}
   const states = new Map();      // nombre -> fn
+  const probes = new Set();      // fn() -> {ok, linea, detalle}  (la sonda de red)
   const listeners = new Set();   // fn(entry) / fn()
   const consoleHooked = { error: false, warn: false };
   let levelValue = levelOf(levelKey).value;
@@ -198,6 +199,32 @@ export function createDiag(opts = {}) {
 
     // Un subsistema se apunta aqui para que el informe lleve su estado actual.
     registerState(nombre, fn) { states.set(nombre, fn); return diag; },
+
+    // --- la sonda de red -----------------------------------------------------
+    // Un subsistema se apunta aqui si sabe preguntar a la RED (ver src/sl/red.js):
+    // «¿este movil, en esta red, saca un datagrama UDP y le vuelve la respuesta?».
+    // El boton «Comprobar red» del panel y el arranque de la sesion LLUDP lo usan.
+    // `fn` es async y devuelve `{ok, linea, detalle}`.
+    registerProbe(fn) { probes.add(fn); return diag; },
+    get probes() { return probes; },
+
+    // Lanza la comprobacion de red. Si nadie se ha apuntado (navegador de
+    // escritorio, o antes de montar la sesion con el puente UDP) lo dice en vez
+    // de quedarse callado.
+    async probar() {
+      if (!probes.size) {
+        return { ok: false, linea: "no hay a quién preguntar por la red (hace falta la app Android con una sesión LLUDP abierta)", detalle: { motivo: "sin-sonda" } };
+      }
+      for (const fn of probes) {
+        try {
+          const r = await fn();
+          if (r) return r;
+        } catch (e) {
+          return { ok: false, linea: "la comprobación de red falló: " + shortText(e), detalle: { error: shortText(e) } };
+        }
+      }
+      return { ok: false, linea: "la comprobación de red no devolvió nada", detalle: { motivo: "sin-resultado" } };
+    },
 
     // --- entorno -------------------------------------------------------------
 
@@ -581,6 +608,12 @@ export function createDiag(opts = {}) {
         try { null.oops; } catch (e) { diag.error("error", "prueba de excepción capturada", String(e.message)); }
         refresh();
         toast("Anotados dos errores de prueba. Pulsa «Ver informe».");
+      });
+      mk("Comprobar red", "", async () => {
+        toast("Comprobando la salida UDP…");
+        const r = await diag.probar();
+        toast(r.linea);
+        refresh();
       });
       mk("Limpiar", "", () => { diag.clear(); refresh(); toast("Registro vaciado."); });
       root.appendChild(btns);

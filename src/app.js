@@ -22,6 +22,7 @@ import { createPeers } from "./peers.js";
 import { createNet } from "./net.js";
 import { createSession } from "./sl/session.js";
 import { getStartPanel } from "./sl/startPanel.js";
+import { comprobarRed } from "./sl/red.js";
 import { patternKeys } from "./textures.js";
 import diag from "./diag.js";
 
@@ -58,6 +59,17 @@ diag.registerState("sesión", () => {
 diag.registerState("LLUDP", () => {
   if (!lldpRelay || !lldpRelay.gateway) return null;
   try { return lldpRelay.gateway.resumen(); } catch (e) { return { error: String((e && e.message) || e) }; }
+});
+// La sonda de red: la responde `probarRed()`, que mira el puente UDP que haya en
+// ese momento (solo existe en la app Android). El panel de depuracion tiene el
+// boton «Comprobar red» y el informe la lleva porque `probarRed` anota su linea.
+diag.registerProbe(probarRed);
+diag.registerState("red", () => {
+  const b = lldpRelay && lldpRelay.gateway ? lldpRelay.gateway.bridge : null;
+  if (!b) return null;
+  // Lo que se puede saber sin sonda: si el puente está abierto y la familia del
+  // socket local (la que decide si el simulador puede contestar).
+  return { enlace: b.state.link, listo: !!b.ready, familia: (b.state && b.state.familia) || null, sondas: sondaRedResumen || null };
 });
 diag.registerState("render", () => {
   if (!mount || !mount.quality) return null;
@@ -120,6 +132,11 @@ let session = null;     // sesion con el retransmisor (region de Second Life)
 // venga despues: es lo unico que permite entender un fallo de protocolo sin
 // cable USB).
 let lldpRelay = null;
+// El resultado de la ultima sonda de red (ver `probarRed`), para que el informe
+// lo pueda enseñar en el estado aunque no se repita la sonda.
+let sondaRedResumen = null;
+let sondaAutoHecha = false;
+let sondaAutoTimer = null;
 let gh = null;          // mandos de juego: minimapa, menus (inventario, armario, mapa, sitios, ajustes)
 
 // Lo que deja la pantalla de inicio (#sl) para que la ruta del visor (#viewer)
@@ -462,6 +479,44 @@ function boot() {
   last = performance.now();
 }
 
+// --- la sonda de red (¿este movil saca UDP?) ---------------------------------
+
+// Responde a «¿este movil, en esta red, saca un datagrama UDP y le vuelve la
+// respuesta?» usando el puente UDP de la app Android (ver src/sl/red.js). Es lo
+// que distingue «la red de la operadora no deja salir UDP» de «el simulador no
+// contesta», que hasta ahora solo se podia adivinar desde el informe.
+async function probarRed() {
+  const gw = lldpRelay && lldpRelay.gateway;
+  const puente = gw ? gw.bridge : null;
+  if (!puente || typeof puente.probe !== "function") {
+    return { ok: false, linea: "todavía no hay puente UDP (esta comprobación necesita la app Android y una sesión LLUDP abierta)", detalle: { motivo: "sin-puente" } };
+  }
+  const r = await comprobarRed(puente);
+  sondaRedResumen = { ok: r.ok, linea: r.linea };
+  diag.info("red", "sonda de red: " + r.linea, r.detalle);
+  return r;
+}
+
+// La sonda se lanza SOLA en cuanto el puente UDP esta abierto: asi el informe
+// que manda el usuario trae siempre el dato de la salida UDP (y la familia del
+// socket), sin que tenga que pulsar nada. Se reintenta un rato y se rinde: si el
+// puente no llega a abrirse, el registro ya lo dice por otra via.
+function sondearRedCuandoHayaPuente(intentos = 60) {
+  if (sondaAutoHecha) return;
+  if (sondaAutoTimer) { clearTimeout(sondaAutoTimer); sondaAutoTimer = null; }
+  const gw = lldpRelay && lldpRelay.gateway;
+  const puente = gw ? gw.bridge : null;
+  if (puente && puente.ready) {
+    sondaAutoHecha = true;
+    probarRed().then((r) => {
+      if (chatPanel) chatPanel.line({ kind: r.ok ? "region" : "debug", speaker: "red", text: "Sonda de red: " + r.linea });
+    }).catch(() => { /* ya queda anotado en el registro */ });
+    return;
+  }
+  if (intentos <= 0) return;
+  sondaAutoTimer = setTimeout(() => sondearRedCuandoHayaPuente(intentos - 1), 500);
+}
+
 // --- sesion con el retransmisor (region de Second Life) ----------------------
 
 // Crea la sesion que pidio la pantalla de inicio. El retransmisor es el que
@@ -500,6 +555,10 @@ function startRegionSession(cfg) {
   session.connect();
   paintSessionChip();
   lldpRelay = cfg.lldp || null;
+  // Una sesion nueva => una sonda nueva (el movil puede haber cambiado de red).
+  sondaAutoHecha = false;
+  sondaRedResumen = null;
+  if (lldpRelay && !lldpRelay.mock) sondearRedCuandoHayaPuente();
   if (chatPanel) {
     let texto;
     if (cfg.mode === "mock") {

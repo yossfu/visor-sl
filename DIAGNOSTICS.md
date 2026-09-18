@@ -70,10 +70,14 @@ Está en **Ajustes → Depuración e informes** (cajón de Ajustes del HUD). Tra
   línea, y los mensajes repetidos se cuentan: `×12`);
 - el botón **«Probar error»**, que anota dos errores a propósito (uno directo y
   otro capturado por el manejador global) para comprobar que el informe recoge
-  lo que tiene que recoger.
+  lo que tiene que recoger;
+- el botón **«Comprobar red»**, que manda una petición STUN por el puente UDP
+  (ver «IPv4 a la fuerza y la sonda de red» en el README) y dice en una línea si
+  la red deja salir UDP y con qué familia de socket. La misma sonda se lanza sola
+  al abrirse el puente, así que todo informe la trae.
 
 Botones: **Ver informe** (abre el texto completo, con su propio Guardar/Copiar),
-**Guardar**, **Compartir**, **Copiar** y **Limpiar**.
+**Guardar**, **Compartir**, **Copiar**, **Comprobar red** y **Limpiar**.
 
 La ventana no depende de la consola del navegador: en el APK no hay consola a
 mano, así que todo lo que importa se ve ahí y acaba en el informe.

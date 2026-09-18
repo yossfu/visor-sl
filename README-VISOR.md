@@ -136,7 +136,8 @@ navegador es mover datagramas UDP: la trae la **app Android** (un puente tonto d
       - `src/sl/lludp/` — **el núcleo LLUDP** (Fase 10): plantillas del protocolo,
         códec binario, circuito UDP con acks/reenvíos/ping, terreno (DCT),
         objetos, avatares, el retransmisor `gateway.js` y un simulador de región
-        real (`sim.js`). 866 comprobaciones en verde (14 suites). Ver "Modelo del
+        real (`sim.js`). 895 comprobaciones en verde (15 suites, con la sonda de
+        red `src/sl/red.js`). Ver "Modelo del
         núcleo LLUDP".
       - `src/sl/avatarLad.js` / `src/sl/avatarMesh.js` — forma real del avatar.
 - [x] `src/avatarRealBody.js` + `src/sl/slAppearance.js` + `src/sl/avatarLad.js` —
@@ -572,7 +573,7 @@ transporte es:
   datagrama, y una primera trama de texto `{"cmd":"connect","host":…,"port":…}`.
   Ahí sí se habla con un simulador de Second Life de verdad.
 
-Piezas (todas con autotest, **866 comprobaciones en verde** en 14 suites):
+Piezas (todas con autotest, **895 comprobaciones en verde** en 15 suites):
 
 - `templates.js` (68 KB, **483 mensajes** del protocolo), `template.js`
   (`TemplateSet`) y `codec.js` (bloques, compresión de ceros, uuids, utf8 fijo).
@@ -594,7 +595,11 @@ Piezas (todas con autotest, **866 comprobaciones en verde** en 14 suites):
   autotest propio: `runGatewayGuardiaSelfTest` (15/15).
 - `sim.js` — el simulador de región (72 prims de ejemplo, residentes, chat que
   responde, terreno, `RegionHandshake`, `SimStats`…).
-- `udp.js` — los transportes (par de pruebas en memoria y el puente WebSocket).
+- `udp.js` — los transportes (par de pruebas en memoria y el puente WebSocket al
+  socket UDP de la app Android, con la orden `probe` de la sonda de red).
+- [`../red.js`](../red.js) — **la sonda de red**: petición STUN y lectura de la
+  respuesta para saber si el móvil, en su red, saca un datagrama UDP y le vuelve
+  (y con qué familia de socket). Autotest 24/24.
 - [`../relay.js`](../relay.js) — **el enlace**: saludo y estado con el
   retransmisor (o con el puente UDP de la app) y el vigilante de latido descrito
   en «Enlace y parones del móvil». Autotest 36/36.
@@ -651,7 +656,8 @@ Reglas ahora:
   `simPackets`, `relogins`, y el bloque `puente` con los datagramas que han ido y
   vuelto por el WebSocket local de la app (`erroresEnvio`/`ultimoErrorEnvio`
   incluidos). Sin eso, un «no pasa nada» en el móvil no se distingue de un puerto
-  cerrado, **ni de un socket que no puede salir a internet**.
+  cerrado, **ni de un socket que no puede salir a internet**, ni de una red que
+  no deja salir UDP (la sonda de red, `src/sl/red.js`, lo dice en una línea).
 
 ### El puente UDP no podía salir a internet (el fallo del 18-09-2026)
 
@@ -692,7 +698,8 @@ de origen. Además, para que esto no vuelva a parecer otra cosa:
   destino y tamaño), para que el informe sea legible y diga la causa.
 
 Autotest: `runUdpSelfTest` cubre el aviso (`sendError`) — que se cuenta, que
-guarda motivo y destino, y que **no** tumba el enlace (21/21).
+guarda motivo y destino, y que **no** tumba el enlace (26/26, con la sonda
+`probe`; ver la sección siguiente).
 
 Límites honestos (documentados, no bugs): las texturas de Second Life son
 **JPEG2000** y el navegador no las decodifica, así que el visor no pide assets y
@@ -742,6 +749,67 @@ Autotest: `runGatewayGuardiaSelfTest` gana las dos comprobaciones que faltaban
 la pantalla de inicio (para que la página pase de los 17 s del plazo), la versión
 anterior se quedaba en fase 3 sin mandar el login, y con el arreglo entra en la
 región (256 parches, 71 prims, 18 residentes).
+
+### IPv4 a la fuerza y la sonda de red (lo que enseñó Lumiya, 18-09-2026)
+
+El cuarto informe del móvil traía el síntoma clásico: el socket abierto, el login
+hecho, el circuito latiendo… y **`datagramasOut` subiendo con `datagramasIn: 0`**.
+«Se envían paquetes y no llega ninguno». El usuario apuntó al sitio correcto: el
+visor antiguo **Lumiya** funcionaba (y sigue funcionando) para el login, y su
+código está publicado en `github.com/Kaleaon/Linkpoint` (que además es la fuente
+descompilada de Lumiya, en Kotlin, MIT).
+
+Lo que hace Lumiya y aquí no se hacía está en el constructor de su conexión
+(`SLConnection.java`, `scratch/lp/SLConnection.java`), **antes de crear ningún
+socket**:
+
+```java
+System.setProperty("java.net.preferIPv4Stack", "true");
+System.setProperty("java.net.preferIPv6Addresses", "false");
+```
+
+Y Linkpoint lo documenta con capturas reales (`UDPConnectionFixed.kt`, ~línea
+1080): *Second Life simulators only listen on IPv4. On cellular networks, Android
+may create a dual-stack (IPv6) socket by default… outgoing packets are sent as
+IPv4-mapped IPv6 but return packets may not be routed back correctly through the
+carrier's NAT. This causes **«packets sent but none received»**.* Es exactamente
+lo que se veía: en datos móviles (CGNAT) un socket de doble pila manda hacia la
+IP IPv4 del simulador como IPv4-metido-en-IPv6, y la respuesta no encuentra el
+camino de vuelta.
+
+Arreglado en dos capas, para que no dependa de una sola:
+
+- **Antes de crear ningún socket** (`VisorApp.kt`, un `Application`):
+  `preferIPv4Stack=true` y `preferIPv6Addresses=false` en `onCreate`, que corre
+  antes que nada. `MainActivity` lo repite al arrancar y el resultado va al
+  registro (`pila de red: preferIPv4Stack=true · …`) y al informe.
+- **En el socket mismo** (`UdpBridgeServer.abrirSocketUdp()`): se mira la familia
+  del socket recién abierto y, si ha salido IPv6, se descarta y se abre uno IPv4
+  explícito (`DatagramChannel.open(StandardProtocolFamily.INET)` + `bind`), con
+  aviso en el registro si tampoco. La familia elegida va al informe (bloque
+  `puente.familia`) — mirar eso primero es lo que distingue «la red no deja
+  salir» de «el simulador no contesta».
+
+Y para no volver a diagnosticar a ciegas, se añadió la **sonda de red**
+(`src/sl/red.js` + la orden `probe` del puente): una petición STUN (20 bytes, RFC
+5389) a un servidor público —`stun.l.google.com`, `stun.cloudflare.com`— que
+contesta con la dirección de origen que ve. Si vuelve, la red deja salir UDP y
+deja volver la respuesta; y dice la **IP y puerto públicos**, que se comparan con
+el puerto local (en CGNAT suelen diferir, y si la entrada del NAT caduca cada
+30-60 s hay que mantener el circuito con pings, como hace Lumiya). La sonda se
+lanza **sola** en cuanto el puente está abierto, así que todo informe trae ya el
+resultado; y hay un botón **«Comprobar red»** en el panel de depuración para
+repetirla cuando se quiera.
+
+Autotests: `runUdpSelfTest` 26/26 (la orden `probe` de ida y vuelta, sin
+respuesta, y la familia del socket) y `runRedSelfTest` 24/24 (forma de la
+petición, lectura de XOR-MAPPED-ADDRESS IPv4 e IPv6, MAPPED-ADDRESS antiguo,
+rechazo de lo que no es STUN, la comprobación completa, el aviso de IPv6, el
+reintento con el siguiente servidor y los casos sin puente).
+
+Si aun así no entra por datos móviles: probar **por Wi-Fi** (descarta la
+operadora) y mirar en el informe el bloque `puente` (`familia`, `datagramasOut`,
+`datagramasIn`, `erroresEnvio`) y las líneas `sonda de red:`.
 
 ## Modelo de la forma real del avatar (SL, Bento y BoM)
 

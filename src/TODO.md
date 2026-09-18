@@ -381,16 +381,30 @@ de juego" en el README).
       null`, `puente: null`, `framesIn: 4` = saludo + 3 latidos, sin `LOGIN`).
       Arreglado: la guardia no cuenta sin circuito (`gateway.js`) y la sesión
       manda el login si no se ha mandado nunca (`session.js`). Autotest de la
-      guardia 15/15 (total 866). Reproducido en el editor con `?udp=sim` esperando
+      guardia 15/15 (total 895). Reproducido en el editor con `?udp=sim` esperando
       18,5 s antes de entrar. Versión de la app 0.1.2 y `DIAG_VERSION` 1.2, para que
       el próximo informe confirme que corre el código nuevo. Falta compilar el APK
       y probar en el móvil.
+- [x] **Cuarto informe del móvil** («sigue sin funcionar», 18-09-2026): el usuario
+      apuntó a **Lumiya** (`github.com/Kaleaon/Linkpoint`) porque su login
+      funcionaba y sigue funcionando. Leído su código (`SLConnection.java`,
+      `UDPConnectionFixed.kt`, `02-cellular-and-background.md`): Lumiya fuerza
+      `preferIPv4Stack=true` **antes de crear ningún socket**, y Linkpoint
+      documenta con capturas reales que un socket de doble pila (IPv6) en CGNAT
+      móvil produce justo «se envían paquetes y no llega ninguno». Arreglado en
+      dos capas (VisorApp.kt + `abrirSocketUdp()` que descarta un socket IPv6 y
+      abre uno INET explícito), y añadida la **sonda de red** (STUN por la orden
+      `probe` del puente, `src/sl/red.js`) que se lanza sola al abrirse el puente
+      y tiene botón «Comprobar red» en el panel de depuración. Autotests: `udp`
+      26/26 y `red` 24/24 (total 895 en 15 suites). Versión de la app 0.1.3 y
+      `DIAG_VERSION` 1.3. Falta compilar el APK y probar (también por Wi-Fi, para
+      descartar la operadora).
 
 ## Fase 12 — Núcleo LLUDP (mundo real)
 
 Todo el protocolo de Second Life en JavaScript (`src/sl/lludp/`), con el nativo
 reducido a mover datagramas. Ver "Modelo del núcleo LLUDP" en el README y
-`src/VIEWER-REAL.md`. **866 comprobaciones en verde (14 suites).**
+`src/VIEWER-REAL.md`. **895 comprobaciones en verde (15 suites).**
 
 - [x] Plantillas del protocolo (`templates.js`, 483 mensajes) y códec binario
       (`codec.js`), verificados contra datagramas REALES (`recapturas.js`) y
