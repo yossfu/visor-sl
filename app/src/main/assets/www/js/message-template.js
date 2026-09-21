@@ -176,27 +176,12 @@ function writeF64(out, v) {
   for (let i = 0; i < 8; i++) out.push(dv.getUint8(i));
 }
 
-function writeCount(out, n) {
-  if (n < 0xff) return void out.push(n);
-  if (n < 0xffff) {
-    out.push(0xff);
-    return void out.push(n & 0xff, (n >>> 8) & 0xff);
-  }
-  out.push(0xff, 0xff);
-  writeInt(out, n, 4);
-}
-
-function readCount(bytes, pos) {
-  let c = bytes[pos++];
-  if (c === 0xff) {
-    c = bytes[pos] | (bytes[pos + 1] << 8);
-    pos += 2;
-    if (c === 0xffff) {
-      c = bytes[pos] | (bytes[pos + 1] << 8) | (bytes[pos + 2] << 16) | (bytes[pos + 3] << 24);
-      pos += 4;
-    }
-  }
-  return { count: c >>> 0, pos };
+// Block counts on the wire (lltemplatemessagereader.cpp): a `Single` block has no
+// count, a `Multiple N` block always has exactly N (nothing on the wire), and a
+// `Variable` block is preceded by ONE byte (255 is a literal 255, and a missing
+// block at the end of a message means zero repeats).
+function writeBlockCount(out, n) {
+  out.push(n & 0xff);
 }
 
 function encodeField(out, field, value) {
@@ -328,19 +313,19 @@ export function encodeBody(def, obj) {
   const out = [];
   const data = obj || {};
   for (const block of def.blocks) {
-    if (block.countType === "Multiple") writeCount(out, blockItems(data, block).length);
-  }
-  for (const block of def.blocks) {
     if (block.countType === "Single") {
       const src = data[block.name] || {};
       for (const f of block.fields) encodeField(out, f, src[f.name]);
     } else if (block.countType === "Multiple") {
-      for (const item of blockItems(data, block)) {
+      // Fixed count from the template: nothing on the wire, always N items.
+      const items = blockItems(data, block);
+      for (let n = 0; n < block.count; n++) {
+        const item = items[n] || {};
         for (const f of block.fields) encodeField(out, f, item[f.name]);
       }
     } else {
       const items = blockItems(data, block);
-      writeCount(out, items.length);
+      writeBlockCount(out, items.length);
       for (const item of items) {
         for (const f of block.fields) encodeField(out, f, item[f.name]);
       }
@@ -349,15 +334,21 @@ export function encodeBody(def, obj) {
   return new Uint8Array(out);
 }
 
-export function decodeBody(def, bytes, offset = 0) {
-  const counts = {};
-  let pos = offset;
-  for (const block of def.blocks) {
-    if (block.countType !== "Multiple") continue;
-    const r = readCount(bytes, pos);
-    counts[block.name] = r.count;
-    pos = r.pos;
+// Byte size of one repeat of a block, or -1 when it contains a length-prefixed
+// field and therefore can't be computed ahead of time.
+function blockItemSize(block) {
+  let total = 0;
+  for (const f of block.fields) {
+    if (f.type === "Fixed" || f.type === "Variable") return -1;
+    const n = TYPE_SIZE[f.type];
+    if (!n) return -1;
+    total += n;
   }
+  return total;
+}
+
+export function decodeBody(def, bytes, offset = 0) {
+  let pos = offset;
   const result = {};
   for (const block of def.blocks) {
     if (block.countType === "Single") {
@@ -369,11 +360,18 @@ export function decodeBody(def, bytes, offset = 0) {
       }
       result[block.name] = rec;
     } else {
-      let count = counts[block.name];
+      let count = block.count;
       if (block.countType === "Variable") {
-        const r = readCount(bytes, pos);
-        count = r.count;
-        pos = r.pos;
+        // One byte; a variable block missing at the end of the message means 0.
+        count = pos < bytes.length ? bytes[pos++] : 0;
+        // The simulator truncates the tail of a block when a datagram also
+        // carries appended acks, and 0xff is the "as many as fit" escape hatch.
+        // Never read past the payload: keep only the repeats that fit whole.
+        const per = blockItemSize(block);
+        if (per > 0) {
+          const fits = Math.floor((bytes.length - pos) / per);
+          if (count > fits) count = Math.max(0, fits);
+        }
       }
       const arr = [];
       for (let n = 0; n < count; n++) {

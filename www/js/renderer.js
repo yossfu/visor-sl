@@ -5,6 +5,31 @@ import { terrainTextures } from "./textures.js";
 
 export const SL_UP = new THREE.Vector3(0, 0, 1);
 
+/**
+ * What the GPU actually is, and what the WebGL2 context can do — the numbers
+ * that tell "the phone is rendering on its GPU" apart from "the WebView fell
+ * back to SwiftShader (software)". Worth logging on every launch: on Android
+ * this is the difference between a smooth region and a slideshow, and it is
+ * invisible from anywhere else in the app.
+ */
+export function gpuInfo(renderer) {
+  const out = { vendor: "", renderer: "", webgl: "", maxTexture: 0, maxRenderbuffer: 0, extensions: 0, software: false };
+  try {
+    const gl = renderer.getContext();
+    out.webgl = gl instanceof WebGL2RenderingContext ? "WebGL2" : "WebGL1";
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    out.vendor = String((dbg && gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL)) || gl.getParameter(gl.VENDOR) || "");
+    out.renderer = String((dbg && gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) || gl.getParameter(gl.RENDERER) || "");
+    out.maxTexture = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0;
+    out.maxRenderbuffer = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) || 0;
+    out.extensions = (gl.getSupportedExtensions() || []).length;
+    out.software = /swiftshader|software|llvmpipe|mesa offscreen/i.test(out.renderer);
+  } catch (e) {
+    out.error = String((e && e.message) || e);
+  }
+  return out;
+}
+
 export class Viewer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -16,6 +41,7 @@ export class Viewer {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.gpu = gpuInfo(this.renderer);
 
     this.scene = new THREE.Scene();
     this.scene.fog = new THREE.Fog(0xbfd8ee, 120, 420);
@@ -284,7 +310,7 @@ export class CameraController {
     const c = this.viewer.canvas;
     const down = (e) => {
       if (!this.enabled) return;
-      c.setPointerCapture?.(e.pointerId);
+      try { c.setPointerCapture(e.pointerId); } catch (_) {}
       this._dragging = { x: e.clientX, y: e.clientY, id: e.pointerId, moved: false };
     };
     const move = (e) => {

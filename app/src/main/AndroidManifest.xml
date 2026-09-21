@@ -4,6 +4,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Keeps the session alive (and the UDP socket open) when the app is in the
+         background. WorkManager is deliberately NOT used. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <uses-feature android:glEsVersion="0x00020000" android:required="true" />
 
@@ -26,5 +31,17 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- "specialUse" (not dataSync, which Android 14 caps and rejects without
+             a declared type): this service exists to keep the viewer's own socket
+             session running while the app is backgrounded. -->
+        <service
+            android:name=".SessionService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the Second Life viewer session (WebGL world + UDP circuit) alive while the app is in the background." />
+        </service>
     </application>
 </manifest>

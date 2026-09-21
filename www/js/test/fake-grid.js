@@ -140,15 +140,42 @@ function textureEntry(texId, { rgba = 0xffffffff, repeatU = 1, repeatV = 1, glow
   return w.bytes();
 }
 
-// ObjectUpdateCompressed payload (see object-update.js for the layout).
-function compressedObject({ fullID, id, localID, scale, position, rotation, pcode = 9 }) {
+/** A texture id whose first byte drives texturePaint(), so each prim differs. */
+function primTexture(localID) {
+  const n = ((localID * 37) % 256).toString(16).padStart(2, "0");
+  return `${n}00000-0000-4000-8000-000000000000`;
+}
+
+/**
+ * ObjectUpdateCompressed payload. This is the *real* layout the grid uses
+ * (llviewerobject.cpp + Lumiya's decompiled `SLObjectInfo.ApplyObjectUpdate`):
+ * fixed header, flag-conditional middle, and finally the prim shape (path +
+ * profile, 23 bytes) and the TextureEntry right at the end — the two blocks a
+ * viewer that stops after the owner UUID never sees.
+ */
+function compressedObject({ fullID, id, localID, scale, position, rotation, pcode = 9, params, texture }) {
+  const P = Object.assign({
+    pathCurve: 16, pathBegin: 0, pathEnd: 0, pathScaleX: 100, pathScaleY: 100,
+    pathShearX: 0, pathShearY: 0, pathTwist: 0, pathTwistBegin: 0, pathRadiusOffset: 0,
+    pathTaperX: 0, pathTaperY: 0, pathRevolutions: 0, pathSkew: 0,
+    profileCurve: 1, profileBegin: 0, profileEnd: 0, profileHollow: 0,
+  }, params || {});
   const w = writer();
   w.uuid(fullID || id).u32(localID).u8(pcode).u8(0).u32(1).u8(0).u8(0);
   w.f32(scale[0]).f32(scale[1]).f32(scale[2]);
   w.f32(position[0]).f32(position[1]).f32(position[2]);
   const r = rotation || [0, 0, 0];
   w.f32(r[0]).f32(r[1]).f32(r[2]);
-  w.u32(0);
+  w.u32(0);                       // SpecialCode: no conditional fields
+  w.uuid(AGENT_ID);               // Owner — unconditional, NOT flag-driven
+  w.u8(0);                        // no ExtraParams
+  w.u8(P.pathCurve).u16(P.pathBegin).u16(P.pathEnd)
+    .u8(P.pathScaleX).u8(P.pathScaleY).u8(P.pathShearX).u8(P.pathShearY)
+    .u8(P.pathTwist).u8(P.pathTwistBegin).u8(P.pathRadiusOffset)
+    .u8(P.pathTaperX).u8(P.pathTaperY).u8(P.pathRevolutions).u8(P.pathSkew)
+    .u8(P.profileCurve).u16(P.profileBegin).u16(P.profileEnd).u16(P.profileHollow);
+  const te = textureEntry(texture || primTexture(localID));
+  w.u32(te.length).raw(te);       // S32 TextureEntry size, then the entry itself
   return w.bytes();
 }
 
@@ -204,6 +231,18 @@ class FakeSim {
     const out = [];
     const cx = FAKE.agentPos[0], cy = FAKE.agentPos[1];
     const shapes = [[6, 6, 0.5], [4, 4, 4], [3, 3, 8], [2, 2, 12], [8, 2, 1], [1.5, 1.5, 5]];
+    // Every compressed prim is a different primitive type, so a viewer that
+    // fails to read the shape tail shows a field of identical default cubes.
+    const types = [
+      { pathCurve: 16, profileCurve: 1 },                                   // caja
+      { pathCurve: 16, profileCurve: 0 },                                   // cilindro
+      { pathCurve: 32, profileCurve: 5 },                                   // esfera
+      { pathCurve: 16, profileCurve: 3 },                                   // prisma
+      { pathCurve: 32, profileCurve: 0 },                                   // toro
+      { pathCurve: 16, profileCurve: 1, pathScaleX: 60, pathScaleY: 150 },  // troncocónico
+      { pathCurve: 48, profileCurve: 0 },                                   // tubo
+      { pathCurve: 16, profileCurve: 2 },                                   // medio cono
+    ];
     let i = 0;
     for (let ring = 0; ring < 3; ring++) {
       const r = 10 + ring * 12;
@@ -218,6 +257,8 @@ class FakeSim {
           localID, id: `00000000-0000-4000-8000-${String(localID).padStart(12, "0")}`,
           position: [x, y, terrainH(x, y) + s[2] / 2 + 0.1],
           scale: s, pcode: 9,
+          params: types[i % types.length],
+          texture: primTexture(localID),
         });
       }
     }
@@ -298,6 +339,17 @@ class FakeSim {
         { UpdateFlags: 0, Data: compressedObject({ fullID: AGENT_ID, localID: this.selfLocalID, scale: [0.6, 0.6, 1.8], position: FAKE.agentPos, pcode: 47 }) },
         { UpdateFlags: 0, Data: compressedObject({ fullID: NEIGHBOUR_ID, localID: this.neighbourLocalID, scale: [0.6, 0.6, 1.8], position: [cx + 5, cy + 5, cz], pcode: 47 }) },
       ],
+    }));
+    // The neighbour is animating: the same message a real simulator sends when
+    // a resident's viewer reports AgentAnimation (AnimID is an animation asset).
+    out.push(this.packet("AvatarAnimation", {
+      Sender: { ID: uuidBytes(NEIGHBOUR_ID) },
+      AnimationList: [
+        { AnimID: uuidBytes("2408fe9e-df1d-1d7d-f4ff-1384fa7b350f"), AnimSequenceID: 1 },
+        { AnimID: uuidBytes("6ed24bd8-91aa-4b12-ccc7-c97c857ab4e0"), AnimSequenceID: 3 },
+      ],
+      AnimationSourceList: [{ ObjectID: uuidBytes(NEIGHBOUR_ID) }],
+      PhysicalAvatarEventList: [],
     }));
     // Kill the last prim: exercises the KillObject path.
     out.push(this.packet("KillObject", { ObjectData: [{ ID: prims[prims.length - 1].localID }] }));

@@ -299,6 +299,10 @@ export function missingTexture(uuid) {
 export class TextureLibrary {
   constructor() {
     this.cache = new Map();
+    // UUIDs whose *real* pixels came from the grid. `cache` also holds the
+    // placeholders the renderer shows while a texture is on its way, and the
+    // avatar code must never mistake one of those for the real thing.
+    this.installed = new Set();
     this.default = primDefaultTexture();
     this.wood = woodTexture();
     this.brick = brickTexture();
@@ -319,7 +323,17 @@ export class TextureLibrary {
     const tex = source && source.isTexture ? source : new THREE.Texture(source);
     if (tex.version === 0) tex.needsUpdate = true;
     if (tex.colorSpace === undefined || tex.colorSpace === "") tex.colorSpace = THREE.SRGBColorSpace;
+    // Grid textures are sampled with explicit UV transforms (repeatU/repeatV) and
+    // the terrain tiles them across the whole region, so they must wrap and
+    // mip-map; the default clamp showed a stretched edge pixel instead.
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.generateMipmaps = true;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.anisotropy = 4;
     this.cache.set(uuid, tex);
+    this.installed.add(uuid);
     return tex;
   }
   get(key) {

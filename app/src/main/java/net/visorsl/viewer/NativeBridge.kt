@@ -105,6 +105,232 @@ class NativeBridge(private val activity: Activity) {
         return o.toString()
     }
 
+    // ---------------------------------------------------------------------
+    // On-device storage: a texture/asset cache in the app's own cache dir and
+    // a small key/value store (SharedPreferences) for the saved session.
+    //
+    // These folders belong to the app, so Android does NOT ask the user for any
+    // storage permission (WRITE_EXTERNAL_STORAGE has been a no-op since Android
+    // 10 and is refused by the Play policy). Exporting a file to the shared
+    // Downloads folder - the one case that used to need a permission - goes
+    // through MediaStore, which is permission-free on Android 10+ too.
+    // ---------------------------------------------------------------------
+
+    private val cacheDir: java.io.File
+        get() = java.io.File(activity.cacheDir, "vcache").apply { if (!exists()) mkdirs() }
+
+    private fun safeName(key: String): String =
+        key.replace(Regex("[^A-Za-z0-9._-]"), "_").take(96)
+
+    @JavascriptInterface
+    fun storageInfo(): String {
+        val o = JSONObject()
+        try {
+            val dir = cacheDir
+            var bytes = 0L
+            var files = 0
+            dir.listFiles()?.forEach { bytes += it.length(); files++ }
+            o.put("kind", "storage")
+            o.put("cacheDir", dir.absolutePath)
+            o.put("filesDir", activity.filesDir.absolutePath)
+            o.put("cacheFiles", files)
+            o.put("cacheBytes", bytes)
+            o.put("freeBytes", activity.filesDir.usableSpace)
+            o.put("external", android.os.Environment.getExternalStorageState())
+            o.put("needsPermission", false)
+            o.put("canExport", android.os.Build.VERSION.SDK_INT >= 29)
+        } catch (t: Throwable) {
+            o.put("error", describe(t))
+        }
+        return o.toString()
+    }
+
+    @JavascriptInterface
+    fun cachePut(requestJson: String): String {
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        val key = safeName(req.optString("key"))
+        val data = Base64.decode(req.optString("data", ""), Base64.DEFAULT)
+        httpPool.execute {
+            val out = JSONObject()
+            out.put("id", id); out.put("kind", "cachePut")
+            try {
+                val f = java.io.File(cacheDir, key)
+                if (data.isEmpty()) {
+                    out.put("ok", true); out.put("skipped", true)
+                } else {
+                    java.io.FileOutputStream(f).use { it.write(data) }
+                    out.put("ok", true); out.put("bytes", data.size)
+                }
+            } catch (t: Throwable) {
+                out.put("ok", false); out.put("error", describe(t))
+            }
+            push(out)
+        }
+        return ack(id)
+    }
+
+    @JavascriptInterface
+    fun cacheGet(requestJson: String): String {
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        val key = safeName(req.optString("key"))
+        httpPool.execute {
+            val out = JSONObject()
+            out.put("id", id); out.put("kind", "cacheGet"); out.put("key", key)
+            try {
+                val f = java.io.File(cacheDir, key)
+                if (f.isFile && f.length() > 0) {
+                    out.put("ok", true)
+                    out.put("data", Base64.encodeToString(f.readBytes(), Base64.NO_WRAP))
+                } else {
+                    out.put("ok", false); out.put("miss", true)
+                }
+            } catch (t: Throwable) {
+                out.put("ok", false); out.put("error", describe(t))
+            }
+            push(out)
+        }
+        return ack(id)
+    }
+
+    @JavascriptInterface
+    fun cacheClear(requestJson: String): String {
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        httpPool.execute {
+            val out = JSONObject()
+            out.put("id", id); out.put("kind", "cacheClear")
+            try {
+                var n = 0
+                cacheDir.listFiles()?.forEach { it.delete(); n++ }
+                out.put("ok", true); out.put("deleted", n)
+            } catch (t: Throwable) {
+                out.put("ok", false); out.put("error", describe(t))
+            }
+            push(out)
+        }
+        return ack(id)
+    }
+
+    private fun prefs() = activity.getSharedPreferences("visor", Context.MODE_PRIVATE)
+
+    @JavascriptInterface
+    fun prefsSet(requestJson: String): String {
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        try {
+            val e = prefs().edit()
+            val values = req.optJSONObject("values")
+            if (values != null) {
+                val it = values.keys()
+                while (it.hasNext()) {
+                    val k = it.next()
+                    val v = values.opt(k)
+                    if (v == null || v === JSONObject.NULL) e.remove(k) else e.putString(k, v.toString())
+                }
+            }
+            e.apply()
+            return ack(id)
+        } catch (t: Throwable) {
+            return ack(id, false, describe(t))
+        }
+    }
+
+    @JavascriptInterface
+    fun prefsAll(): String {
+        val o = JSONObject()
+        try {
+            val all = prefs().all
+            for ((k, v) in all) o.put(k, v?.toString() ?: JSONObject.NULL)
+        } catch (t: Throwable) {
+            o.put("error", describe(t))
+        }
+        return o.toString()
+    }
+
+    /** Writes a file into the public Downloads folder (screenshots, logs). */
+    @JavascriptInterface
+    fun saveToDownloads(requestJson: String): String {
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        val name = req.optString("name", "visor-sl.txt")
+        val mime = req.optString("mime", "text/plain")
+        val data = Base64.decode(req.optString("data", ""), Base64.DEFAULT)
+        httpPool.execute {
+            val out = JSONObject()
+            out.put("id", id); out.put("kind", "saveToDownloads")
+            try {
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    val values = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name)
+                        put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mime)
+                        put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
+                            android.os.Environment.DIRECTORY_DOWNLOADS)
+                    }
+                    val uri = activity.contentResolver.insert(
+                        android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    if (uri == null) throw IllegalStateException("MediaStore no devolvió un URI")
+                    activity.contentResolver.openOutputStream(uri)?.use { it.write(data) }
+                    out.put("ok", true); out.put("uri", uri.toString())
+                } else {
+                    @Suppress("DEPRECATION")
+                    val dir = android.os.Environment.getExternalStoragePublicDirectory(
+                        android.os.Environment.DIRECTORY_DOWNLOADS)
+                    if (!dir.exists()) dir.mkdirs()
+                    val f = java.io.File(dir, name)
+                    java.io.FileOutputStream(f).use { it.write(data) }
+                    out.put("ok", true); out.put("path", f.absolutePath)
+                }
+            } catch (t: Throwable) {
+                out.put("ok", false); out.put("error", describe(t))
+            }
+            push(out)
+        }
+        return ack(id)
+    }
+
+    // ---------------------------------------------------------------------
+    // Background session: while you are in-world the WebView must keep running
+    // (and the UDP socket alive) even when the app goes to the background, and
+    // Android must not freeze it - that is exactly what a foreground service
+    // with a persistent notification is for. No WorkManager anywhere.
+    // ---------------------------------------------------------------------
+
+    @JavascriptInterface
+    fun sessionStart(requestJson: String): String {
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        try {
+            SessionService.start(activity, req.optString("region", "Second Life"), req.optString("agent", ""))
+            SessionService.active = true
+        } catch (t: Throwable) {
+            return ack(id, false, describe(t))
+        }
+        return ack(id)
+    }
+
+    @JavascriptInterface
+    fun sessionUpdate(requestJson: String): String {
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        try {
+            SessionService.update(activity, req.optString("region", ""), req.optString("agent", ""))
+        } catch (_: Throwable) {
+        }
+        return ack(id)
+    }
+
+    @JavascriptInterface
+    fun sessionStop(): String {
+        try {
+            SessionService.stop(activity)
+            SessionService.active = false
+        } catch (_: Throwable) {
+        }
+        return ack("sessionStop")
+    }
+
     @JavascriptInterface
     fun log(message: String) {
         Log.i(TAG, message)

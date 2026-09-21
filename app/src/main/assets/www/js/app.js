@@ -5,6 +5,7 @@ import { World } from "./world.js";
 import { UI } from "./ui.js";
 import { buildDemoRegion } from "./demo.js";
 import { defaultPrimParams } from "./prims.js";
+import { TouchControls } from "./touch.js";
 
 export class App {
   constructor(canvas) {
@@ -14,11 +15,16 @@ export class App {
     this.world.onSelect = (rec) => this.ui.showInspector(rec);
     this.ui = new UI(this);
     this.session = null;
-    this.mode = "demo";
-    this.loadDemo(1337);
+    this.mode = "login";
+    // The viewer opens on the login screen with an empty region: there is no
+    // demo island any more (?test=demo brings it back for development).
+    this.world.reset();
+    this.viewer.controls.focus([128, 128, 30], 90);
+    this.touch = new TouchControls(this);
     this.bindInput();
     this.lastTime = performance.now();
     this.raf = requestAnimationFrame(() => this.loop());
+    this.ui.showLogin();
   }
 
   loadDemo(seed = 1337) {
@@ -41,31 +47,36 @@ export class App {
       const dt = performance.now() - this._down.t;
       this._down = null;
       if (moved > 6 || dt > 600) return;
-      const rect = c.getBoundingClientRect();
-      const ndc = new THREE.Vector2(
-        ((e.clientX - rect.left) / rect.width) * 2 - 1,
-        -((e.clientY - rect.top) / rect.height) * 2 + 1);
-      const hits = this.world.raycast(ndc);
-      if (hits.length) {
-        const rec = this.world.objects.get(hits[0].object.userData.objectId);
-        this.world.select(rec);
-      } else {
-        this.world.select(null);
-        this.ui.showInspector(null);
-      }
+      this.pickAt(e.clientX, e.clientY);
     });
     c.addEventListener("dblclick", (e) => {
-      const rect = c.getBoundingClientRect();
-      const ndc = new THREE.Vector2(
-        ((e.clientX - rect.left) / rect.width) * 2 - 1,
-        -((e.clientY - rect.top) / rect.height) * 2 + 1);
-      const hits = this.world.raycast(ndc);
+      const hits = this.raycastAt(e.clientX, e.clientY);
       if (hits.length) {
         const rec = this.world.objects.get(hits[0].object.userData.objectId);
-        if (rec.position) this.viewer.controls.focus(rec.position, Math.max(4, (rec.scale?.[0] || 1) * 4));
+        if (rec && rec.position) this.viewer.controls.focus(rec.position, Math.max(4, (rec.scale?.[0] || 1) * 4));
       }
     });
     window.addEventListener("contextmenu", (e) => { if (e.target === c) e.preventDefault(); });
+  }
+
+  raycastAt(clientX, clientY) {
+    const rect = this.canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return [];
+    const ndc = new THREE.Vector2(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1);
+    return this.world.raycast(ndc);
+  }
+
+  /** Click/tap on a prim: select it (and show it in the inspector). */
+  pickAt(clientX, clientY) {
+    const hits = this.raycastAt(clientX, clientY);
+    if (hits.length) {
+      const rec = this.world.objects.get(hits[0].object.userData.objectId);
+      if (rec) { this.world.select(rec); return; }
+    }
+    this.world.select(null);
+    this.ui.showInspector(null);
   }
 
   spawn(params) {
@@ -135,8 +146,8 @@ export class App {
       this.ui.log("⚠ No se pudo conectar: " + ((e && e.message) || e));
       try { await s.disconnect(); } catch (_) {}
       this.session = null;
-      this.ui.log("Volviendo al modo demo.");
-      this.loadDemo();
+      this.ui.log("Volviendo a la pantalla de inicio de sesión.");
+      this.returnToLogin();
       throw e;
     }
     this.rememberDiag(this.session);
@@ -159,7 +170,30 @@ export class App {
     if (this.ui.regionEl) this.ui.regionEl.textContent = "conectando…";
     this.viewer.water.setLevel(20);
     this.viewer.controls.focus([128, 128, 30], 18);
-    this.ui.log("Modo grid: se descarta la isla de demostración y empieza el terreno real (plano hasta que lleguen los parches del simulador).");
+    // Third-person camera (Genshin-like): close behind the avatar, looking slightly down.
+    const ctl = this.viewer.controls;
+    ctl.distance = 6.5;
+    ctl.pitch = -0.22;
+    ctl.yaw = 0;
+    ctl.applyOrbit();
+    // Touch pad only where it makes sense: inside the Android shell (the native
+    // bridge is present) or on a coarse-pointer device. A desktop browser keeps
+    // the mouse/keyboard controls it already had.
+    const wantTouch = !!(window.VisorNative) ||
+      (typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches) ||
+      /[?&]touch=1/.test(location.search);
+    if (this.ui.setTouchVisible) this.ui.setTouchVisible(wantTouch);
+    this.ui.log("Modo grid: el mundo arranca vacío; el terreno, los prims y los avatares llegan del simulador.");
+  }
+
+  /** Back to the login screen with an empty region (after a failed login or a disconnect). */
+  returnToLogin() {
+    this.mode = "login";
+    this.world.reset();
+    this.viewer.water.setLevel(20);
+    this.viewer.controls.focus([128, 128, 30], 90);
+    if (this.ui.setTouchVisible) this.ui.setTouchVisible(false);
+    if (this.ui.showLogin) this.ui.showLogin();
   }
 
   rememberDiag(session) {
@@ -209,8 +243,79 @@ export class App {
     await this.session.disconnect();
     this.session = null;
     this.ui.netEl.textContent = "sin conexión";
-    this.ui.log("Sesión cerrada. Volviendo al modo demo.");
-    this.loadDemo();
+    this.ui.log("Sesión cerrada. Vuelves a la pantalla de inicio de sesión.");
+    this.returnToLogin();
+  }
+
+  // --- touch controls -------------------------------------------------------
+
+  onTouchFly(on) {
+    this.flying = !!on;
+    const b = document.getElementById("flyBtn");
+    if (b) b.textContent = on ? "Volar: sí" : "Volar (F)";
+    this.ui.log(on ? "Modo volar activado." : "Modo volar desactivado.");
+  }
+
+  onTouchSit() {    if (!this.session || !this.CONTROL) return;
+    const c = this.CONTROL;
+    const sitting = !this._sitting;
+    this._sitting = sitting;
+    this.session.pulseControls(sitting ? c.SIT_ON_GROUND : c.STAND_UP);
+    this.ui.log(sitting ? "Sentarse." : "Levantarse.");
+  }
+
+  /**
+   * A jump pulse: the touch layer calls this on a double tap (and the keyboard on
+   * Space). Holding the jump button also works — UP_POS is what the simulator
+   * reads as "jump", and it needs to be *pulsed*, not latched.
+   */
+  onTouchJump() {
+    this._jumpUntil = performance.now() + 260;
+    this.ui.log("Salto.");
+  }
+
+  /**
+   * Turns the virtual stick into SL control flags. Movement is camera-relative:
+   * the avatar turns to face the direction you push and walks that way, which is
+   * how mobile SL viewers (and third-person games) behave. BodyRotation is what
+   * tells the simulator which way the avatar faces.
+   */
+  applyTouchInput() {
+    const s = this.session;
+    if (!s || !this.CONTROL || s.state !== "online" || !this.touch || !this.touch.visible) return;
+    const C = this.CONTROL;
+    const v = this.touch.vector;
+    const mag = Math.hypot(v.x, v.y);
+    const fly = this.touch.fly || this.flying;
+    let flags = 0;
+    if (mag > 0.22) {
+      flags |= C.AT_POS;
+      if (this.touch.running) flags |= C.FAST_AT;
+      if (fly && v.y < -0.45) flags |= C.UP_NEG;
+    }
+    if (this.touch.jumping || performance.now() < (this._jumpUntil || 0)) flags |= C.UP_POS;
+    if (fly) flags |= C.FLY;
+    s.setControls(flags);
+    if (mag > 0.22) {
+      const heading = this.cameraHeading(v.x, v.y);
+      s.bodyRot = [0, 0, Math.sin(heading / 2), Math.cos(heading / 2)];
+    }
+  }
+
+  /** Yaw (SL space, about Z) of the camera-relative direction of the stick. */
+  cameraHeading(x, y) {
+    const cam = this.viewer.camera;
+    const ctl = this.viewer.controls;
+    const target = ctl.target;
+    const fwd = new THREE.Vector3().subVectors(target, cam.position);
+    fwd.y = 0;
+    if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1);
+    fwd.normalize();
+    const up = new THREE.Vector3(0, 1, 0);
+    const right = new THREE.Vector3().crossVectors(fwd, up).normalize();
+    const dir = fwd.clone().multiplyScalar(y).addScaledVector(right, x);
+    // three world (x, y, -z) <- SL (x, y, z): the SL direction is (dir.x, -dir.z)
+    return Math.atan2(-dir.z, dir.x);
   }
 
   // Maps the keyboard onto AGENT_CONTROL_* bits for the live grid.
@@ -267,6 +372,8 @@ export class App {
       this.world.rebuildTerrain();
     }
     this.followAgent();
+    this.world.animateAvatars(now);
+    this.applyTouchInput();
     this.world.updateLOD(this.viewer.camera.position, 2);
     this.frameCount = (this.frameCount || 0) + 1;
     if (this.frameCount % 6 === 0) this.world.updateVisibility(this.viewer.camera.position);
@@ -288,6 +395,15 @@ export function boot() {
     import("./test/fake-grid.js")
       .then((m) => m.runFakeGrid(app))
       .catch((e) => app.ui.error("harness: " + ((e && e.message) || e)));
+  }
+  if (params.includes("test=avatar")) {
+    import("./test/avatar-test.js")
+      .then((m) => m.runAvatarTest(app))
+      .catch((e) => app.ui.error("harness de avatares: " + ((e && e.message) || e)));
+  }
+  if (params.includes("test=demo")) {
+    app.ui.hideModal();
+    app.loadDemo();
   }
   return app;
 }

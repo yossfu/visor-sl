@@ -4,6 +4,10 @@ import { primToFaces } from "./prims.js";
 import { buildTerrainMesh, Terrain, REGION_SIZE, SAMPLES_PER_EDGE } from "./terrain.js";
 import { terrainTextures, TextureLibrary } from "./textures.js";
 import { faceUVMatrix, defaultFace } from "./texture-entry.js";
+import { createAvatar, disposeAvatar, applyShape, applyPose, applyBakedTextures, bakedNeeded }
+  from "./avatar/builder.js";
+import { AvatarAnimations } from "./avatar/animation.js";
+import { DEFAULT_ANIMS } from "./avatar/anim-data.js";
 
 export const QUALITY = { low: 2, medium: 3, high: 4, ultra: 5 };
 
@@ -17,12 +21,19 @@ export class World {
     this.terrainMesh = null;
     this.objects = new Map();   // uuid -> object record
     this.avatars = new Map();   // uuid -> other residents
+    this.avatarAppearances = new Map(); // uuid -> appearance (may arrive first)
+    this.pendingAvatarAnimations = new Map(); // uuid -> animation list
+    // Residents with nothing else playing stand (the grid's default stand asset).
+    this.defaultAnimation = DEFAULT_ANIMS.stand;
     this.pickables = [];
     this.quality = this._qualityFromDevice();
     this.selection = null;
     this.onSelect = null;
     this.drawDistance = 260;
     this._lodQueue = [];
+    // The session registers a texture requester here; the avatar code needs it
+    // because baked textures arrive through the same GetTexture queue.
+    this.onTextureNeeded = null;
   }
 
   _qualityFromDevice() {
@@ -100,6 +111,31 @@ export class World {
     this.terrainMesh.name = "terrain";
     this.root.add(this.terrainMesh);
     this.terrainMesh.userData.isTerrain = true;
+    this.terrainUniforms = uniforms;
+    if (this.terrainTexIds) this.applyTerrainTextures();
+  }
+
+  /**
+   * The four TerrainDetail textures the region announces in its RegionHandshake.
+   * Until they arrive the terrain keeps the procedural stand-ins.
+   */
+  setTerrainTextures(ids) {
+    this.terrainTexIds = ids && ids.length ? ids.slice(0, 4) : null;
+    this.applyTerrainTextures();
+  }
+
+  applyTerrainTextures() {
+    const u = this.terrainUniforms;
+    if (!u || !this.terrainTexIds) return 0;
+    const slots = [u.uT0, u.uT1, u.uT2, u.uT3];
+    let applied = 0;
+    for (let i = 0; i < 4; i++) {
+      const id = this.terrainTexIds[i];
+      if (!id || /^0+$/.test(id.replace(/-/g, ""))) continue;
+      if (this.texlib.cache.has(id)) { slots[i].value = this.texlib.get(id); applied++; }
+    }
+    this.terrainTexturesApplied = applied;
+    return applied;
   }
 
   heightAt(x, y) { return this.terrain.bilinear(x, y); }
@@ -316,29 +352,52 @@ export class World {
         }
       });
     }
+    // Terrain textures are announced in the RegionHandshake and arrive through
+    // the same GetTexture queue.
+    if (this.terrainTexIds && this.terrainTexIds.includes(uuid)) touched += this.applyTerrainTextures();
+    // Baked textures of the residents (skin, clothes) come through the same
+    // queue: swap them in on every body part that was waiting for this uuid.
+    for (const av of this.avatars.values()) {
+      const group = av.bodyGroup;
+      if (!group) continue;
+      for (const p of group.userData.parts) {
+        if (p.mesh.userData.bakedUUID !== uuid) continue;
+        p.material.map = this.texlib.get(uuid);
+        p.material.color.set(0xffffff);
+        p.material.needsUpdate = true;
+        touched++;
+      }
+    }
     return touched;
   }
 
-  // Other residents are drawn as a capsule + billboarded name tag. Creating an
-  // avatar that already exists updates its name instead of duplicating it (the
-  // simulator sends our own avatar through the same path as everyone else).
+  // Other residents are drawn with the real SL body meshes (builder.js) plus a
+  // billboarded name tag. Creating an avatar that already exists updates its name
+  // instead of duplicating it (the simulator sends our own avatar through the
+  // same path as everyone else).
+  //
+  // While the meshes are being read off the disk the avatar is a capsule, so a
+  // resident never flickers in as nothing.
   addAvatar(id, name) {
     const known = this.avatars.get(id);
     if (known) {
       if (name && name !== known.name && !/^\(.*\)$/.test(name)) {
         known.name = name;
-        known.sprite.material.map.dispose();
+        if (known.sprite.material.map) known.sprite.material.map.dispose();
         known.sprite.material.map = nameTexture(name);
         known.sprite.material.needsUpdate = true;
       }
       return known;
     }
     const group = new THREE.Group();
+    // The whole world is Z-up inside viewer.slRoot, so the capsule has to be
+    // turned onto the Z axis (it is modelled around Y).
     const body = new THREE.Mesh(
       new THREE.CapsuleGeometry(0.28, 1.1, 6, 12),
       new THREE.MeshLambertMaterial({ color: 0x7fa8d8 })
     );
-    body.position.y = 0.85;
+    body.rotation.x = Math.PI / 2;
+    body.position.z = 0.85;
     body.castShadow = true;
     group.add(body);
     const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
@@ -347,12 +406,167 @@ export class World {
       map: nameTexture(name || "residente"), transparent: true, depthTest: false, depthWrite: false,
     }));
     sprite.scale.set(2.4, 0.6, 1);
-    sprite.position.y = 2.1;
+    sprite.position.set(0, 0, 2.15);
     group.add(sprite);
     this.root.add(group);
-    const av = { id, name, group, body, sprite };
+    const av = {
+      id, name, group, body, sprite,
+      bodyGroup: null, bodyPromise: null, appearance: null, weights: null,
+      anim: new AvatarAnimations(), animations: null, animationCount: 0,
+    };
     this.avatars.set(id, av);
+    const pending = this.avatarAppearances.get(id);
+    if (pending) av.appearance = pending;
+    const pendingAnim = this.pendingAvatarAnimations.get(id);
+    if (pendingAnim) {
+      this.pendingAvatarAnimations.delete(id);
+      this.setAvatarAnimations(id, pendingAnim);
+    } else if (this.defaultAnimation) {
+      // Every resident plays the default stand animation until the simulator
+      // says otherwise, which is what makes a freshly-arrived avatar look alive
+      // instead of frozen in its bind pose.
+      av.anim.setList([{ animationID: this.defaultAnimation, sequenceID: 1 }], performance.now()).catch(() => {});
+    }
+    this.provideAvatarBody(av);
     return av;
+  }
+
+  /**
+   * Loads the body meshes (once per session) and swaps them in for the capsule.
+   * The simulator can report an appearance before the object update, so the
+   * stored appearance is applied as soon as the body exists.
+   */
+  provideAvatarBody(av) {
+    if (av.bodyPromise) return av.bodyPromise;
+    av.bodyPromise = createAvatar(av.weights)
+      .then((group) => {
+        if (av.removed) { disposeAvatar(group); return null; }
+        if (av.body) {
+          av.group.remove(av.body);
+          av.body.geometry.dispose();
+          av.body.material.dispose();
+          av.body = null;
+        }
+        group.name = "cuerpo";
+        av.group.add(group);
+        av.bodyGroup = group;
+        if (av.appearance) this.applyAvatarAppearance(av);
+        this.avatarsWithBody = (this.avatarsWithBody || 0) + 1;
+        if (this.onAvatarBuilt) this.onAvatarBuilt(av);
+        return group;
+      })
+      .catch((e) => {
+        av.bodyPromise = null;
+        this.avatarError = (e && e.message) || String(e);
+        console.warn("[visor] no se pudo construir el avatar: " + this.avatarError);
+        return null;
+      });
+    return av.bodyPromise;
+  }
+
+  /**
+   * The grid's version of a resident: the shape sliders (morph weights) and the
+   * baked textures (skin, clothes) that the resident is wearing. May arrive
+   * before the body meshes have been read, in which case it is queued.
+   */
+  setAvatarAppearance(id, appearance) {
+    if (!id || !appearance) return;
+    this.avatarAppearances.set(id, appearance);
+    const av = this.avatars.get(id);
+    if (!av) return;
+    av.appearance = appearance;
+    if (!av.bodyGroup) { this.provideAvatarBody(av); return; }
+    this.applyAvatarAppearance(av);
+  }
+
+  applyAvatarAppearance(av) {
+    const app = av.appearance;
+    const group = av.bodyGroup;
+    if (!app || !group) return 0;
+    av.weights = app.weights || null;
+    const applied = applyPose(group, av.weights, av.anim, performance.now());
+    this.applyAvatarTextures(group, app.baked);
+    this.updateNameTagHeight(av);
+    return applied;
+  }
+
+  /** The floating name stays above the head, whatever the body's height. */
+  updateNameTagHeight(av) {
+    if (!av || !av.sprite || !av.bodyGroup) return;
+    const h = av.bodyGroup.userData.height || 1.9;
+    av.sprite.position.set(0, 0, h + 0.28);
+  }
+
+  /**
+   * The animations a resident is playing, straight out of the simulator's
+   * AvatarAnimation message. The whole list arrives every time it changes, so
+   * sequences that are still listed keep running and the ones that vanished fade
+   * out (avatar-animation.js).
+   */
+  setAvatarAnimations(id, list) {
+    if (!id) return;
+    const av = this.avatars.get(id);
+    if (!av) {
+      // The list can arrive before the object update that creates the avatar.
+      this.pendingAvatarAnimations.set(id, list || []);
+      return;
+    }
+    av.animations = list || [];
+    av.animationCount = av.animations.length;
+    av.anim.setList(av.animations, performance.now())
+      .then(() => {
+        // The list may reference animations the app does not ship (a resident's
+        // own uploads): those need an asset transfer, and until it exists they
+        // are simply not played.
+        const missing = [...av.anim.missing];
+        if (missing.length && this.onAnimationMissing) this.onAnimationMissing(missing);
+      })
+      .catch(() => {});
+  }
+
+  /**
+   * Advances every resident's animation clocks and re-skins the ones that moved.
+   * Called once per frame from the render loop; an avatar with nothing running
+   * costs a Map iteration and nothing else.
+   */
+  animateAvatars(now) {
+    let posed = 0;
+    for (const av of this.avatars.values()) {
+      const anim = av.anim;
+      if (!anim || !av.bodyGroup) continue;
+      if (!anim.active && anim.sequences.size === 0) continue;
+      anim.update(now);
+      if (!anim.active && anim.sequences.size === 0) {
+        // Everything stopped: put the body back in its shaped rest pose.
+        applyPose(av.bodyGroup, av.weights, null, now);
+        this.updateNameTagHeight(av);
+        posed++;
+        continue;
+      }
+      applyPose(av.bodyGroup, av.weights, anim, now);
+      this.updateNameTagHeight(av);
+      posed++;
+    }
+    this.avatarsAnimated = posed;
+    return posed;
+  }
+
+  /**
+   * Baked textures for a body part. A texture that has not been downloaded yet
+   * is requested through the session's GetTexture queue (the same one prims use)
+   * and swapped in by applyTexture() when it arrives.
+   */
+  applyAvatarTextures(group, baked) {
+    if (!group) return 0;
+    const resolve = (uuid) => (this.texlib.installed.has(uuid) ? this.texlib.get(uuid) : null);
+    const applied = applyBakedTextures(group, baked, resolve);
+    for (const uuid of bakedNeeded(baked)) {
+      if (!this.texlib.installed.has(uuid) && this.onTextureNeeded) {
+        this.onTextureNeeded(uuid);
+        this.avatarTextureRequests = (this.avatarTextureRequests || 0) + 1;
+      }
+    }
+    return applied;
   }
 
   updateAvatar(av, pos, rot) {
@@ -364,11 +578,13 @@ export class World {
 
   removeAvatar(av) {
     if (!av) return;
+    av.removed = true;
     this.root.remove(av.group);
     av.group.traverse((o) => {
       if (o.isMesh) o.geometry.dispose();
       if (o.isSprite && o.material.map) o.material.map.dispose();
     });
+    if (av.bodyGroup) { disposeAvatar(av.bodyGroup); av.body = null; }
     if (this.avatars) this.avatars.delete(av.id);
   }
 
@@ -386,6 +602,7 @@ export class World {
     this.avatars.clear();
     this.resident = this.resident || new Map();
     this.resident.clear();
+    if (this.avatarAppearances) this.avatarAppearances.clear();
     this._lodQueue = [];
     this.selection = null;
     const t = terrain || new Terrain();

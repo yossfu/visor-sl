@@ -25,6 +25,49 @@ Todo esto se comprobó leyendo ficheros concretos y se usa en
 | Contraseña: `"$1$" + md5(password.trim().substring(0,16))` | `slproto/auth/SLAuth.getPasswordHash` | |
 | Posición "terse" (16/32/48 bytes): `pos, vel, accel, rot` (cuantizados U8 o U16) y luego velocidad angular | `slproto/objects/SLObjectInfo.ParseObjectData` | en 60 bytes es flotante: `pos,vel,accel,rot(+angVel)`; la variante de 76 lleva 16 bytes de prefijo |
 
+### Animaciones y esqueleto del avatar (ronda 6) — verificado en el código decompilado
+
+- **`ObjectUpdateCompressed` (lo que hacía que el mundo saliera blanco)**: la
+  cabecera fija es FullID(16) LocalID(4) PCode(1) Estado(1) CRC(4) Material(1)
+  ClickAction(1) Escala(12) Posición(12) Rotación(12, tres floats — la W se
+  deriva) y **SpecialCode(4) y Owner(16) incondicionales** (el bit 0x01 del
+  SpecialCode es el *scratchpad*, no el dueño). Después van los parámetros extra
+  tal cual los describe la plantilla y, **al final del bloque**, la **forma del
+  prim (23 B, de PathCurve a ProfileHollow) y el TextureEntry (`S32` tamaño +
+  datos)**. Lumiya (`SLObjectInfo.java`) los lee de ahí, no del principio.
+- **Parámetros extra**: `U8 num_params` y por cada uno `[U16 tipo][S32 tamaño][datos]`;
+  flexible = tension/drag/gravity/wind + 3 floats de fuerza; luz = RGBA(4×U8) +
+  3 floats (radio, corte, caída) = 16 B; sculpt = UUID + U8 tipo = 17 B.
+- **Escalas de hueso (`LLPolySkeletalDistortion`)**: el `<bone scale="x y z"/>`
+  de `avatar_lad.xml` es un *delta* que se **suma** a la escala del hueso,
+  multiplicado por el peso del slider, y el hueso deforma **su propia malla y a
+  sus volúmenes de colisión**, mientras que **cada hijo escala su desplazamiento
+  con la escala de su padre directo** (`SLSkeletonBone.updateGlobalPos`:
+  `usePosition * parent.scale + offset`). Es decir: la escala **no** se acumula
+  multiplicando generación tras generación — con la lectura ingenua, la Altura al
+  máximo daba un avatar de 3,2 m en vez de 2,2 m. La escala del hueso se aplica
+  *después* de su rotación, sólo a los vértices ligados a él
+  (`Matrix.scaleM(... globalMatrix, scale)`).
+- **`mPelvis` es la raíz** y las piernas crecen hacia abajo, así que un avatar
+  alto se hundiría en el suelo: el visor recoloca el cuerpo con
+  `getPelvisToFoot()` (deformado, no de reposo) y `getBodySize()`. En este visor
+  se replanta con el mínimo de los tobillos/pies de la **forma** (no de la
+  animación, que sí puede levantar el cuerpo: volar, sentarse).
+- **Formato de animación (`AnimationData`)**: `S32` desconocido (siempre 1),
+  prioridad, duración, nombre de expresión acabado en NUL, `inPoint`/`outPoint`,
+  bucle, `easeIn`/`easeOut`, `handPose`, nº de huesos y, por hueso: nombre,
+  **prioridad por hueso**, fotogramas de rotación (`U16` tiempo + 3 `U16` del
+  vector del cuaternión, que se normaliza con `w = √(1-|v|²)`) y fotogramas de
+  posición (`±5 m`). Los archivos acaban con 4 bytes que el visor no lee.
+  - La **prioridad por hueso** es lo que agrupa los huesos en "conjuntos": una
+    animación puede llevar las caderas en prioridad 3 y el torso en 0, y en la
+    mezcla cada conjunto compite por separado (por eso una animación de brazos no
+    rompe la de caminar). El *blend* final normaliza el cuaternión por el peso
+    total aplicado.
+  - Los 118 assets de Lumiya son los que trae la app; sus UUID de sistema
+    (`animUUID_*` en `SLAvatarControl`) son los que manda el simulador en
+    `AvatarAnimation` (STAND `2408fe9e…`, WALK `6ed24bd8…`, RUN `05ddbff8…`).
+
 ### LLSD (capacidades y EventQueue) — verificado en `llsdserialize*.cpp`
 
 - El XML de LLSD (respuesta de la capability semilla, EventQueueGet) escribe los
@@ -43,6 +86,21 @@ Todo esto se comprobó leyendo ficheros concretos y se usa en
   del cliente Kotlin de Linkpoint.
 - Las respuestas pueden llegar en XML o en **LLSD binario** (magia `LLSD\x01`), así
   que `loadCapabilities` le pasa los bytes a `LLSD.parse`, que detecta el formato.
+
+### Bloques `Variable` y los *acks adjuntos* (ronda 6, informe 4)
+
+Los mensajes de la plantilla pueden traer bloques `Variable`: **un byte de
+recuento** antes de las repeticiones (`lltemplatemessagereader.cpp`). El recuento
+puede valer `0xff` (p. ej. `KillObject` con 255 identificadores, que es lo que
+manda el simulador al vaciar una región). El problema real era otro: **cuando el
+datagrama lleva *acks adjuntos* (bandera `0x10`), el recorte de la cola puede
+caer dentro del bloque**, y entonces el recuento pide más repeticiones de las que
+quedan y el `DataView` se sale del buffer (`Offset is outside the bounds of the
+DataView`). Cabecera real observada en el grid: `10 ff e2 0c 00 00 e3 0c 00 00 …`
+→ byte de número de mensaje `0x10` (=16, `KillObject`), recuento `0xff`=255, IDs
+`3298, 3299, 3300, 3301…`. `decodeBody` ahora recorta el recuento al número de
+repeticiones que caben enteras, así que nunca lanza y se siguen matando los
+objetos que sí venían en el paquete.
 
 ### Divergencias conscientes
 - **ImprovedInstantMessage**: Lumiya empaqueta sólo hasta `BinaryBucket` (sin
@@ -94,9 +152,10 @@ y `connect`), `indra/newview/llxmlrpclistener.cpp` (`Poller`),
 | `slproto/terrain/*` (TerrainPatch, DCT, texturas de terreno) | **portado** (`terrain.js`); falta `EdgeDataPacket` (bordes de agua) |
 | `slproto/textures/SLTextureEntry(+Face)` | **portado** (`texture-entry.js`) |
 | `slproto/modules/texfetcher`, `texuploader` (descarga de texturas, HTTP) | **parcial**: descarga por capacidad `GetTexture`; falta JPEG2000 real y subida |
-| `slproto/objects/SLObjectInfo`, `SLPrimObjectDisplayInfo` (objetos y jerarquía) | **parcial**: objetos y updates; falta jerarquía de enlaces, `ObjectUpdateCompressed` completo y propiedades |
+| `slproto/objects/SLObjectInfo`, `SLPrimObjectDisplayInfo` (objetos y jerarquía) | **parcial**: objetos y updates (incluido el bloque comprimido completo, forma + TextureEntry al final); falta jerarquía de enlaces y propiedades |
 | `slproto/messages/*` (400+ mensajes) | **genérico**: la plantilla los cubre todos; implementados los que usa el flujo actual |
-| `slproto/avatar/*`, `baker/*` (avatares, esqueleto, morphs, baking) | **no**: los residentes son cápsulas con nombre |
+| `slproto/avatar/*`, `baker/*` (avatares, esqueleto, morphs, baking) | **hecho en lo esencial**: `avatar/params.js` (avatar_lad.xml + drivers), `avatar/skeleton.js` (avatar_skeleton.xml), `avatar/llm.js` (mallas y morphs), `avatar/skin.js` (pose + *skinning*) y `avatar/builder.js`; falta el *baking* propio (se usan las texturas baked que manda el simulador) |
+| `res/avatar/AnimationData`, `AnimationSkeletonData`, `AvatarAnimationList` (animaciones) | **portado**: `avatar/anim-data.js` (formato LLKeyframeMotion + paquete de 118 animaciones que trae la app) y `avatar/animation.js` (secuencias, ease-in/out, bucle, blend por prioridad). Falta el transfer UDP para animaciones que no vengan en el paquete |
 | `slproto/mesh/*`, `render/lumiya/drawable/*` (mallas, sculpt, render de prims) | **no**: sculpt/mesh pendientes (los `sculptId` se leen, no se dibujan) |
 | `slproto/modules/rlv` (Restrained Life) | **no** |
 | `slproto/inventory/*`, `modules/xfer`, `transfer` (inventario, transferencias) | **no** |
@@ -110,11 +169,12 @@ y `connect`), `indra/newview/llxmlrpclistener.cpp` (`Poller`),
 ## 4. Siguientes pasos por orden de impacto
 
 1. Probar el login real y arreglar lo que falle (ver `TODO.md`).
-2. Decodificador JPEG2000 (texturas) y texturas del terreno desde la región.
-3. Mallas (`ObjectUpdateCompressed` + carga de mesh por capacidad `GetMesh`) y sculpt maps.
-4. Avatares con esqueleto y apariencia (baking) — la parte más grande de Lumiya.
-5. Inventario y transferencias (Xfer) para wearables y objetos.
-6. UI de conversaciones (IM por residente, historial), grupos, minimapa.
+2. ~~Decodificador JPEG2000 (texturas)~~ **hecho** (OpenJPEG wasm); texturas del terreno desde la región: hecho el camino, pendiente de ver en el grid.
+3. Sculpt maps y mallas (`GetMesh`): lo que queda de geometría.
+4. ~~Avatares con esqueleto y apariencia~~ **hecho** (formas, morphs, escalas de hueso, texturas baked y animaciones con los 118 assets de Lumiya). Queda el *baking* propio y el transfer de animaciones no incluidas.
+5. **Transferencias de assets por UDP** (`TransferRequest`/`TransferInfo`/`TransferPacket` + acks): es lo que desbloquea animaciones subidas por residentes, y después el inventario/wearables.
+6. Inventario (capacidades `FetchInventory2`/`FetchLib2`) y ventana de ropa.
+7. UI de conversaciones (IM por residente, historial), grupos, minimapa.
 
 ## 5. Arranque del agente y acuses (lo que faltaba en la 2ª prueba real)
 

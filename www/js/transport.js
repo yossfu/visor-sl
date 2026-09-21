@@ -254,3 +254,121 @@ export function netInfo() {
     return { error: String(e && e.message ? e.message : e) };
   }
 }
+
+// ---------------------------------------------------------------------------
+// On-device storage (Android). Every call degrades to a no-op in a browser, so
+// the viewer keeps working on the desktop preview.
+// ---------------------------------------------------------------------------
+
+function hasFn(name) {
+  const bridge = nativeBridge();
+  return !!bridge && typeof bridge[name] === "function";
+}
+
+export function storageInfo() {
+  const bridge = nativeBridge();
+  if (!bridge || typeof bridge.storageInfo !== "function") {
+    return { kind: "storage", platform: "web", needsPermission: false, cacheBytes: 0 };
+  }
+  try {
+    return JSON.parse(bridge.storageInfo());
+  } catch (e) {
+    return { error: String(e && e.message ? e.message : e) };
+  }
+}
+
+/** Texture/asset cache in the app's own storage (no permission needed). */
+export async function cacheGet(key) {
+  if (!hasFn("cacheGet")) return null;
+  try {
+    const res = await nativeCall("cacheGet", { key, timeout: 8000 });
+    if (res && res.ok && res.data) return b64decode(res.data);
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function cachePut(key, bytes) {
+  if (!hasFn("cachePut") || !bytes || !bytes.length) return false;
+  try {
+    await nativeCall("cachePut", { key, data: b64encode(bytes), timeout: 15000 });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+export async function cacheClear() {
+  if (!hasFn("cacheClear")) return null;
+  try {
+    return await nativeCall("cacheClear", { timeout: 8000 });
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Small key/value store for the saved session (fast re-login). */
+export function prefsAll() {
+  const bridge = nativeBridge();
+  if (!bridge) {
+    const out = {};
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("visor.")) out[k] = localStorage.getItem(k);
+      }
+    } catch (_) {}
+    return out;
+  }
+  try {
+    return JSON.parse(bridge.prefsAll ? bridge.prefsAll() : "{}");
+  } catch (e) {
+    return {};
+  }
+}
+
+export function prefsSet(values) {
+  const bridge = nativeBridge();
+  if (!bridge || typeof bridge.prefsSet !== "function") {
+    try {
+      for (const [k, v] of Object.entries(values || {})) {
+        if (v == null) localStorage.removeItem(k);
+        else localStorage.setItem(k, String(v));
+      }
+    } catch (_) {}
+    return true;
+  }
+  try {
+    return JSON.parse(bridge.prefsSet(JSON.stringify({ values }))).ok !== false;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Exports a file to the phone's Downloads folder (logs, screenshots). */
+export async function saveToDownloads(name, bytes, mime = "application/octet-stream") {
+  if (!hasFn("saveToDownloads")) return null;
+  try {
+    return await nativeCall("saveToDownloads", {
+      name, mime, data: b64encode(bytes), timeout: 20000,
+    });
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+/** Foreground service with the persistent "connected" notification. */
+export async function sessionService(action, info = {}) {
+  const fn = action === "start" ? "sessionStart" : action === "update" ? "sessionUpdate" : "sessionStop";
+  if (!hasFn(fn)) return false;
+  try {
+    const bridge = nativeBridge();
+    if (action === "stop") { bridge.sessionStop(); return true; }
+    const res = JSON.parse(bridge[fn](JSON.stringify(Object.assign({ id: "svc" + ++counter }, info))));
+    return res.ok !== false;
+  } catch (e) {
+    return false;
+  }
+}
+

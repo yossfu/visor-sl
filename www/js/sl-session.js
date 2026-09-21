@@ -8,13 +8,15 @@ import {
   parseMessageTemplate, buildIndex, wireNumber, uuidString, toBytes, toText, missingFields,
 } from "./message-template.js";
 import { Circuit, buildMessage, decodeMessage } from "./udp.js";
-import { httpRequest, openUdp, hasUdp, platformInfo, netInfo, udpProbe } from "./transport.js";
+import { httpRequest, openUdp, hasUdp, platformInfo, netInfo, udpProbe, cacheGet, cachePut, sessionService } from "./transport.js";
 import { parseTextureEntry } from "./texture-entry.js";
 import { decodeTerrainLayer } from "./terrain.js";
 import {
-  decodeTerseObjectData, decodeImprovedTerse, primParamsFromShape, decodeExtraParams, parseCompressedObjectData,
+  decodeTerseObjectData, decodeImprovedTerse, primParamsFromShape, primParamsFromPacked,
+  decodeExtraParams, parseCompressedObjectData,
   PCODE_PRIM, PCODE_AVATAR, PCODE_GRASS, PCODE_TREE, PCODE_NEW_TREE, PCODE_PART_SYS,
 } from "./object-update.js";
+import { defaultPrimParams } from "./prims.js";
 
 export const GRIDS = {
   agni: { label: "Second Life (agni)", login: "https://login.agni.lindenlab.com/cgi-bin/login.cgi" },
@@ -93,11 +95,20 @@ export function splitLoginName(raw) {
   return { first, last, full: first + " " + last };
 }
 
+/**
+ * The password hash a viewer sends to the login server: md5 of the first 16
+ * characters of the password, prefixed with "$1$". This is what gets stored on
+ * the device when the user asks for a quick login - never the plain password
+ * (this hash *is* the credential, so it is exactly as sensitive as one).
+ */
+export function passwordHash(password) {
+  return "$1$" + md5Hex(String(password || "").trim().slice(0, 16));
+}
+
 function loginIp(value) {
   if (typeof value === "string") return value;
   if (value instanceof Uint8Array && value.length >= 4) return [...value.slice(0, 4)].join(".");
-  return String(value || "");
-}
+  return String(value || "");}
 
 function asUuid(value) {  if (!value) return null;
   if (value instanceof Uint8Array) return value.length >= 16 ? uuidString(value) : null;
@@ -168,7 +179,7 @@ export class SLSession {
   async login(opts = {}) {
     const grid = GRIDS[opts.grid] || GRIDS.agni;
     const who = splitLoginName(opts.name);
-    if (!who || !opts.password) {
+    if (!who || (!opts.password && !opts.passwordHash)) {
       throw new Error("Escribe tu usuario (o Nombre Apellido) y la contraseña.");
     }
     this.agentName = who.full;
@@ -177,6 +188,7 @@ export class SLSession {
     const loginReply = await this.sendLogin(grid.login, who, opts.password, {
       token: opts.token,
       mfaHash: opts.mfaHash,
+      passHash: opts.passwordHash,
     });
     if (!loginReply || loginReply.login === false || loginReply.login === "false") {
       throw new Error("Login fallido: " + ((loginReply && loginReply.message) || "respuesta rechazada"));
@@ -200,7 +212,7 @@ export class SLSession {
 
   async sendLogin(url, who, password, opts = {}) {
     const info = platformInfo();
-    const passHash = "$1$" + md5Hex(password.trim().slice(0, 16));
+    const passHash = opts.passHash || passwordHash(password);
     const body = LLSD.xmlRpcCall("login_to_simulator", [{
       first: who.first,
       last: who.last,
@@ -337,6 +349,9 @@ export class SLSession {
     this.udp.onClose(() => this.log("Circuito UDP cerrado."));
     if (this.app.world) {
       this.app.world.texlib.uuidLoader = (uuid) => this.requestTexture(uuid);
+      // Baked textures of the residents go through the same GetTexture queue;
+      // the world asks for them, the session owns the queue.
+      this.app.world.onTextureNeeded = (uuid) => this.requestTexture(uuid);
     }
     this.send("UseCircuitCode", {
       CircuitCode: { Code: this.circuitCode, SessionID: this.sessionID, ID: this.agentID },
@@ -552,8 +567,13 @@ export class SLSession {
       try {
         decoded = decodeMessage(def, packet);
       } catch (e) {
-        this.log(`No se pudo leer ${def.name}: ${e.message} · ${packet.payload.length} B, ` +
-          `cabecera: ${hexHead(packet.payload, 16)}`);
+        if (!this.decodeFails) this.decodeFails = new Map();
+        const n = (this.decodeFails.get(def.name) || 0) + 1;
+        this.decodeFails.set(def.name, n);
+        if (n <= 3 || n % 100 === 0) {
+          this.log(`No se pudo leer ${def.name}: ${e.message} · ${packet.payload.length} B, ` +
+            `cabecera: ${hexHead(packet.payload, 16)}${n > 3 ? ` (×${n})` : ""}`);
+        }
         return;
       }
       try {
@@ -665,6 +685,8 @@ export class SLSession {
       case "SimulatorViewerTimeMessage": return this.onTimeSync(data);
       case "UUIDNameReply": return this.onUUIDNameReply(data);
       case "AgentDataUpdate": return this.onAgentDataUpdate(data);
+      case "AvatarAppearance": return this.onAvatarAppearance(data);
+      case "AvatarAnimation": return this.onAvatarAnimation(data);
       case "DisableSimulator": return this.log("El simulador cerró el circuito.");
       default: return;
     }
@@ -685,6 +707,16 @@ export class SLSession {
         highEnd: info.TerrainHeightRange01 ?? t.heights.highEnd,
       };
       this.app.viewer.water.setLevel(t.waterHeight);
+    }
+    // The four terrain textures this region paints its ground with (SL blends
+    // them by height/slope; they are ordinary GetTexture textures).
+    const detail = ["TerrainDetail0", "TerrainDetail1", "TerrainDetail2", "TerrainDetail3"]
+      .map((k) => (info[k] ? uuidString(info[k]) : null));
+    if (detail.some((d) => d && !d.startsWith("00000000"))) {
+      this.terrainDetail = detail;
+      if (this.app.world) this.app.world.setTerrainTextures(detail);
+      for (const d of detail) this.requestTexture(d);
+      this.log(`Texturas del terreno pedidas: ${detail.map((d) => (d ? d.slice(0, 8) : "—")).join(", ")}.`);
     }
     this.log(`RegionHandshake: «${this.regionName}»${this.regionUUID ? " " + this.regionUUID : ""}, agua a ${info.WaterHeight ?? "?"} m.`);
     // Flags (llviewerregion.h): 0x4 = supports self appearance, 0x2 = our object
@@ -722,6 +754,17 @@ export class SLSession {
       this.app.viewer.controls.groundHeight = (x, y) => this.app.world.heightAt(x, y);
     }
     this.log(`AgentMovementComplete: estás en ${(d.Position || []).map((v) => Number(v).toFixed(1)).join(", ")} — el mundo debería empezar a llegar.`);
+    // We are really in-world now: keep the session alive in the background and
+    // schedule the automatic texture/terrain report (on a real region "white
+    // prims" is either "nothing arrived" or "it arrived but did not decode", and
+    // only this report can tell them apart).
+    sessionService("start", { region: this.regionName || "Second Life", agent: this.agentName || "" });
+    if (!this.reportTimer) {
+      this.reportTimer = setTimeout(() => {
+        this.log(this.textureReport());
+        this.log(`Terreno del grid: ${this.terrainPatches || 0} parches · objetos ${this.objects.size} · avatares renderizados ${this.app.world ? this.app.world.avatars.size : 0}`);
+      }, 25000);
+    }
   }
 
   onLayerData(data) {
@@ -770,18 +813,39 @@ export class SLSession {
   onObjectUpdateCompressed(data) {
     for (const block of data.ObjectData || []) {
       const parsed = parseCompressedObjectData(block.Data);
-      if (!parsed) continue;
-      // A compressed update only carries position/rotation/scale/flags: the
-      // shape and the texture entry are known from an earlier full update, so
-      // they must be kept instead of overwritten with cube defaults.
+      if (!parsed) { this.compressedBad = (this.compressedBad || 0) + 1; continue; }
+      this.compressedSeen = (this.compressedSeen || 0) + 1;
       const known = this.objects.get(parsed.fullID);
+      // Every compressed block carries the prim shape and the TextureEntry at
+      // the end (after the flag-conditional fields) — an earlier full update is
+      // *not* needed, and on a fresh region there usually is none.
+      let textureEntry = null;
+      if (parsed.textureEntryBytes && parsed.textureEntryBytes.length > 8) {
+        try {
+          textureEntry = parseTextureEntry(parsed.textureEntryBytes, 32);
+        } catch (e) {
+          textureEntry = null;
+        }
+      }
+      if (!textureEntry && known) textureEntry = known.textureEntry;
       const rec = Object.assign({}, parsed, {
         id: parsed.fullID,
         name: (known && known.name) || this.names.get(parsed.fullID) || "(objeto)",
-        params: (known && known.params) || { profileCurve: 1, pathCurve: 16 },
-        textureEntry: known ? known.textureEntry : null,
+        params: parsed.shape
+          ? primParamsFromPacked(parsed.shape, parsed.extra)
+          : (known && known.params) || defaultPrimParams(),
+        textureEntry,
+        terse: parsed.tailOk ? false : true,
         updateFlags: block.UpdateFlags,
       });
+      if (!parsed.tailOk) {
+        this.compressedTailMisses = (this.compressedTailMisses || 0) + 1;
+        if (!this.firstTailMissLogged) {
+          this.firstTailMissLogged = true;
+          this.log(`Aviso: no pude localizar forma/textura en un ObjectUpdateCompressed ` +
+            `(${block.Data.length} B, flags 0x${parsed.compFlags.toString(16)}) — uso posición y escala igualmente.`);
+        }
+      }
       this.storeObject(rec);
       if (rec.pcode === PCODE_AVATAR) this.requestName(rec.id);
     }
@@ -867,6 +931,9 @@ export class SLSession {
       text: rec.text,
     });
     this.resident.set(id, stored);
+    this.builtPrims = (this.builtPrims || 0) + 1;
+    if (this.textureKeysFor(rec)) this.builtTextured = (this.builtTextured || 0) + 1;
+    else this.builtUntextured = (this.builtUntextured || 0) + 1;
     if (rec.textureEntry) this.requestTextures(rec.textureEntry);
     if (!this.firstPrimLogged) {
       this.firstPrimLogged = true;
@@ -902,6 +969,7 @@ export class SLSession {
   requestTexture(uuid) {
     if (!uuid || uuid.startsWith("00000000") || !this.textureCap()) return;
     if (this.textureCache.has(uuid) || this.pendingTextures.has(uuid)) return;
+    this.requests = (this.requests || 0) + 1;
     this.pendingTextures.add(uuid);
     this.textureQueue.push(uuid);
     this.pumpTextures();
@@ -911,43 +979,129 @@ export class SLSession {
     while (this.textureInFlight < MAX_TEXTURE_INFLIGHT && this.textureQueue.length) {
       const uuid = this.textureQueue.shift();
       this.textureInFlight++;
+      // The uuid leaves `pendingTextures` either way: on success it is in
+      // textureCache (which is what stops a re-request), on failure it must be
+      // free to be asked for again after a reconnect.
       this.fetchTexture(uuid)
-        .catch(() => { this.pendingTextures.delete(uuid); })
-        .then(() => { this.textureInFlight--; this.pumpTextures(); });
+        .catch(() => {})
+        .then(() => {
+          this.pendingTextures.delete(uuid);
+          this.textureInFlight--;
+          this.pumpTextures();
+        });
     }
   }
 
   async fetchTexture(uuid) {
     const base = this.textureCap();
     if (!base) return;
-    // The official viewer builds the URL as <capability>/?texture_id=<uuid>
-    // (lltexturefetch.cpp, "Texture URL: ..."), which is also what Lumiya did.
     const url = String(base).replace(/\/+$/, "") + "/?texture_id=" + uuid;
-    const res = await this.http({ url, timeout: 60000 });
-    const type = header(res.headers, "content-type");
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    if (!res.bytes.length) throw new Error("respuesta vacía");
-    const decoded = await this.decodeImage(res.bytes, type);
+    // Textures are immutable: the same UUID always has the same pixels, so a
+    // copy on the device is always valid. This is what makes re-entering a
+    // region fast and saves the user's mobile data.
+    let bytes = await cacheGet("tex_" + uuid);
+    let type = "";
+    let fromCache = !!bytes;
+    if (!bytes) {
+      const res = await this.http({ url, timeout: 60000 });
+      type = header(res.headers, "content-type");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.bytes.length) throw new Error("respuesta vacía");
+      bytes = res.bytes;
+    }
+    const decoded = await this.decodeImage(bytes, type);
     if (decoded) {
       this.textureCache.set(uuid, decoded);
       if (this.app.world) this.app.world.applyTexture(uuid, decoded);
       this.stats.textures++;
+      if (!fromCache) cachePut("tex_" + uuid, bytes);
     } else {
       this.stats.textureFailures = (this.stats.textureFailures || 0) + 1;
       this.textureProblems = this.textureProblems || [];
       if (this.textureProblems.length < 6) {
-        this.textureProblems.push(`${uuid.slice(0, 8)}: ${res.bytes.length} B, tipo "${type || "?"}"${this.lastDecodeError ? " → " + this.lastDecodeError : ""}`);
+        this.textureProblems.push(`${uuid.slice(0, 8)}: ${bytes.length} B, tipo "${type || "?"}"${this.lastDecodeError ? " → " + this.lastDecodeError : ""}`);
       }
     }
     const first = this.stats.textures + (this.stats.textureFailures || 0);
     if (first === 1 || (first === 6 && !this.stats.textures)) {
-      this.log(`Texturas del grid: primera respuesta de GetTexture — ${res.bytes.length} B, tipo "${type || "sin tipo"}", ${decoded ? "decodificada" : "NO decodificada"}` +
-        `${this.lastDecodeError ? " (" + this.lastDecodeError + ")" : ""} · primeros bytes: ${hexHead(res.bytes, 12)}`);
+      this.log(`Texturas del grid: primera respuesta de GetTexture — ${bytes.length} B, tipo "${type || (fromCache ? "caché" : "sin tipo")}", ${decoded ? "decodificada" : "NO decodificada"}` +
+        `${this.lastDecodeError ? " (" + this.lastDecodeError + ")" : ""} · primeros bytes: ${hexHead(bytes, 12)}`);
     }
     if (this.textureProblems && this.textureProblems.length === 6 && !this.textureProblemsLogged) {
       this.textureProblemsLogged = true;
       this.log("Texturas: 6 fallos. Ejemplos: " + this.textureProblems.join(" | "));
     }
+  }
+
+  /**
+   * One-line texture report. It goes into the log (and the copyable trace) on
+   * purpose: without it a report from a real region cannot tell "no textures
+   * arrived" apart from "textures arrived but would not decode" — the two look
+   * exactly the same on screen (untextured white prims).
+   */
+  /**
+   * AvatarAnimation: the simulator telling every viewer which animations an
+   * avatar is playing (`Sender.ID` = the avatar, each AnimationList entry an
+   * animation *asset* UUID plus a sequence number — higher sequences win when
+   * two animations drive the same joint).
+   *
+   * The message always carries the *complete* list, so it is handed straight to
+   * the world: sequences that are still listed keep running, the ones that
+   * vanished fade out, and the animation itself comes from the 118 built-in
+   * assets the app ships (avatar/animation.js).
+   */
+  onAvatarAnimation(data) {
+    const src = data.Sender && data.Sender.ID ? uuidString(data.Sender.ID) : null;
+    const list = (data.AnimationList || []).map((a) => ({
+      animationID: a.AnimID ? uuidString(a.AnimID) : null,
+      sequenceID: a.AnimSequenceID,
+    })).filter((a) => a.animationID);
+    this.animationMessages = (this.animationMessages || 0) + 1;
+    this.lastAnimationList = list;
+    if (src) {
+      if (!this.avatarAnims) this.avatarAnims = new Map();
+      this.avatarAnims.set(src, list);
+      const world = this.app.world;
+      if (world) world.setAvatarAnimations(src, list);
+    }
+    this.animationsSeen = (this.animationsSeen || 0) + list.length;
+    if (this.animationMessages === 1) {
+      const mine = src === this.agentID ? " (nuestro avatar)" : "";
+      this.log(`AvatarAnimation: ${list.length} animación(es)${mine} — ` +
+        `${list.slice(0, 3).map((a) => a.animationID.slice(0, 8) + " seq " + a.sequenceID).join(", ") || "sin lista"}.`);
+    }
+  }
+
+  textureReport() {
+    const ok = this.stats.textures || 0;
+    const bad = this.stats.textureFailures || 0;
+    const pending = this.pendingTextures ? this.pendingTextures.size : 0;
+    let line = `TEXTURAS: pedidas ${this.requests || this.stats.textures + bad + pending}, decodificadas ${ok}, fallidas ${bad}, en cola ${pending}`;
+    if (bad && this.textureProblems && this.textureProblems.length) {
+      line += ` · ejemplos: ${this.textureProblems.slice(0, 3).join(" | ")}`;
+    }
+    line += ` · terreno: ${this.terrainDetail ? this.terrainDetail.map((d) => (d ? d.slice(0, 8) : "—")).join(",") : "sin datos"}, aplicadas ${this.app.world ? this.app.world.terrainTexturesApplied || 0 : 0}/4`;
+    const world = this.app.world;
+    if (world) {
+      const avs = world.avatars.size;
+      const bodies = [...world.avatars.values()].filter((a) => a.bodyGroup).length;
+      const info = this.appearanceInfo;
+      line += ` · prims: ${this.builtPrims || 0} dibujados de ${this.objects.size} objetos` +
+        ` (${this.builtTextured || 0} con textura real, ${this.builtUntextured || 0} sin textura)`;
+      line += ` · comprimidos: ${this.compressedSeen || 0} leídos` +
+        (this.compressedTailMisses ? ` (⚠ ${this.compressedTailMisses} sin forma/textura)` : " (todos con forma y textura)");
+      line += ` · avatares: ${avs} (con cuerpo ${bodies})` +
+        (info ? `, apariencia ${info.count}/${info.expected} parámetros, ${info.weights} con peso, ${info.baked} baked` : ", sin apariencia recibida") +
+        `, texturas de avatar pedidas ${world.avatarTextureRequests || 0}` +
+        (world.avatarError ? `, error de malla: ${world.avatarError}` : "");
+      const withAnim = [...world.avatars.values()].filter((a) => a.anim && a.anim.sequences.size).length;
+      const running = [...world.avatars.values()].filter((a) => a.anim && a.anim.active).length;
+      const bones = [...world.avatars.values()].reduce((n, a) => n + (a.anim && a.anim.active ? a.anim.pose.count : 0), 0);
+      line += ` · animaciones: ${this.animationMessages || 0} mensajes, ${withAnim} avatares con lista, ${running} reproduciendo, ${bones} huesos movidos` +
+        (world.avatarsAnimated ? `, ${world.avatarsAnimated} re-posados/fotograma` : "") +
+        (this.lastAnimationList && this.lastAnimationList.length ? ` (última: ${this.lastAnimationList.length})` : "");
+    }
+    return line;
   }
 
   // GetTexture is the classic capability; newer regions only advertise
@@ -1143,6 +1297,77 @@ export class SLSession {
 
   // -- avatars -------------------------------------------------------------
 
+  /**
+   * The shape-slider table (avatar_lad.xml, shipped inside the app). Loaded on
+   * demand: it is only needed once an avatar actually shows up.
+   */
+  avatarParamModule() {
+    if (!this._avatarParams) {
+      this._avatarParams = import("./avatar/params.js").catch((e) => {
+        this._avatarParams = null;
+        this.log("No se pudo leer la tabla de parámetros del avatar: " + ((e && e.message) || e));
+        throw e;
+      });
+    }
+    return this._avatarParams;
+  }
+
+  /**
+   * AvatarAppearance: the resident's shape (one byte per visual param, in the
+   * order the sender walked its param table — see avatar/params.js) and the
+   * baked textures it is wearing (TextureEntry faces 8..20).
+   *
+   * This is the message that turns a capsule into *that* person.
+   */
+  onAvatarAppearance(data) {
+    const sender = data.Sender && data.Sender.ID ? uuidString(data.Sender.ID) : null;
+    if (!sender) return;
+    let baked = null;
+    const te = data.ObjectData && data.ObjectData.TextureEntry;
+    if (te && te.length > 8) {
+      try {
+        const entry = parseTextureEntry(te, 24);
+        baked = [];
+        for (let i = 0; i < 24; i++) {
+          const f = entry.getFace(i);
+          const id = f && f.textureID;
+          baked[i] = id && !id.startsWith("00000000") ? id : null;
+        }
+        // The baked faces (8..11, 19, 20) are what the body meshes wear.
+        for (const u of baked) if (u) this.requestTexture(u);
+      } catch (e) {
+        baked = null;
+      }
+    }
+    const values = Uint8Array.from((data.VisualParam || []).map((v) => (v.ParamValue | 0)));
+    const rec = this.objects.get(sender);
+    if (rec) rec.appearance = null;   // filled in below, once the table is read
+    this.avatarParamModule()
+      .then((mod) => mod.loadAvatarParams().then((table) => ({ mod, table })))
+      .then(({ mod, table }) => {
+        const weights = mod.weightsFromVisualParams(values, table);
+        const appearance = { weights, baked, values, count: values.length, expected: table.transmitted.length };
+        if (rec) rec.appearance = appearance;
+        const world = this.app.world;
+        if (world) world.setAvatarAppearance(sender, appearance);
+        if (!this.appearanceLogged) {
+          this.appearanceLogged = true;
+          this.appearanceInfo = {
+            count: values.length, expected: table.transmitted.length,
+            weights: weights.size, baked: baked ? baked.filter(Boolean).length : 0,
+          };
+          this.log(`AvatarAppearance: ${values.length} parámetros de forma (la tabla del visor tiene ` +
+            `${table.transmitted.length}) · ${weights.size} con peso · ` +
+            `${baked ? baked.filter(Boolean).length : 0} texturas baked`);
+          if (values.length !== table.transmitted.length) {
+            this.log("⚠ La apariencia que envía el grid no tiene el mismo número de parámetros que el " +
+              "avatar_lad.xml: la forma puede salir descolocada.");
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
   upsertAvatar(rec) {
     const world = this.app.world;
     if (!world) return;
@@ -1151,6 +1376,7 @@ export class SLSession {
     const av = world.addAvatar(rec.id, rec.name);
     this.avatars.set(rec.id, av);
     world.updateAvatar(av, rec.position, rec.rotation, this.regionName);
+    if (rec.appearance) world.setAvatarAppearance(rec.id, rec.appearance);
   }
 
   // -- text ----------------------------------------------------------------
@@ -1182,19 +1408,22 @@ export class SLSession {
     const viewer = this.app.viewer;
     if (!viewer || !viewer.getCamAxes) return;
     const { center, at, left, up } = viewer.getCamAxes();
+    const bodyRot = this.bodyRot || this.agentRot;
+    const flags = ((this.controls | (this.pulse || 0)) >>> 0);
+    this.pulse = 0;
     this.send("AgentUpdate", {
       AgentData: {
         AgentID: this.agentID,
         SessionID: this.sessionID,
-        BodyRotation: this.agentRot.slice(0, 3),
-        HeadRotation: this.agentRot.slice(0, 3),
+        BodyRotation: bodyRot.slice(0, 3),
+        HeadRotation: bodyRot.slice(0, 3),
         State: 0,
         CameraCenter: center,
         CameraAtAxis: at,
         CameraLeftAxis: left,
         CameraUpAxis: up,
         Far: Math.max(32, this.app.world ? this.app.world.drawDistance : 128),
-        ControlFlags: this.controls,
+        ControlFlags: flags,
         Flags: 0,
       },
     }, { reliable: false });
@@ -1202,6 +1431,11 @@ export class SLSession {
 
   setControls(flags) {
     this.controls = flags >>> 0;
+  }
+
+  /** One-shot control bits (a jump, a sit) that must go out in the next update. */
+  pulseControls(flags) {
+    this.pulse = (this.pulse || 0) | (flags >>> 0);
   }
 
   distanceToAgent(pos) {
@@ -1238,6 +1472,8 @@ export class SLSession {
     this.state = "offline";
     for (const id of this.timers) clearInterval(id);
     this.timers = [];
+    if (this.reportTimer) { clearTimeout(this.reportTimer); this.reportTimer = null; }
+    sessionService("stop");
     try {
       if (this.circuit && this.defs.has("LogoutRequest")) {
         this.send("LogoutRequest", { AgentData: { AgentID: this.agentID, SessionID: this.sessionID } });

@@ -89,12 +89,18 @@ class MainActivity : Activity() {
         settings.cacheMode = WebSettings.LOAD_DEFAULT
         settings.allowFileAccess = true
         settings.allowContentAccess = true
+        // GPU: let the WebView run WebGL2 with the device's real GL driver.
+        settings.loadsImagesAutomatically = true
+        settings.blockNetworkImage = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
+        webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         webView.setBackgroundColor(0xFF0B0E13.toInt())
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
+
+        requestNotificationPermission()
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
@@ -201,6 +207,24 @@ class MainActivity : Activity() {
             )
     }
 
+    /**
+     * Android 13+ needs the user's permission to post the session notification
+     * (the foreground service would otherwise start without showing anything).
+     * Storage permissions are NOT requested: the viewer's cache lives in the
+     * app's own folders, which never need one.
+     */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < 33) return
+        try {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "permiso de notificaciones: $t")
+        }
+    }
+
     override fun onBackPressed() {
         if (bridge.hasModal()) {
             bridge.evalJs("window.visor && window.visor.ui && window.visor.ui.hideModal()")
@@ -211,7 +235,10 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         super.onPause()
-        webView.onPause()
+        // While a session is up the service keeps the WebView (and its UDP
+        // socket) running in the background; pausing it here would freeze the
+        // world the moment the screen locks or the user switches apps.
+        if (!SessionService.active) webView.onPause()
     }
 
     override fun onResume() {

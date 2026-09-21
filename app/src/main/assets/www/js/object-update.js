@@ -198,39 +198,82 @@ function paramsFromExtra(sculpt) {
   return { sculptType: sculpt.type, sculptId: sculpt.texture, sculptTexture: null };
 }
 
-// ExtraParams is a TLV list: [type U8][size U8][payload...].
+export function uuidHex(bytes, off = 0) {
+  let s = "";
+  for (let i = 0; i < 16; i++) {
+    s += (bytes[off + i] || 0).toString(16).padStart(2, "0");
+    if (i === 3 || i === 5 || i === 7 || i === 9) s += "-";
+  }
+  return s;
+}
+
+/**
+ * One extra-parameter entry. The payload formats are the `LLNetworkData`
+ * subclasses' `unpack` (indra/llprimitive/llprimitive.cpp), *not* the
+ * PRIM_* script constants:
+ *
+ *   Flexible (0x10): U8 tension, U8 drag, U8 gravity, U8 wind, [F32 force x/y/z]
+ *   Light    (0x20): LLColor4U color (4×U8), F32 radius, F32 cutoff, F32 falloff
+ *   Sculpt   (0x30): LLUUID texture, U8 type            (also sent as 0x60)
+ */
+export function decodeParameterEntry(type, body) {
+  if (!body || !body.length) return null;
+  const v = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  if (type === EXTRA_FLEXIBLE && body.length >= 4) {
+    return {
+      kind: "flexible",
+      value: {
+        tension: (body[0] & 0x7f) / 10,
+        drag: (body[1] & 0x7f) / 10,
+        gravity: body[2] / 10 - 10,
+        wind: body[3] / 10,
+        simulateLOD: ((body[0] >> 6) & 2) | ((body[1] >> 7) & 1),
+        force: body.length >= 16
+          ? [v.getFloat32(4, true), v.getFloat32(8, true), v.getFloat32(12, true)]
+          : [0, 0, 0],
+      },
+    };
+  }
+  if (type === EXTRA_LIGHT && body.length >= 16) {
+    return {
+      kind: "light",
+      value: {
+        color: [body[0] / 255, body[1] / 255, body[2] / 255],
+        alpha: body[3] / 255,
+        radius: v.getFloat32(4, true),
+        cutoff: v.getFloat32(8, true),
+        falloff: v.getFloat32(12, true),
+      },
+    };
+  }
+  if ((type === EXTRA_SCULPT || type === EXTRA_RENDER_MATERIAL) && body.length >= 17) {
+    return { kind: "sculpt", value: { texture: uuidHex(body, 0), type: body[16] } };
+  }
+  return null;
+}
+
+/**
+ * ExtraParams of *both* ObjectUpdate and ObjectUpdateCompressed: a TLV list
+ *   U8 count, then per entry U16 type, S32 size, payload
+ * (llviewerobject.cpp, `unpackU8(num_params)` / `unpackU16(param_type)` /
+ * `unpackBinaryData(param_block, ..., param_size, "param_data")`).
+ */
 export function decodeExtraParams(bytes) {
+  const out = { sculpt: null, flexible: null, light: null, raw: [], count: 0 };
+  if (!bytes || !bytes.length) return out;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const out = { sculpt: null, flexible: null, light: null, raw: [] };
-  let p = 0;
-  while (p + 2 <= bytes.length) {
-    const type = bytes[p];
-    const size = bytes[p + 1];
-    const body = bytes.subarray(p + 2, p + 2 + size);
-    if (body.length < size) break;
+  const count = bytes[0];
+  out.count = count;
+  let p = 1;
+  for (let i = 0; i < count; i++) {
+    if (p + 6 > bytes.length) break;
+    const type = view.getUint16(p, true); p += 2;
+    const size = view.getInt32(p, true); p += 4;
+    if (size < 0 || p + size > bytes.length) break;
     out.raw.push({ type, size });
-    if (type === EXTRA_SCULPT && size >= 17) {
-      let s = "";
-      for (let i = 0; i < 16; i++) {
-        s += body[i].toString(16).padStart(2, "0");
-        if (i === 3 || i === 5 || i === 7 || i === 9) s += "-";
-      }
-      out.sculpt = { texture: s, type: body[16] };
-    } else if (type === EXTRA_FLEXIBLE && size >= 28) {
-      const f = new DataView(body.buffer, body.byteOffset, body.byteLength);
-      out.flexible = {
-        softness: f.getUint8(0), gravity: f.getFloat32(1, true), drag: f.getFloat32(5, true),
-        wind: f.getFloat32(9, true), forceX: f.getFloat32(13, true), forceY: f.getFloat32(17, true),
-        forceZ: f.getFloat32(21, true), tension: f.getFloat32(25, true),
-      };
-    } else if (type === EXTRA_LIGHT && size >= 16) {
-      const f = new DataView(body.buffer, body.byteOffset, body.byteLength);
-      out.light = {
-        color: [f.getFloat32(0, true), f.getFloat32(4, true), f.getFloat32(8, true)],
-        intensity: f.getFloat32(12, true), radius: f.getFloat32(16, true), falloff: f.getFloat32(20, true),
-      };
-    }
-    p += 2 + size;
+    const entry = decodeParameterEntry(type, bytes.subarray(p, p + size));
+    if (entry) out[entry.kind] = entry.value;
+    p += size;
   }
   return out;
 }
@@ -265,40 +308,177 @@ export function primParamsFromShape(shape, extra) {
   return p;
 }
 
-// ObjectUpdateCompressed carries the same fields but at fixed offsets inside a
-// zlib-less "compressed" blob; the first 16 bytes are the object UUID.
-export const COMPRESSED_UPDATE_HAS_OWNER = 0x01;
-export const COMPRESSED_UPDATE_HAS_TEXTURE_ENTRY = 0x02;
+// The "SpecialCode" of ObjectUpdateCompressed. Note 0x01 is the *scratchpad*,
+// not "has owner": the owner UUID is unconditional
+// (llviewerobject.cpp `LLViewerObject::initObjectDataMap`).
+export const COMPRESSED_SCRATCHPAD = 0x01;
+export const COMPRESSED_TREE = 0x02;
+export const COMPRESSED_TEXT = 0x04;
+export const COMPRESSED_PARTICLES = 0x08;
+export const COMPRESSED_SOUND = 0x10;
+export const COMPRESSED_PARENT = 0x20;
+export const COMPRESSED_OMEGA = 0x80;
+export const COMPRESSED_NAME_VALUES = 0x100;
+export const COMPRESSED_MEDIA = 0x200;
+export const COMPRESSED_PARTICLE_SYSTEM = 0x400;
 
-export function parseCompressedObjectData(bytes) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (bytes.length < 16 + 4 + 1) return null;
+/** NUL-terminated string (the binary datapacker's `unpackString`). */
+function readCString(bytes, p) {
+  let end = p;
+  while (end < bytes.length && bytes[end] !== 0) end++;
   let s = "";
-  for (let i = 0; i < 16; i++) {
-    s += bytes[i].toString(16).padStart(2, "0");
-    if (i === 3 || i === 5 || i === 7 || i === 9) s += "-";
-  }
-  // Layout (see the official viewer's compressed unpacking): FullID (16),
-  // LocalID (4), PCode (1), State (1), CRC (4), Material (1), ClickAction (1),
-  // Scale (12), Position (12), Rotation (12), CompressedFlags (4),
-  // [OwnerID (16) if flag 0x01].
+  for (let i = p; i < end; i++) s += String.fromCharCode(bytes[i]);
+  return { value: s, end: end + 1 };
+}
+
+/**
+ * Walks the flag-conditional middle of the compressed blob and then the two
+ * fixed blocks that close it: the prim shape (path + profile, the same values
+ * ObjectUpdate carries) and, last, the TextureEntry.
+ *
+ * Only the *scratchpad* block is ambiguous between implementations (the
+ * official viewer reads a U32 size then a length-prefixed binary blob, Lumiya
+ * a single U8 size); both are tried and the caller keeps whichever one lands
+ * exactly on the end of the buffer.
+ */
+function walkCompressed(bytes, view, flags, scratchpadMode) {
   const out = {
-    fullID: s, localID: view.getUint32(16, true), pcode: bytes[20] || PCODE_PRIM,
-    scale: [1, 1, 1], position: [0, 0, 0], rotation: [0, 0, 0, 1],
+    omega: [0, 0, 0], parentID: 0, text: "", textColor: null, mediaURL: "",
+    nameValue: "", treeData: null, extra: null, shape: null, textureEntryBytes: null,
   };
-  try {
-    let p = 21;
-    out.state = bytes[p++];
-    p += 4;
-    out.material = bytes[p++];
-    out.clickAction = bytes[p++];
-    out.scale = readF32Vec(view, p); p += 12;
-    out.position = readF32Vec(view, p); p += 12;
-    out.rotation = readQuat(bytes, view, p, 32); p += 12;
-    const compFlags = view.getUint32(p, true); p += 4;
-    if (compFlags & COMPRESSED_UPDATE_HAS_OWNER) p += 16;
-    return out;
-  } catch (e) {
-    return out;
+  let p = 84;
+  if (flags & COMPRESSED_OMEGA) { out.omega = readF32Vec(view, p); p += 12; }
+  if (flags & COMPRESSED_PARENT) { out.parentID = view.getUint32(p, true); p += 4; }
+  if (flags & COMPRESSED_TREE) {
+    out.treeData = bytes[p];
+    p += 1;
+  } else if (flags & COMPRESSED_SCRATCHPAD) {
+    if (scratchpadMode === "lumiya") {
+      const n = bytes[p];
+      p += 1 + n;
+    } else {
+      p += 4;
+      const n = view.getInt32(p, true);
+      p += 4 + n;
+    }
   }
+  if (p > bytes.length) return null;
+  if (flags & COMPRESSED_TEXT) {
+    const s = readCString(bytes, p);
+    out.text = s.value;
+    p = s.end + 4; // LLColor4U, with the alpha byte flipped by the sender
+  }
+  if (p > bytes.length) return null;
+  if (flags & COMPRESSED_MEDIA) {
+    const s = readCString(bytes, p);
+    out.mediaURL = s.value;
+    p = s.end;
+  }
+  if (p > bytes.length) return null;
+  if (flags & COMPRESSED_PARTICLES) p += 0x56; // legacy LLPartSysData
+  if (p >= bytes.length) return null;
+  const count = bytes[p];
+  p += 1;
+  const extra = { sculpt: null, flexible: null, light: null, raw: [], count };
+  for (let i = 0; i < count; i++) {
+    if (p + 6 > bytes.length) return null;
+    const type = view.getUint16(p, true); p += 2;
+    const size = view.getInt32(p, true); p += 4;
+    if (size < 0 || p + size > bytes.length) return null;
+    extra.raw.push({ type, size });
+    const entry = decodeParameterEntry(type, bytes.subarray(p, p + size));
+    if (entry) extra[entry.kind] = entry.value;
+    p += size;
+  }
+  out.extra = extra;
+  if (flags & COMPRESSED_SOUND) p += 16 + 4 + 1 + 4; // UUID, gain, flags, radius
+  if (p > bytes.length) return null;
+  if (flags & COMPRESSED_NAME_VALUES) {
+    const s = readCString(bytes, p);
+    out.nameValue = s.value;
+    p = s.end;
+  }
+  if (p > bytes.length) return null;
+  // PathCurve..PathSkew (16 bytes), then ProfileCurve..ProfileHollow (7).
+  if (p + 23 + 4 > bytes.length) return null;
+  const q = p;
+  out.shape = {
+    pathCurve: bytes[q],
+    pathBegin: view.getUint16(q + 1, true),
+    pathEnd: view.getUint16(q + 3, true),
+    pathScaleX: bytes[q + 5],
+    pathScaleY: bytes[q + 6],
+    pathShearX: bytes[q + 7],
+    pathShearY: bytes[q + 8],
+    pathTwist: bytes[q + 9],
+    pathTwistBegin: bytes[q + 10],
+    pathRadiusOffset: bytes[q + 11],
+    pathTaperX: bytes[q + 12],
+    pathTaperY: bytes[q + 13],
+    pathRevolutions: bytes[q + 14],
+    pathSkew: bytes[q + 15],
+    profileCurve: bytes[q + 16],
+    profileBegin: view.getUint16(q + 17, true),
+    profileEnd: view.getUint16(q + 19, true),
+    profileHollow: view.getUint16(q + 21, true),
+  };
+  p = q + 23;
+  const teSize = view.getInt32(p, true);
+  p += 4;
+  if (teSize < 0 || p + teSize !== bytes.length) return null;
+  out.textureEntryBytes = bytes.subarray(p, p + teSize);
+  out.tailBytes = teSize;
+  return out;
+}
+
+/**
+ * The Data block of ObjectUpdateCompressed. Fixed header (see
+ * `LLViewerObject::initObjectDataMap`), then a flag-conditional middle, then the
+ * prim shape and the TextureEntry *at the end* — which is why a viewer that
+ * stops after the owner UUID sees every compressed prim as an untextured cube.
+ * Returns null if the header itself is short; `tailOk: false` if the shape /
+ * texture tail could not be located (position and rotation are still usable).
+ */
+export function parseCompressedObjectData(bytes) {
+  if (!bytes || bytes.length < 85) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const out = {
+    fullID: uuidHex(bytes, 0),
+    localID: view.getUint32(16, true),
+    pcode: bytes[20] || PCODE_PRIM,
+    state: bytes[21],
+    crc: view.getUint32(22, true),
+    material: bytes[26],
+    clickAction: bytes[27],
+    scale: readF32Vec(view, 28),
+    position: readF32Vec(view, 40),
+    rotation: quatFrom3(
+      view.getFloat32(52, true), view.getFloat32(56, true), view.getFloat32(60, true)),
+    compFlags: view.getUint32(64, true),
+    ownerID: uuidHex(bytes, 68),
+    omega: [0, 0, 0], parentID: 0, text: "", mediaURL: "", nameValue: "",
+    shape: null, textureEntryBytes: null, extra: null, tailOk: false,
+  };
+  const flags = out.compFlags;
+  for (const mode of ["lumiya", "ll"]) {
+    const tail = walkCompressed(bytes, view, flags, mode);
+    if (tail) {
+      Object.assign(out, tail);
+      out.tailOk = true;
+      out.scratchpadMode = mode;
+      break;
+    }
+    if (!(flags & COMPRESSED_SCRATCHPAD)) break; // both modes are identical
+  }
+  return out;
+}
+
+/** Same shape as `primParamsFromShape`, fed from a compressed blob's tail. */
+export function primParamsFromPacked(shape, extra) {
+  const p = defaultPrimParams(Object.assign({}, shape));
+  const fromExtra = extra ? paramsFromExtra(extra.sculpt) : null;
+  if (fromExtra) Object.assign(p, fromExtra);
+  if (extra && extra.flexible) p.flexible = extra.flexible;
+  if (extra && extra.light) p.light = extra.light;
+  return p;
 }

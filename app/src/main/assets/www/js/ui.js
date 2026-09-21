@@ -1,4 +1,12 @@
 // HUD / panels. Plain DOM, no framework.
+import { md5Hex } from "./md5.js";
+import { prefsAll, prefsSet, storageInfo, saveToDownloads, cacheClear, platformInfo } from "./transport.js";
+
+// Same value sl-session.js sends as `passwd` (kept local so the login screen
+// does not pull the whole session module into the initial bundle).
+function passwordHash(password) {
+  return "$1$" + md5Hex(String(password || "").trim().slice(0, 16));
+}
 
 export function el(tag, props = {}, children = []) {
   const n = document.createElement(tag);
@@ -25,11 +33,16 @@ const TEXTURES = [
 ];
 
 export class UI {
-  constructor(app) {
-    this.app = app;
+  constructor(app) {    this.app = app;
     this.root = document.getElementById("hud");
     this.build();
-    this.log("Visor SL listo. Modo demo cargado.");
+    this.log("Visor SL listo. Inicia sesión con tu cuenta de Second Life.");
+    const gpu = app.viewer && app.viewer.gpu;
+    if (gpu) {
+      this.gpu = gpu;
+      this.log(`GPU: ${gpu.renderer || gpu.vendor || "desconocida"} · ${gpu.webgl} · texturas hasta ${gpu.maxTexture}px · ${gpu.extensions} extensiones` +
+        (gpu.software ? " ⚠ renderizado por software (sin GPU): bajará la fluidez." : ""));
+    }
   }
 
   build() {
@@ -77,6 +90,14 @@ export class UI {
       this.logEl,
       el("div", { class: "row" }, [
         chatInput,
+        el("button", {
+          class: "btn", title: "Mostrar u ocultar el registro",
+          onclick: (e) => {
+            this.logEl.classList.toggle("open");
+            e.currentTarget.classList.toggle("active");
+          },
+          text: "▤",
+        }),
         el("button", { class: "btn", title: "Copiar el registro al portapapeles", onclick: () => this.copyLog(), text: "⧉" }),
       ]),
     ]);
@@ -90,9 +111,9 @@ export class UI {
   buildMenu() {
     const b = (label, fn) => el("button", { class: "btn wide", onclick: fn, text: label });
     return el("div", { class: "section" }, [
-      el("h3", { text: "Mundo" }),
-      b("Cargar demo (isla)", () => this.app.loadDemo()),
-      b("Regenerar isla (semilla nueva)", () => this.app.loadDemo(Math.floor(Math.random() * 1e6))),
+      el("h3", { text: "Sesión" }),
+      b("Conectar a Second Life", () => this.showLogin()),
+      b("Desconectar", () => this.app.disconnect()),
       el("h3", { text: "Crear prim" }),
       el("div", { class: "row wrap" }, [
         b("Cubo", () => this.app.spawn({ profileCurve: 1, pathCurve: 16 })),
@@ -106,14 +127,25 @@ export class UI {
       ]),
       el("h3", { text: "Sol" }),
       this.slider("Ángulo", 0, 100, 42, (v) => this.app.viewer.setSun(v / 100 * 1.5, this.app.viewer.sunAzimuth)),
-      el("h3", { text: "Región" }),
-      el("div", { class: "row" }, [
-        b("Conectar a Second Life", () => this.showLogin()),
-        b("Desconectar", () => this.app.disconnect()),
-      ]),
+      el("h3", { text: "Diagnóstico" }),
       b("Diagnóstico de red y UDP", () => this.app.diagnoseUdp().catch((e) => this.error(e.message))),
+      el("h3", { text: "Datos en el dispositivo" }),
+      b("Guardar registro en Descargas", () => this.saveLog()),
+      b("Borrar caché de texturas", async () => {
+        const res = await cacheClear();
+        this.log(res ? `Caché de texturas borrada (${res.deleted || 0} archivos).` : "No hay caché que borrar (hace falta la app Android).");
+      }),
+      b("Dónde se guardan los datos", () => {
+        const s = storageInfo();
+        this.log(`Almacenamiento: ${s.platform === "web" ? "navegador" : s.cacheDir || "?"} · caché ${((s.cacheBytes || 0) / 1048576).toFixed(1)} MB en ${s.cacheFiles || 0} archivos · libre ${(((s.freeBytes || 0)) / 1073741824).toFixed(1)} GB` +
+          (s.needsPermission === false ? " · no hace falta permiso de almacenamiento (carpeta propia de la app)" : ""));
+      }),
       el("h3", { text: "Texturas" }),
-      el("div", { class: "hint", text: "El grid entrega texturas JPEG2000; si el decodificador no está disponible se muestra un color plano por textura." }),
+      b("Informe de texturas/terreno", () => {
+        if (this.app.session && this.app.session.textureReport) this.log(this.app.session.textureReport());
+        else this.log("Sin sesión activa.");
+      }),
+      el("div", { class: "hint", text: "El grid entrega texturas JPEG2000; se decodifican con OpenJPEG y se guardan en el dispositivo para no volver a descargarlas." }),
       el("div", { class: "hint", text: "Conecta con tu cuenta de Second Life para entrar al mundo real (necesita el APK con el puente nativo para UDP)." }),
     ]);
   }
@@ -242,9 +274,7 @@ export class UI {
   }
 
   copyLog() {
-    const lines = [...(this.logEl ? this.logEl.children : [])].map((c) => c.textContent.trim()).filter(Boolean);
-    let text = lines.join("\n");
-    if (this.lastError && !text.includes(this.lastError)) text += "\nÚLTIMO ERROR: " + this.lastError;
+    const text = this.logText();
     const done = (ok) => this.log(ok ? "Registro copiado. Pégalo en el chat si algo falla." : "No se pudo copiar el registro.");
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
@@ -260,6 +290,35 @@ export class UI {
     done(ok);
   }
 
+  logText() {
+    const lines = [...(this.logEl ? this.logEl.children : [])].map((c) => c.textContent.trim()).filter(Boolean);
+    const head = [];
+    const gpu = this.gpu;
+    let app = "";
+    try { app = (platformInfo() || {}).appVersion || ""; } catch (_) {}
+    head.push(`appVersion ${app || "web"} · ${new Date().toISOString()}`);
+    if (gpu) {
+      head.push(`GPU: ${gpu.renderer || gpu.vendor || "?"} · ${gpu.webgl} · maxTexture ${gpu.maxTexture} · ${gpu.extensions} extensiones${gpu.software ? " · SOFTWARE (sin GPU)" : ""}`);
+    }
+    if (navigator.userAgent) head.push(`UA: ${navigator.userAgent}`);
+    let text = head.join("\n") + "\n" + lines.join("\n");
+    if (this.lastError && !text.includes(this.lastError)) text += "\nÚLTIMO ERROR: " + this.lastError;
+    return text;
+  }
+
+  /** Writes the log to the phone's Downloads folder (no permission needed on Android 10+). */
+  async saveLog() {
+    const info = storageInfo();
+    const name = `visor-sl-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`;
+    const res = await saveToDownloads(name, new TextEncoder().encode(this.logText()), "text/plain");
+    if (!res) {
+      this.log("Guardar en Descargas necesita la app Android. Registro copiable con ⧉.");
+      return;
+    }
+    if (res.ok) this.log(`Registro guardado en Descargas como ${name}${info.cacheBytes ? ` (caché de texturas: ${(info.cacheBytes / 1048576).toFixed(1)} MB)` : ""}.`);
+    else this.error("No se pudo guardar el registro: " + (res.error || "?"));
+  }
+
   updateStats(s) {
     this.fpsEl.textContent = `${s.fps.toFixed(0)} fps`;
     this.trisEl.textContent = `${(s.tris / 1000).toFixed(1)}k tris`;
@@ -270,43 +329,69 @@ export class UI {
     const m = this.modalHost;
     m.innerHTML = "";
     m.classList.remove("hidden");
+    const saved = prefsAll();
     const grid = el("select", {}, [
       el("option", { value: "agni", text: "Second Life (agni)" }),
       el("option", { value: "aditi", text: "Beta grid (aditi)" }),
     ]);
-    const user = el("input", { class: "num wide", placeholder: "Usuario o Nombre Apellido" });
+    if (saved["visor.last.grid"] === "aditi") grid.value = "aditi";
+    const user = el("input", { class: "num wide", placeholder: "Usuario o Nombre Apellido", value: saved["visor.last.name"] || "" });
     const pass = el("input", { class: "num wide", type: "password", placeholder: "Contraseña" });
     const token = el("input", { class: "num wide", placeholder: "Código MFA de 6 dígitos (si lo pide)", autocomplete: "one-time-code" });
+    const remember = el("input", { type: "checkbox", id: "rememberChk" });
+    const rememberLabel = el("label", { class: "check" }, [
+      remember,
+      el("span", { text: " Guardar el acceso en este dispositivo (entrar sin escribir la contraseña)" }),
+    ]);
     const status = el("div", { class: "hint", text: "" });
     const deviceHint = el("div", { class: "hint", text: "" });
     const close = () => { m.classList.add("hidden"); m.innerHTML = ""; };
-    const mfaKey = (name) => "visor.mfa." + grid.value + "." + String(name || "").trim().toLowerCase();
+    const key = (name) => grid.value + "." + String(name || "").trim().toLowerCase();
+    const hashKey = (name) => "visor.hash." + key(name);
+    const mfaKey = (name) => "visor.mfa." + key(name);
     let mfaHash = "";
+    let savedHash = "";
     const reloadDevice = () => {
-      try { mfaHash = localStorage.getItem(mfaKey(user.value)) || ""; } catch (_) { mfaHash = ""; }
+      const s = prefsAll();
+      mfaHash = s[mfaKey(user.value)] || "";
+      savedHash = s[hashKey(user.value)] || "";
+      remember.checked = !!savedHash;
       deviceHint.textContent = mfaHash
         ? "Este móvil ya está verificado (MFA recordado): no necesitas código."
-        : "Si tu cuenta tiene verificación en dos pasos, escribe aquí el código de 6 dígitos.";
+        : (savedHash
+          ? "Acceso guardado: pulsa Entrar (no hace falta escribir la contraseña)."
+          : "Si tu cuenta tiene verificación en dos pasos, escribe aquí el código de 6 dígitos.");
+      pass.placeholder = savedHash ? "Contraseña (ya guardada — déjala vacía)" : "Contraseña";
     };
     user.addEventListener("input", reloadDevice);
+    grid.addEventListener("change", reloadDevice);
     reloadDevice();
-    const go = async () => {
+    const go = async (useSaved) => {
       status.textContent = "Conectando…";
       const code = token.value.replace(/\s+/g, "");
+      const pw = pass.value;
+      if (useSaved && !savedHash) { status.textContent = "No hay acceso guardado para ese usuario."; return; }
+      if (!useSaved && !pw) { status.textContent = "Escribe la contraseña."; return; }
       try {
         const reply = await this.app.connect({
           grid: grid.value,
           name: user.value,
-          password: pass.value,
+          password: pw,
+          passwordHash: useSaved ? savedHash : (pw ? passwordHash(pw) : ""),
           token: code,
           mfaHash,
           status: (t) => status.textContent = t,
         });
         const returned = (reply && reply.mfa_hash) || "";
-        if (returned) {
-          mfaHash = returned;
-          try { localStorage.setItem(mfaKey(user.value), mfaHash); } catch (_) {}
-        }
+        if (returned) mfaHash = returned;
+        const updates = {
+          "visor.last.grid": grid.value,
+          "visor.last.name": user.value.trim(),
+          [mfaKey(user.value)]: mfaHash || null,
+          [hashKey(user.value)]: (remember.checked || useSaved) ? (useSaved ? savedHash : passwordHash(pw)) : null,
+        };
+        prefsSet(updates);
+        if (updates[hashKey(user.value)]) savedHash = updates[hashKey(user.value)];
         close();
         return;
       } catch (e) {
@@ -332,9 +417,10 @@ export class UI {
     m.appendChild(el("div", { class: "modal" }, [
       el("h2", { text: "Conectar a Second Life" }),
       el("div", { class: "hint", text: "Tu contraseña sólo se envía al servidor de login de Linden Lab (como hash $1$ + md5, igual que cualquier visor)." }),
-      grid, user, pass, token, deviceHint, status,
+      grid, user, pass, token, deviceHint, rememberLabel, status,
       el("div", { class: "row" }, [
-        el("button", { class: "btn accent", onclick: go, text: "Entrar" }),
+        el("button", { class: "btn accent", onclick: () => go(false), text: "Entrar" }),
+        el("button", { class: "btn", onclick: () => go(true), text: "Entrar (acceso guardado)" }),
         el("button", { class: "btn", onclick: close, text: "Cancelar" }),
       ]),
       el("div", { class: "hint", text: "Sirve tanto el usuario de una sola palabra (cuentas nuevas) como «Nombre Apellido». Si el login falla, el motivo exacto que devuelve el servidor queda en el registro de abajo." }),
@@ -342,4 +428,9 @@ export class UI {
   }
 
   hideModal() { this.modalHost.classList.add("hidden"); this.modalHost.innerHTML = ""; }
+
+  /** Shows/hides the on-screen touch pad (only meaningful in the grid). */
+  setTouchVisible(on) {
+    if (this.app.touch) this.app.touch.setVisible(on);
+  }
 }

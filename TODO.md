@@ -3,6 +3,62 @@
 Ordenado por impacto. Lo primero es lo que hay que hacer en cuanto se pruebe con
 una cuenta real en el grid.
 
+## Ronda 6 — lo hecho en esta revisión (informe 4)
+
+El informe 4 (cuenta ExeQiel, en el grid) traía: `LayerData`, `ObjectUpdate`,
+`ObjectUpdateCompressed`, `ImprovedTerseObjectUpdate`, `AvatarAppearance`,
+`KillObject`, `SoundTrigger`, `AttachedSound`, `SimStats`… y el usuario seguía
+viendo **estructuras cuadriculadas blancas**. Diagnosticado y arreglado:
+
+- [x] **Causa raíz del mundo blanco**: el bloque `ObjectUpdateCompressed` se leía
+      sólo hasta el UUID del dueño. La **forma del prim (23 B) y el TextureEntry
+      (S32 tamaño + datos) van al final**, después de los parámetros extra, y
+      además el UUID del dueño es incondicional (no depende de la bandera 0x01).
+      Sin leerlos, cada prim comprimido salía como un cubo por defecto sin
+      textura. Verificado en el simulador falso: 40 prims comprimidos, 0 fallos
+      de cola, 40/40 con su forma y su textura.
+- [x] **Formato de los parámetros extra corregido**: cabecera `U8 num_params` con
+      entradas `[U16 tipo][S32 tamaño][datos]` (antes se leía mal), más flexible
+      (0x10), luz (0x20) y sculpt (0x30/0x60) con sus tamaños reales.
+- [x] **Avatares reales con forma**: los sliders del `AvatarAppearance` se
+      resuelven con los *drivers* y se aplican a la vez como morphs y como
+      escalas de hueso (`<bone scale/offset>` de avatar_lad.xml, unión de todas
+      las declaraciones del mismo slider). Altura, cadera, hombros y grosor
+      cambian el esqueleto de verdad: verificado 1,93 m neutro → 2,16 m al máximo
+      de Altura, con los pies en el suelo en todos los casos.
+- [x] **Animaciones reales**: los 118 assets de Lumiya (`anims/`, formato
+      LLKeyframeMotion) empaquetados en `data/avatar/anims.gz` y reproducidos con
+      el blend por prioridad del visor oficial. Verificado: STAND baja los brazos
+      (1,88 m), WALK/ RUN/ FLY dan posturas distintas y cambian con el tiempo.
+- [x] **`KillObject` (el error «Offset is outside the bounds of the DataView»)**
+      arreglado de verdad: el recuento de un bloque `Variable` puede venir a
+      `0xff`, y cuando el datagrama lleva *acks adjuntos* el simulador recorta la
+      cola del bloque; el lector pedía 255 identificadores de 4 B y se salía del
+      buffer. Ahora se recorta al número de repeticiones que caben enteras (así
+      se siguen matando los objetos que sí llegaron) y el aviso se agrupa en vez
+      de repetirse. Comprobado con los bytes reales del informe: `10 ff e2 0c …`
+      → recuento 255, IDs 3298, 3299, 3300, 3301.
+- [x] **GPU**: al arrancar se registra la GPU real (`ANGLE (…)`, WebGL2, tamaño
+      máximo de textura) y se avisa si el WebView usa renderizado por software.
+- [x] **Controles táctiles más Genshin**: doble toque = saltar, empujar el stick
+      a tope = correr (con aviso visual en el propio stick).
+- [x] 70/70 pruebas del protocolo (incluye las de animación y las de KillObject
+      truncado).
+
+Pendiente de comprobar en el grid real (5ª prueba):
+
+- [ ] **5ª prueba real** con el APK 1.2.0: el mundo debe salir **con texturas y
+      formas distintas** (no la rejilla blanca), con avatares reales que se
+      mueven, y en el registro deben verse las líneas nuevas de `TEXTURAS:`
+      (prims/texturas/comprimidos), `animaciones:` (mensajes, avatares
+      reproduciendo, huesos movidos) y `GPU:`.
+- [ ] Comprobar en la línea de `GPU:` que **no** dice «SOFTWARE (sin GPU)».
+- [ ] Ver si el registro trae animaciones que **no** estén en el paquete (un
+      residente con animación propia): eso pide el transfer de assets.
+- [ ] Que la ropa puesta se vea en las texturas baked (caras 8–11 del avatar).
+- [ ] Probar el teclado/registro en segundo plano: cerrar la app con sesión
+      abierta y ver que la notificación sigue y que al volver la sesión vive.
+
 ## 0. Conexión real (comprobaciones)
 
 **Estado tras la 3ª prueba real (cuenta ExeQiel, Diamond Cove 54.190.153.220, Xiaomi API 36):**
