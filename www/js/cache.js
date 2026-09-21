@@ -25,8 +25,13 @@ import { cacheGet, cachePut, cacheDelete, cacheClear, cacheVerify, prefsAll, pre
 /**
  * Bump this whenever a change alters what a stored copy MEANS (a decoder fix, a
  * new encoding, a different size cap). Old entries are wiped on the next start.
+ *
+ * r3: the JPEG2000 read was fixed (a 4-component codestream was being read as
+ * interleaved RGBA, giving colour-cycled stripes with a black bar). Every entry
+ * r2 wrote is one of those broken bitmaps stored as a PNG, so the whole store
+ * has to go — otherwise the fix would be invisible on the phone.
  */
-export const CACHE_REV = "r2";
+export const CACHE_REV = "r3";
 
 const MODE_KEY = "visor.cache";
 const REV_KEY = "visor.cacheRev";
@@ -78,6 +83,24 @@ export function looksLikeImage(bytes) {
   // RIFF....WEBP
   if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
       bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return true;
+  return false;
+}
+
+/**
+ * True when `bytes` starts like an `LLMESH` asset: binary LLSD, so either the
+ * map tag `{` or the deprecated `<? llsd/binary ?>` text tag the viewer strips.
+ * An HTTP error page ("<html>…", JSON, a plain-text refusal) is neither, which
+ * is the point: a stored copy of one of those would fail to decode forever.
+ */
+export function looksLikeMesh(bytes) {
+  if (!bytes || bytes.length < 16) return false;
+  if (bytes[0] === 0x7b) return true; // '{'
+  if (bytes[0] === 0x3c) {            // '<' -> the deprecated text tag
+    for (let i = 0; i < 24 && i < bytes.length; i++) {
+      if (bytes[i] === 0x3e) return i >= 8;  // reached the end of a short tag
+    }
+    return false;
+  }
   return false;
 }
 

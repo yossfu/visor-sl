@@ -3,6 +3,90 @@
 Ordenado por impacto. Lo primero es lo que hay que hacer en cuanto se pruebe con
 una cuenta real en el grid.
 
+## Ronda 11 — lo hecho en esta revisión (informe 8)
+
+El informe 7 seguía diciendo «todo se ve roto sin sentido, sin estructuras ni
+texturas lógicas», y añadía dos cosas concretas: **los TP no funcionan** y **el
+buscador de regiones no encuentra sitios**. Se atacaron por separado, mirando
+cómo lo hacen el visor oficial y Lumiya (fuentes en `scratch/`):
+
+- [x] **JPEG2000 de 4 componentes: la causa de las «texturas sin sentido».**
+      Las capturas del móvil mostraban, en el panel de texturas, cada 64×64 como
+      **rayas verticales de colores ciclados con una barra negra a la derecha**.
+      El decodificador wasm reserva `ancho×alto×componentes` bytes pero **sólo
+      escribe tripletas RGB** en `x*3`: con 4 componentes los píxeles quedan a 3
+      bytes de paso dentro de filas de 4 (fase girando → rayas) y el último 25 %
+      de cada fila sin escribir (→ barra negra). `j2c.js` (y `j2c-worker.js`)
+      ahora leen la geometría real del búfer, los codestreams de 16 bits o
+      multicomponente se rechazan en vez de dibujarse, y la revisión de caché
+      (**r3**) tira todo lo guardado por la versión mala.
+- [x] **Búsqueda de regiones por UDP, no raspando la web.** `MapNameRequest`
+      (405/408) → `MapBlockReply` (409) para nombre → rejilla, y
+      `MapBlockRequest` (407) para llenar el mapa con los nombres de las regiones
+      vecinas. El camino web anterior queda sólo como reserva.
+- [x] **Teleport: `CrossedRegion` se ignoraba.** Cruzar el borde de región es un
+      `CrossedRegion` por UDP (no un `TeleportFinish` por la cola de eventos), y
+      sin atenderlo el visor se quedaba atrás. Ahora se completa igual que un
+      `TeleportFinish`. `send()` es fiable por defecto, como en Lumiya.
+- [x] **LLSD binario corregido** (big-endian, mapa con recuento, clave `k` +
+      longitud sin etiqueta `s`): sin esto una cabecera de malla se lee como
+      basura.
+- [x] **Mallas `LLMESH` (`mesh.js`).** Cabecera LLSD binaria + bloques zlib +
+      submeshes con dominios cuantizados + LOD, port de
+      `LLVolume::unpackVolumeFacesInternal`. El activo se pide a **`GetMesh`**
+      (`/?mesh_id=`), en su propia cola y con caché en el dispositivo; los prims
+      de malla reutilizan la tubería de prims (geometría compartida por
+      activo+LOD, materiales por cara, batching). Sin activo → no se dibuja.
+- [x] **`mesh-encode.js`**: escribe activos `LLMESH` reales, así que el
+      decodificador se prueba **contra un codificador** (autotest 97/97, arnés
+      `?test=grid` con casa y caja por `GetMesh`, demo offline con dos edificios).
+      El arnés sirve además **la mitad de las texturas como codestream RGBA de 4
+      componentes**, que es exactamente el caso que producía las rayas: comprobado
+      a nivel de píxel (error 0 en las esquinas y en el último píxel de la
+      última fila, que era el que quedaba sin escribir).
+- [x] **Bug del *batcher* al reutilizar el mundo** (`dispose()` sacaba su grupo de
+      la escena y no lo volvía a poner): tras `world.dispose()` el demo mostraba
+      isla y **ni un objeto**. Ahora se reengancha.
+- [x] **Dos caras de la caja del codificador salían del revés** (`boxMesh`, caras
+      ±Y): el descarte de caras posteriores se las comía, así que una caja se veía
+      como una sola pared. Lo delató el arnés de esculturas, que enseñó una «casa»
+      sin tres de sus cuatro paredes.
+- [x] **Tejado a dos aguas** (`prismRoofMesh`) en vez de la pirámide cuadrada, que
+      era más ancha que el edificio y dejaba rendija; el alero va metido 6 cm
+      dentro de la caja.
+- [x] **Mallas en metros, esculturas normalizadas**: escrito en el código y en el
+      arnés (un vértice de malla se guarda en metros y la `scale` del prim lo
+      multiplica, como en SL). Escalar una malla como una escultura dio un
+      edificio de 25 m en el arnés.
+- [x] Versión **1.6.0 (build 7)**.
+
+Comprobado en el simulador falso (`?test=grid`) antes de subir: el teletransporte
+**por la interfaz** (panel *Lands* → buscar «Sandbox Cordova» → *Teletransportar*)
+llega hasta `TeleportFinish` y la región nueva con sus 44 prims; la búsqueda por
+nombre resuelve por UDP; el mundo se ve con terreno, objetos sólidos y un edificio
+con tejado; y el arnés de esculturas dibuja las cinco formas y la casa de malla,
+sin dibujar los dos casos que no deben dibujarse.
+
+Pendiente de comprobar en el móvil (informe 9), por orden:
+
+- [ ] Que el registro empiece por `app 1.6.0 (build 7)` y que la caché diga
+      `revisión r3 … borrados N archivos` (si no aparece, la caché no se vació).
+- [ ] La línea `TEXTURAS:` debe mostrar `formas del codestream: 8b×1c:… 8b×3c:…`
+      y —si aparece— `8b×4c:` con `decodificadas` subiendo: **si salen rayas
+      otra vez en el panel de texturas, es esta línea la que lo explica**.
+- [ ] La parte nueva **`mallas: N dibujadas de M`**: si `M` es alto y `dibujadas`
+      es bajo, mirar `N activos` y `N descargados` (¿no llega `GetMesh`?) y
+      `errores de malla`.
+- [ ] **Buscador de tierras**: buscar una región real por nombre y que la lista
+      dé resultados **sin** depender de la web (es UDP ahora).
+- [ ] **Teletransporte**: el registro debe decir `TP: … RegionHandle 0x…` y
+      después `TeleportStart` → `TeleportFinish` (o `CrossedRegion` al cruzar un
+      borde) y la región nueva.
+- [ ] Una captura del mundo (no del panel de texturas) con lo que se ve.
+- [ ] Lo que queda por hacer con mallas: liberar la geometría de un activo cuando
+      no queda ningún prim visible que lo use (hoy se acotan los LOD por activo,
+      pero no se sueltan), y **prims flexibles**.
+
 ## Ronda 10 — lo hecho en esta revisión (informe 7)
 
 El informe 7 (móvil, 900 prims) traía la pista decisiva: `LayerData` **sí**
@@ -26,7 +110,8 @@ tierras que pidió el usuario para probar el teletransporte:
       que esperaban. Mapa sin relieve o sin llegar → no se dibuja. Arnés aislado
       `?test=sculpt` + 6 pruebas nuevas.
 - [x] **Los objetos *mesh* ya no se dibujan como cajas** (se cuentan y salen en
-      el informe). Es la otra mitad de las «geometrías extrañas».
+      el informe). Es la otra mitad de las «geometrías extrañas». **Ronda 11: se
+      decodifican y se dibujan de verdad.**
 - [x] **Texturas**: decodificador en un *pool* de hasta 3 hilos y la caché del
       móvil guarda el **PNG ya decodificado** (se acabó re-decodificar todo en
       cada entrada). El diagnóstico dice cuántos hilos.
@@ -41,7 +126,7 @@ tierras que pidió el usuario para probar el teletransporte:
       importado para que el buscador y el mapa funcionen también sin el APK.
 - [x] Versión **1.5.0 (build 6)**.
 
-Pendiente de comprobar en el móvil (informe 8), por orden:
+Pendiente de comprobar en el móvil (informe 8 — sustituido por la lista de la ronda 11):
 
 - [ ] Que el registro empiece por `app 1.5.0 (build 6)`.
 - [ ] La fila **terreno**: ya no debe decir «PLACEHOLDER PLANO», y la línea de

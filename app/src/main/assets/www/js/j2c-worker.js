@@ -48,37 +48,50 @@ function loadModule(glueUrl, wasmUrl, glueText, wasmBinary) {
 }
 
 /**
- * The decoded buffer's real geometry (see the twin of this function in j2c.js:
- * the reported component count and the buffer length have to agree, and a
- * reduced frame has to be detected rather than read as if it were full size).
+ * The real layout of the decoder's output buffer — the twin of `decodeLayout`
+ * in j2c.js, and the reason the phone's decoded textures were stripes with a
+ * black bar: a 4-component codestream is written as RGB triples at a 3-byte
+ * stride inside 4-byte-per-pixel rows, so reading it as RGBA walks out of phase
+ * and runs into the unwritten zero tail.
  */
-function frameGeometry(decodedLength, width, height, reported) {
+function decodeLayout(info, decodedLength) {
+  const rawW = Math.max(0, info.width | 0);
+  const rawH = Math.max(0, info.height | 0);
+  const components = Math.max(1, info.componentCount | 0);
+  const bits = (info.bitsPerSample | 0) || 8;
+  const bytes = bits > 8 ? 2 : 1;
+  const written = components === 1 ? 1 : 3;
+  const empty = written > 1 && bytes > 1;
   for (const k of [1, 2, 4, 8, 16]) {
-    const w = width / k, h = height / k;
-    if (!Number.isInteger(w) || !Number.isInteger(h) || w < 1 || h < 1) continue;
-    for (const c of [reported, 4, 3, 1]) {
-      if (c && w * h * c === decodedLength) return { width: w, height: h, components: c, mismatch: false };
+    const width = rawW / k, height = rawH / k;
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) continue;
+    if (width * height * components * bytes === decodedLength) {
+      return { width, height, components, bits, bytes, written, empty, mismatch: k !== 1 };
     }
   }
-  return { width, height, components: reported || 4, mismatch: true };
+  return { width: rawW || 1, height: rawH || 1, components, bits, bytes, written, empty, mismatch: true };
 }
 
-function toRgba(decoded, width, height, components) {
+function toRgba(decoded, layout) {
+  const { width, height, components, bytes, written } = layout;
   const rgba = new Uint8ClampedArray(width * height * 4);
-  if (components === 1) {
+  const rowStride = width * components * bytes;
+  const pxStride = written * bytes;
+  if (written === 1) {
     for (let i = 0, o = 0; i < width * height; i++, o += 4) {
-      const v = decoded[i] || 0;
+      const v = bytes === 2 ? (decoded[i * 2] | (decoded[i * 2 + 1] << 8)) >>> 8 : decoded[i] || 0;
       rgba[o] = v; rgba[o + 1] = v; rgba[o + 2] = v; rgba[o + 3] = 255;
     }
-  } else if (components >= 4) {
-    for (let i = 0, s = 0, o = 0; i < width * height; i++, s += components, o += 4) {
-      rgba[o] = decoded[s] || 0; rgba[o + 1] = decoded[s + 1] || 0;
-      rgba[o + 2] = decoded[s + 2] || 0; rgba[o + 3] = decoded[s + 3] || 0;
-    }
-  } else {
-    for (let i = 0, s = 0, o = 0; i < width * height; i++, s += components, o += 4) {
-      rgba[o] = decoded[s] || 0; rgba[o + 1] = decoded[s + 1] || 0;
-      rgba[o + 2] = decoded[s + 2] || 0; rgba[o + 3] = 255;
+    return rgba;
+  }
+  for (let y = 0; y < height; y++) {
+    let s = y * rowStride;
+    let o = y * width * 4;
+    for (let x = 0; x < width; x++, s += pxStride, o += 4) {
+      rgba[o] = decoded[s] || 0;
+      rgba[o + 1] = decoded[s + 1] || 0;
+      rgba[o + 2] = decoded[s + 2] || 0;
+      rgba[o + 3] = 255;
     }
   }
   return rgba;
@@ -102,9 +115,12 @@ async function decode(bytes, maxSize, wantPng) {
   const rh = info.height || 0;
   if (!rw || !rh) throw new Error("imagen vacía");
   const decoded = decoder.getDecodedBuffer();
-  const geo = frameGeometry(decoded.length, rw, rh, info.componentCount);
-  const width = geo.width, height = geo.height;
-  const rgba = toRgba(decoded, width, height, geo.components);
+  const layout = decodeLayout(info, decoded.length);
+  if (layout.empty) {
+    throw new Error(`codestream no soportado (${layout.bits} bits × ${layout.components} componentes)`);
+  }
+  const width = layout.width, height = layout.height;
+  const rgba = toRgba(decoded, layout);
   const image = new ImageData(rgba, width, height);
   const limit = maxSize || 0;
   const biggest = Math.max(width, height);
@@ -131,7 +147,8 @@ async function decode(bytes, maxSize, wantPng) {
       png = null; // the cache is an optimisation: never fail a decode over it
     }
   }
-  return { bitmap, png, width, height, codedWidth: rw, codedHeight: rh, mismatch: geo.mismatch };
+  return { bitmap, png, width, height, codedWidth: rw, codedHeight: rh,
+    mismatch: layout.mismatch, components: layout.components, bits: layout.bits };
 }
 
 self.onmessage = async (ev) => {
@@ -153,7 +170,8 @@ self.onmessage = async (ev) => {
     self.postMessage(
       { kind: "decode", id: msg.id, ok: true, bitmap: r.bitmap, png: r.png,
         srcWidth: r.codedWidth, srcHeight: r.codedHeight,
-        width: r.bitmap.width, height: r.bitmap.height, mismatch: r.mismatch },
+        width: r.bitmap.width, height: r.bitmap.height, mismatch: r.mismatch,
+        components: r.components, bits: r.bits },
       transfer);
   } catch (e) {
     self.postMessage({ kind: "decode", id: msg.id, ok: false, error: (e && e.message) || String(e) });

@@ -94,6 +94,23 @@ export function quickReport(app) {
       : (w.terrainKnown
         ? `malla real (${w.terrainMesh.geometry.attributes.position.count} vértices) · ${w.terrainTexturesApplied || 0}/4 texturas reales`
         : "PLACEHOLDER PLANO — no ha llegado ningún parche de terreno del sim (el agua se mantiene oculta hasta que llegue)")) + layerInfo]);
+    // Mesh prims: the asset is what decides whether a region has buildings at
+    // all, so "how many are drawn and how many are still waiting" is the number
+    // that tells "the world is empty" apart from "the assets are still coming".
+    if (w.refreshSculptStats) {
+      const sc = w.refreshSculptStats();
+      out.push(["mallas (LLMESH)", !sc.mesh
+        ? "ningún prim de malla en la región"
+        : `${sc.meshDrawn} dibujadas de ${sc.mesh} prims de malla · ${sc.meshAssets} activos en memoria` +
+          (sc.meshWaiting ? ` · ${sc.meshWaiting} esperando su activo` : "") +
+          (app.session ? ` · ${app.session.stats.meshes || 0} descargados, ${app.session.stats.meshFailures || 0} fallos` : "") +
+          (w.meshErrors && w.meshErrors.length ? ` · errores: ${w.meshErrors.slice(0, 2).join(" | ")}` : "")]);
+      if (sc.sculpted || sc.mesh) {
+        out.push(["esculturas", `${sc.drawn} dibujadas de ${sc.sculpted}` +
+          (sc.waiting ? ` · ${sc.waiting} esperando su mapa` : "") +
+          (sc.degenerate ? ` · ${sc.degenerate} con mapa sin relieve` : "")]);
+      }
+    }
   }
   const sess = app && app.session;
   if (sess) {

@@ -1,6 +1,11 @@
 // Demo region: a synthetic "sandbox" built entirely from real SL prims so the
 // geometry engine can be exercised and evaluated offline (no grid connection).
 import { proceduralTerrain } from "./terrain.js";
+import { houseMeshAsset } from "./mesh-encode.js";
+
+// The mesh the demo's buildings point at (a real asset UUID would be handed out
+// by the grid; offline it is simply a name the world already knows).
+const DEMO_HOUSE_MESH = "d0000000-0000-4000-8000-00000000de01";
 
 const CUBE = { profileCurve: 1, pathCurve: 16 };
 const CYL = { profileCurve: 0, pathCurve: 16 };
@@ -117,6 +122,30 @@ export function buildDemoRegion(world, opts = {}) {
       texture: { all: "gen:grid" }, fullbright: true, glow: 0.7,
     });
   }
+
+  // ---- mesh buildings ----------------------------------------------------
+  // A real region is mostly mesh, so the demo has to be able to show one. The
+  // asset is written here (mesh-encode.js) and handed straight to the world,
+  // which is the same decoder and the same prim record the grid path uses —
+  // only the download is missing, because there is no grid to download from.
+  const meshX = 128, meshY = 162;
+  const meshZ = H(meshX, meshY);
+  houseMeshAsset().then((asset) => {
+    world.setMeshAsset(DEMO_HOUSE_MESH, asset.bytes);
+    world.addPrim({
+      id: id("meshHouse"), name: "mesh house",
+      params: Object.assign({}, CUBE, { sculptType: 5, sculptId: DEMO_HOUSE_MESH }),
+      scale: [1.6, 1.6, 1.6], position: [meshX, meshY, meshZ + 2.4], rotation: [0, 0, 0, 1],
+      textureByFace: { 0: "gen:brick", 1: "gen:roof" }, texture: { all: "gen:brick" },
+    });
+    world.addPrim({
+      id: id("meshBarn"), name: "mesh barn",
+      params: Object.assign({}, CUBE, { sculptType: 5, sculptId: DEMO_HOUSE_MESH }),
+      scale: [1.2, 1.6, 1.2], position: [meshX + 19, meshY - 7, H(meshX + 19, meshY - 7) + 1.8],
+      rotation: [0, 0, 0.38, 0.92], textureByFace: { 0: "gen:wood", 1: "gen:roof" },
+      texture: { all: "gen:wood" },
+    });
+  }).catch(() => { /* sin mallas: el resto del demo sigue siendo válido */ });
 
   // ---- trees -------------------------------------------------------------
   const rnd = mulberry(seed ^ 0x9e3779b9);

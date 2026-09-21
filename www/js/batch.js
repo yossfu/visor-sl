@@ -101,6 +101,7 @@ export class PrimBatcher {
    */
   update(cameraPos, budget = this.maxPrims) {
     if (!this.enabled) return;
+    this.attach();
     this.maxPrims = budget;
     const camX = cameraPos.x, camZ = -cameraPos.z; // SL x/y from three x/z
     const range = this.drawDistance + this.cellSize;
@@ -213,6 +214,18 @@ export class PrimBatcher {
   dispose() {
     this.clear();
     if (this.group.parent) this.group.parent.remove(this.group);
+  }
+
+  /**
+   * (Re)attaches the merged-cell group. `dispose()` detaches it so a world being
+   * torn down stops drawing through it — but a world that is then REUSED (the
+   * offline demo, or a second region in the same page) has to get it back: with
+   * the group detached, every prim added afterwards is still marked as batched
+   * and therefore hidden, while nothing draws the merged cells. The result is a
+   * region where the terrain is there and every object has silently vanished.
+   */
+  attach() {
+    if (this.root && !this.group.parent) this.root.add(this.group);
   }
 }
 

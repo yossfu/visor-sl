@@ -138,7 +138,7 @@ Requisitos concretos (todos obligatorios):
 | 2. Almacenamiento + sesión rápida | **hecho**: caché de texturas en disco (`cachePut/cacheGet`), preferencias (último usuario/grid, hash de contraseña, MFA recordado) y botón para guardar el registro en *Descargas*. Todo en carpetas propias de la app: **no hace falta pedir permiso de almacenamiento** en Android (y se explica en el registro); sólo se pide el de notificaciones |
 | 3. Sesión en segundo plano + notificación | **hecho**: `SessionService` en primer plano (`specialUse`), sin WorkManager, con la WebView (y su socket UDP) viva al pasar a segundo plano |
 | 4. GPU | **hecho**: `hardwareAccelerated`, `LAYER_TYPE_HARDWARE`, `powerPreference: high-performance`, WebGL2; al arrancar se registra la GPU real y se avisa si es software |
-| 5. Paridad con Lumiya | terreno (**tipo 76 + cabecera: arreglado en la ronda 10**), prims (forma + textura, bloque comprimido **y esculturas**; los mesh no se dibujan), **avatar real con forma, texturas y animaciones**: hechos. **Buscador de tierras y teletransporte**: hechos. Ropa del inventario: la puesta se ve (bake del simulador); cambiar de ropa necesita inventario y transferencias → siguiente hito. Falta: mallas (LLMesh), inventario, grupos, búsqueda en el grid, minimapa, voz |
+| 5. Paridad con Lumiya | terreno (**tipo 76 + cabecera: arreglado en la ronda 10**), prims (forma + textura, bloque comprimido **y esculturas**), **mallas `LLMESH` decodificadas y dibujadas (ronda 11)**, **avatar real con forma, texturas y animaciones**: hechos. **Buscador de tierras (UDP) y teletransporte**: hechos. Ropa del inventario: la puesta se ve (bake del simulador); cambiar de ropa necesita inventario y transferencias → siguiente hito. Falta: inventario, grupos, búsqueda en el grid, minimapa, voz |
 | 6. Controles tipo Genshin | **hecho**: joystick izquierdo, cámara por arrastre en la mitad derecha, botones de saltar/volar/correr/sentar, doble toque para saltar y stick a tope = correr |
 | 7. Investigación exhaustiva | **hecho y documentado** en `LUMIYA.md`: formatos de red verificados contra el código decompilado de Lumiya y contra el visor oficial de Linden (`ObjectUpdateCompressed`, ExtraParams, `AnimationData`, `SLSkeletonBone`/`getPelvisToFoot`, `LLPolySkeletalDistortion`, y en la ronda 10 la máscara de caras de `llprimitive.cpp` y las esculturas de `llvolume.cpp`) |
 | 8. Avisos del informe 4 | **hecho**: `KillObject` ya no falla (bloque `Variable` truncado por los *acks adjuntos* → ahora se recorta a lo que cabe); 76/76 pruebas del protocolo |
@@ -240,5 +240,36 @@ Estado frente a esos requisitos:
 | 1. El mundo carga | **hecho y pendiente de confirmar en el móvil**: el terreno nunca llegaba porque es `LayerID.Type = 76` (no 0) y lleva cabecera de 4 bytes; la máscara de caras del `TextureEntry` estaba en orden inverso (texturas en caras equivocadas); las **esculturas** ahora se generan de verdad y un prim sin su mapa **no se dibuja**; los objetos **mesh** tampoco se dibujan como cajas |
 | 2. Investigar Lumiya | **hecho**: `SLAgentCircuit.HandleLayerData`, `TerrainData.ProcessLayerData`, `SLTextureEntry.ReadFaceBitfield`, `PrimVolume.sculpt*`, más `llprimitive.cpp`/`llvolume.cpp` del visor oficial (ver `LUMIYA.md`) |
 | 3. Buscador de tierras + TP | **hecho**: panel *Lands* con búsqueda por nombre/SLURL/coordenadas, mapa del grid, elección del punto exacto y `TeleportLocationRequest` → `TeleportStart` → `TeleportFinish` → circuito nuevo. Probado de punta a punta con `?test=grid&tp=1004,1006` |
-| 4. Avatar (paso siguiente) | **pendiente**: el usuario dice que se ve deforme y sin texturas/animaciones/ropa; el siguiente paso es diagnosticarlo con un informe 8 (y `?test=avatar`) |
+| 4. Avatar (paso siguiente) | **pendiente**: el usuario dice que se ve deforme y sin texturas/animaciones/ropa; el siguiente paso es diagnosticarlo con un informe (y `?test=avatar`) |
+
+## Ronda 11 (informe 8: «los TP no funcionan, el buscador de regiones no encuentra sitios, todo sigue viéndose roto sin estructuras ni texturas lógicas»)
+
+> los tp no funcionan la busqueda de regiones no encuentra sitios. todo sigue
+> viendose roto sin sentido sin estructuras ni teexturas logicas, debes indagar n
+> como funciona second life y lumiya y como es que hacian para renderizar el mundo
+> y los objetos, por favor analiza todos los archivos que e adjunto es necesariio
+> aunque tardes, los archivos qe te adjunte son archivos de el proyecto linkpoint
+> y de lumiya... debes usar lo necesario para usar en el nuestro
+
+Requisitos, en el orden que pide el usuario:
+
+1. **Que el teletransporte funcione.**
+2. **Que el buscador de regiones encuentre sitios.**
+3. **Que el mundo tenga estructuras y texturas lógicas** (analizar cómo renderizan
+   el mundo y los objetos el visor oficial, Lumiya y Linkpoint, y aplicar lo
+   necesario).
+4. Analizar **todos** los archivos adjuntos (proyecto Linkpoint + Lumiya), aunque
+   lleve tiempo.
+
+Estado frente a esos requisitos:
+
+| Requisito | Estado |
+| --- | --- |
+| 1. Teletransporte | **hecho**: `CrossedRegion` (salto de borde de región) ya no se ignora y se completa como `TeleportFinish`; el envío es fiable por defecto (como Lumiya). Pendiente de confirmar en el móvil (informe 9) |
+| 2. Buscador de regiones | **hecho**: búsqueda de nombre por `MapNameRequest`/`MapBlockReply` (UDP, el protocolo real) y relleno del mapa con `MapBlockRequest`; la web de mapas queda de reserva |
+| 3. Mundo con estructuras | **hecho**: (a) el JPEG2000 de 4 componentes se leía como RGBA entrelazado y producía **rayas verticales + barra negra** en cada textura — es la causa directa de «texturas sin sentido»; (b) **las mallas `LLMESH` se decodifican y se dibujan** (el activo viaja por `GetMesh`), que es lo que faltaba para que hubiera edificios: una región moderna es casi toda malla; (c) `LLSD` binario arreglado (big-endian, mapa con recuento, clave sin etiqueta `s`), que era lo que impedía leer una cabecera de malla |
+| 4. Analizar los adjuntos | **hecho**: se han usado el visor oficial (`llmeshrepository.cpp`, `llvolume.cpp`, `llsdserialize.cpp`, `llprimitive.cpp`), Lumiya (`PrimVolumeParams`, `slproto/…`) y el proyecto Linkpoint (docs de `fixes/`, `capabilities/`, `reports/`), además del propio repositorio `yossfu/visor-sl` (que ya tenía un decodificador `llmesh.js` en otra carpeta) |
+| Extra | **`mesh-encode.js`** escribe activos `LLMESH` reales, así que el decodificador se prueba contra un codificador (autotest 97/97, arnés `?test=grid`, demo offline). Un bug del *batcher* al reutilizar el mundo (el demo mostraba sólo terreno) quedó arreglado. Versión **1.6.0 (build 7)** |
+| 3b. Verificación antes de subir | **hecho**, en `?test=grid`: el teletransporte **por la interfaz** (panel *Lands* → «Sandbox Cordova» → *Teletransportar*) recorre búsqueda UDP → `TeleportStart` → `TeleportFinish` y llega a la región nueva con sus 44 prims; la búsqueda por nombre resuelve por UDP; el mundo se ve con terreno, objetos sólidos y un edificio con tejado; y el arnés `?test=sculpt` dibuja las cinco esculturas y la casa de malla (y no dibuja los dos casos que no deben dibujarse) |
+
 

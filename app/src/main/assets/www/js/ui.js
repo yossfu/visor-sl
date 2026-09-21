@@ -101,6 +101,38 @@ async function landsLookupRegion(name) {
   return { name: display, gx: +x[1], gy: +y[1] };
 }
 
+/**
+ * Splits a typed query into the part that can be answered without any lookup
+ * (`{kind:"coords"}` for a bare grid coordinate, `{kind:"region"}` with the
+ * region name and an optional local point for a SLURL or "Region 128 128 25").
+ * The name is then resolved against the simulator (see
+ * `SLSession.searchRegionsByName`).
+ */
+export function landsParseQuery(query) {
+  const text = String(query || "").trim().replace(/^["']|["']$/g, "");
+  if (!text) return null;
+  let m = text.match(/^secondlife:\/\/([^/\s]+)(?:\/([\d.]+))?(?:\/([\d.]+))?(?:\/([\d.]+))?/i)
+    || text.match(/^https?:\/\/(?:www\.)?maps\.secondlife\.com\/secondlife\/([^/\s?]+)(?:\/([\d.]+))?(?:\/([\d.]+))?(?:\/([\d.]+))?/i);
+  if (m) {
+    return {
+      kind: "region",
+      name: decodeURIComponent(m[1]).replace(/[+_]/g, " ").trim(),
+      local: [Number(m[2]) || 128, Number(m[3]) || 128, Number(m[4]) || 25],
+    };
+  }
+  m = text.match(/^(-?\d{1,5})\s*[,;\s]\s*(-?\d{1,5})$/);
+  if (m) return { kind: "coords", gx: +m[1], gy: +m[2] };
+  m = text.match(/^([A-Za-z0-9' ._+-]+?)[\s/]+([\d.]+)[\s/]+([\d.]+)(?:[\s/]+([\d.]+))?$/);
+  if (m) {
+    return {
+      kind: "region",
+      name: m[1].trim(),
+      local: [Number(m[2]) || 128, Number(m[3]) || 128, Number(m[4]) || 25],
+    };
+  }
+  return { kind: "region", name: text };
+}
+
 /** Accepts a region name, a `secondlife://` or maps.secondlife.com SLURL, or "x, y". */
 async function landsResolve(query) {
   const text = String(query || "").trim().replace(/^["']|["']$/g, "");
@@ -704,7 +736,13 @@ export class UI {
     const m = this.modalHost;
     m.innerHTML = "";
     m.classList.remove("hidden");
-    const close = () => { m.classList.add("hidden"); m.innerHTML = ""; this.landsHereEl = null; };
+    const close = () => {
+      const s = this.app.session;
+      if (s && s.onMapBlock) s.onMapBlock = null;
+      m.classList.add("hidden");
+      m.innerHTML = "";
+      this.landsHereEl = null;
+    };
     const sess = this.app.session;
     const startHere = this.region || (sess && sess.locationInfo ? sess.locationInfo() : null);
     const state = {
@@ -735,6 +773,11 @@ export class UI {
     const zoomIn = el("button", { class: "btn", text: "+" });
     const zoomLabel = el("span", { class: "hint" });
     const hereBtn = el("button", { class: "btn", text: "Centrar en mí" });
+    const resultsEl = el("div", { class: "row wrap landsmatch" });
+    // Region names for the cells on screen, straight from the simulator
+    // (`MapBlockRequest` -> `MapBlockReply`). Without them the map is a grid of
+    // terrain pictures and nobody knows where "Ahern" actually is.
+    const regionNames = new Map();
 
     const span = () => 1 << (state.z - 1);
     // The map is three tiles across and three down, with the tile that holds the
@@ -783,6 +826,35 @@ export class UI {
       await Promise.all(jobs);
     };
 
+    // Ask the simulator for the region names of the cells on screen. The reply
+    // arrives as one or more MapBlockReply messages, is accumulated here and the
+    // map is repainted with the names.
+    const loadNames = () => {
+      const s = this.app.session;
+      if (!s || s.state !== "online" || !s.requestMapBlock) return;
+      regionNames.clear();
+      const sp = span(), o = origin();
+      let minX = Math.max(0, o.tx * sp);
+      let maxX = Math.max(0, o.tx * sp + 3 * sp - 1);
+      let minY = Math.max(0, (o.ty - 2) * sp);
+      let maxY = Math.max(0, o.ty * sp + sp - 1);
+      // Never ask for more than a screenful: at zoom 2 the view is 6x6 regions,
+      // but at zoom 5 it is 48x48 and the reply would be megabytes. Cap it and
+      // centre the smaller block on the view.
+      if ((maxX - minX + 1) * (maxY - minY + 1) > 400) {
+        const k = 6;
+        minX = Math.max(0, state.gx - k); maxX = state.gx + k;
+        minY = Math.max(0, state.gy - k); maxY = state.gy + k;
+      }
+      s.onMapBlock = (rows) => {
+        for (const r of rows) regionNames.set(`${r.gx},${r.gy}`, r.name);
+        compose();
+      };
+      if (s.requestMapBlock(minX, minY, maxX, maxY)) {
+        this.log(`Mapa: pedidos los nombres de las regiones ${minX}..${maxX} × ${minY}..${maxY}.`);
+      }
+    };
+
     const compose = () => {
       const s = span(), o = origin();
       const cell = LANDS_TILE_PX / s;
@@ -806,8 +878,19 @@ export class UI {
             const gx = o.tx * s + col;
             const gy = o.ty * s + s - 1 - row;
             if (gx < 0 || gy < 0) continue;
-            octx.fillStyle = "rgba(255,255,255,.55)";
-            octx.fillText(`${gx},${gy}`, (col + 0.5) * cell, (row + 0.5) * cell);
+            const cx = (col + 0.5) * cell, cy = (row + 0.5) * cell;
+            const regionName = regionNames.get(`${gx},${gy}`);
+            if (regionName) {
+              octx.font = "10px system-ui, sans-serif";
+              octx.fillStyle = "rgba(255,255,255,.92)";
+              octx.fillText(regionName.length > 13 ? regionName.slice(0, 12) + "…" : regionName, cx, cy - 6);
+              octx.fillStyle = "rgba(255,255,255,.45)";
+              octx.fillText(`${gx},${gy}`, cx, cy + 6);
+            } else {
+              octx.font = "11px system-ui, sans-serif";
+              octx.fillStyle = "rgba(255,255,255,.45)";
+              octx.fillText(`${gx},${gy}`, cx, cy);
+            }
           }
         }
       }
@@ -877,21 +960,81 @@ export class UI {
       refreshTarget();
       drawTiles();
       compose();
+      loadNames();
     };
 
-    const doSearch = async () => {
-      const q = search.value;
-      if (!String(q || "").trim()) return;
-      status.textContent = "Buscando…";
-      try {
-        const found = await landsResolve(q);
-        if (!found) { status.textContent = "No encuentro esa región."; return; }
-        if (found.error) { status.textContent = found.error; return; }
-        goTo(found.gx, found.gy, found.local, found.name);
-        status.textContent = `${found.name} está en (${found.gx}, ${found.gy}). Toca el mapa para afinar el punto y pulsa Teletransportar.`;
-      } catch (e) {
-        status.textContent = "La búsqueda falló: " + ((e && e.message) || e);
+    const clearMatches = () => { resultsEl.innerHTML = ""; };
+    const showMatches = (rows) => {
+      clearMatches();
+      for (const r of rows.slice(0, 12)) {
+        resultsEl.appendChild(el("button", {
+          class: "btn",
+          text: `${r.name} (${r.gx},${r.gy})`,
+          onclick: () => {
+            goTo(r.gx, r.gy, null, r.name);
+            status.textContent = `${r.name} está en (${r.gx}, ${r.gy}). Toca el mapa para afinar el punto y pulsa Teletransportar.`;
+            clearMatches();
+          },
+        }));
       }
+    };
+
+    /**
+     * The search itself. When there is a session the region is looked up in the
+     * simulator over UDP (`MapNameRequest` -> `MapBlockReply`), which needs no
+     * web request and therefore cannot be broken by CORS, a User-Agent or a
+     * changed web page. The maps.secondlife.com page is only a fallback for when
+     * there is no session yet.
+     */
+    const doSearch = async () => {
+      const q = String(search.value || "").trim();
+      if (!q) return;
+      clearMatches();
+      const parsed = landsParseQuery(q);
+      if (parsed && parsed.kind === "coords") {
+        goTo(parsed.gx, parsed.gy, null, `Región ${parsed.gx}, ${parsed.gy}`);
+        status.textContent = `Región (${parsed.gx}, ${parsed.gy}) seleccionada. Pulsa Teletransportar.`;
+        return;
+      }
+      const s = this.app.session;
+      const online = !!(s && s.state === "online");
+      status.textContent = online
+        ? "Buscando en el grid (por UDP, sin pasar por la web)…"
+        : "Sin sesión activa: buscando por la web del grid…";
+      let found = null;
+      if (online && s.searchRegionsByName) {
+        try {
+          const rows = await s.searchRegionsByName(parsed.name);
+          if (rows.length) {
+            const want = parsed.name.toLowerCase().replace(/\s+/g, " ").trim();
+            found = rows.find((r) => r.name.toLowerCase().replace(/\s+/g, " ").trim() === want) || rows[0];
+            if (rows.length > 1) showMatches(rows);
+            goTo(found.gx, found.gy, parsed.local, found.name);
+            status.textContent = `${found.name} está en (${found.gx}, ${found.gy})` +
+              (rows.length > 1 ? ` · ${rows.length} regiones coinciden — elige otra abajo si no es esta` : "") +
+              ". Toca el mapa para afinar el punto y pulsa Teletransportar.";
+            return;
+          }
+        } catch (e) {
+          this.log("Búsqueda de región por UDP: " + ((e && e.message) || e));
+        }
+      }
+      // Fallback: the maps.secondlife.com region page (needs no login, but does
+      // need the network to let that page through).
+      try {
+        const web = await landsResolve(q);
+        if (web && !web.error) {
+          goTo(web.gx, web.gy, web.local, web.name);
+          status.textContent = `${web.name} está en (${web.gx}, ${web.gy}). Toca el mapa para afinar el punto y pulsa Teletransportar.`;
+          return;
+        }
+      } catch (e) {
+        this.log("Búsqueda de región por la web: " + ((e && e.message) || e));
+      }
+      status.textContent = (online
+        ? "El simulador no conoce ninguna región con ese nombre. "
+        : "No encuentro esa región. ") +
+        "Escribe también coordenadas (p. ej. «1004, 1006») o toca el mapa.";
     };
 
     search.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
@@ -904,8 +1047,8 @@ export class UI {
       setTarget(w.gx, w.gy, [w.x, w.y, Number(lz.value) || 25]);
       status.textContent = `Punto elegido en (${w.gx}, ${w.gy}) a ${w.x}, ${w.y} m dentro de la región.`;
     });
-    zoomOut.addEventListener("click", () => { if (state.z > 1) { state.z--; updateZoom(); drawTiles(); } });
-    zoomIn.addEventListener("click", () => { if (state.z < 5) { state.z++; updateZoom(); drawTiles(); } });
+    zoomOut.addEventListener("click", () => { if (state.z > 1) { state.z--; updateZoom(); drawTiles(); loadNames(); } });
+    zoomIn.addEventListener("click", () => { if (state.z < 5) { state.z++; updateZoom(); drawTiles(); loadNames(); } });
     hereBtn.addEventListener("click", () => {
       const here = this.region || (this.app.session && this.app.session.locationInfo ? this.app.session.locationInfo() : null);
       if (!here || !Number.isFinite(here.gridX) || here.region === "?") { status.textContent = "Todavía no sé en qué región estás."; return; }
@@ -924,10 +1067,11 @@ export class UI {
         Math.max(0, Number(lz.value) || 25),
       ];
       if (s.teleportToRegion(t.gx, t.gy, point)) {
-        status.textContent = `Teletransportando a ${t.name || `${t.gx}, ${t.gy}`}…`;
-        this.log(`Teletransporte a ${t.name || "región"} (${t.gx}, ${t.gy}) en ${point.map((v) => Math.round(v)).join(", ")}.`);
+        status.textContent = `Teletransportando a ${t.name || `${t.gx}, ${t.gy}`}…` +
+          " El simulador tiene que preparar la región de destino: tarda unos segundos y termina con «TeleportFinish».";
+        this.log(`Teletransporte pedido: ${t.name || "región"} (${t.gx}, ${t.gy}) punto ${point.map((v) => Math.round(v)).join(", ")}.`);
       } else {
-        status.textContent = "No se pudo enviar la petición de teletransporte.";
+        status.textContent = "No se pudo enviar la petición de teletransporte (¿sin sesión activa?).";
       }
     });
 
@@ -950,6 +1094,7 @@ export class UI {
       el("h2", { text: "Buscar tierras y teletransportarse" }),
       el("div", { class: "row" }, [search, el("button", { class: "btn", text: "Buscar", onclick: doSearch })]),
       status,
+      resultsEl,
       el("div", { class: "landspicks" }, [
         el("div", { class: "hint", text: "Regiones de prueba (se pueden editar en main.pjs):" }),
         el("div", { class: "row wrap" }, picks),
@@ -971,7 +1116,7 @@ export class UI {
 
     zoomLabel.textContent = "zoom " + state.z;
     updateZoom();
-    drawTiles();
+    drawTiles().then(loadNames);
   }
 
   logText() {

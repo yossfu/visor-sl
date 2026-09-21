@@ -13,20 +13,37 @@
 // `?test=grid` branch of app.js's boot().
 import { LLSD } from "../llsd.js";
 import { buildMessage, buildPacket, parsePacket, decodeMessage } from "../udp.js";
-import { uuidBytes, uuidString, toBytes } from "../message-template.js";
+import { uuidBytes, uuidString, toBytes, toText } from "../message-template.js";
 import { loadMessageTemplate } from "../sl-session.js";
 import { installSink } from "../transport.js";
 import { LAYER_TYPE_LAND } from "../terrain.js";
+import { houseMeshAsset, boxMeshAsset } from "./mesh-fixture.js";
 
 export const FAKE = {
   region: "Harness Cove",
   water: 20,
+  // The regions the fake grid's map knows about. `MapNameRequest` is answered
+  // from this list, which is what the region search and the map's region names
+  // are checked against without a real grid.
+  regions: [
+    { name: "Ahern", gx: 997, gy: 1002 },
+    { name: "Harness Cove", gx: 1000, gy: 1000 },
+    { name: "Harness Cove North", gx: 1000, gy: 1001 },
+    { name: "Sandbox Cordova", gx: 1004, gy: 1006 },
+    { name: "Sandbox Wanderton", gx: 1006, gy: 1004 },
+    { name: "London City", gx: 995, gy: 999 },
+    { name: "Welcome Island", gx: 1000, gy: 996 },
+  ],
   // The ground under the agent: the same formula terrainPatches() uses, sampled
   // at the centre patch, so the avatar stands on the harness terrain.
   agentPos: [128, 128, 0],
   seedUrl: "https://fake.agni.lindenlab.com/CAPS/seed",
   textureUrl: "https://fake.agni.lindenlab.com/CAPS/GetTexture/c0ffee",
   eqUrl: "https://fake.agni.lindenlab.com/CAPS/EventQueueGet/c0ffee",
+  meshUrl: "https://fake.agni.lindenlab.com/CAPS/GetMesh/c0ffee",
+  // Mesh assets the harness serves: a two-material house and a plain box. A
+  // region is mostly mesh in the real grid, so the harness is mostly mesh too.
+  meshes: { house: "d0000000-0000-4000-8000-000000000001", box: "d0000000-0000-4000-8000-000000000002" },
 };
 FAKE.agentPos[2] = terrainH(FAKE.agentPos[0], FAKE.agentPos[1]) + 3;
 
@@ -129,10 +146,28 @@ const Q16 = (v, min, max) => Math.round(((v - min) / (max - min)) * 65535) & 0xf
  * face bitfield list terminated by 0). Only the default texture id is set here,
  * which is what most prims on the grid look like.
  */
-function textureEntry(texId, { rgba = 0xffffffff, repeatU = 1, repeatV = 1, glow = 0, material = 0 } = {}) {
+function textureEntry(texId, { rgba = 0xffffffff, repeatU = 1, repeatV = 1, glow = 0, material = 0, faces = null } = {}) {
   const w = writer();
-  w.uuid(texId).u8(0);           // texture id + "no per-face overrides"
-  w.u32(rgba).u8(0);
+  // A section is: the default value, then a list of (face bitfield, value).
+  // A face bitfield is a big-endian 7-bits-per-byte number whose high bit means
+  // "another byte of the same field follows", so a face below 8 is one byte with
+  // the high bit CLEAR — that is what ends the field. The list ends with a
+  // 0x00 bitfield. A mesh has one face per material, which is how each material
+  // of an asset gets its own texture and tint.
+  const overrides = (map, writeValue) => {
+    if (map) {
+      for (const key of Object.keys(map).map(Number).sort((a, b) => a - b)) {
+        if (!(key >= 0 && key < 8)) continue;
+        w.u8(1 << key);
+        writeValue(map[key]);
+      }
+    }
+    w.u8(0);
+  };
+  w.uuid(texId);
+  overrides(faces && faces.texture, (v) => w.uuid(v));
+  w.u32(rgba);
+  overrides(faces && faces.rgba, (v) => w.u32(v));
   w.f32(repeatU).u8(0);
   w.f32(repeatV).u8(0);
   w.u16(0).u8(0);                // offsetU
@@ -157,7 +192,22 @@ function primTexture(localID) {
  * profile, 23 bytes) and the TextureEntry right at the end — the two blocks a
  * viewer that stops after the owner UUID never sees.
  */
-function compressedObject({ fullID, id, localID, scale, position, rotation, pcode = 9, params, texture }) {
+/**
+ * ExtraParams TLV: U8 count, then per entry U16 type, S32 size, payload. A mesh
+ * prim carries `PARAMS_MESH` (0x60), whose payload is exactly the sculpt one —
+ * a big-endian UUID plus the "sculpt" type byte, where 5 means `SCULPT_TYPE_MESH`
+ * (llprimitive.cpp / Lumiya's `PrimVolumeParams.unpackExtraParams`). That is how
+ * a mesh prim names its asset on the wire.
+ */
+function meshExtraParams(uuid, sculptType = 5) {
+  const w = writer();
+  w.u8(1);                     // one parameter
+  w.u16(0x60);                 // PARAMS_MESH
+  w.u32(17).raw(uuidBytes(uuid)).u8(sculptType);
+  return w.bytes();
+}
+
+function compressedObject({ fullID, id, localID, scale, position, rotation, pcode = 9, params, texture, extra, materials }) {
   const P = Object.assign({
     pathCurve: 16, pathBegin: 0, pathEnd: 0, pathScaleX: 100, pathScaleY: 100,
     pathShearX: 0, pathShearY: 0, pathTwist: 0, pathTwistBegin: 0, pathRadiusOffset: 0,
@@ -172,13 +222,14 @@ function compressedObject({ fullID, id, localID, scale, position, rotation, pcod
   w.f32(r[0]).f32(r[1]).f32(r[2]);
   w.u32(0);                       // SpecialCode: no conditional fields
   w.uuid(AGENT_ID);               // Owner — unconditional, NOT flag-driven
-  w.u8(0);                        // no ExtraParams
+  if (extra) w.raw(extra);        // ExtraParams (mesh/sculpt/flexible/...)
+  else w.u8(0);                   // no ExtraParams
   w.u8(P.pathCurve).u16(P.pathBegin).u16(P.pathEnd)
     .u8(P.pathScaleX).u8(P.pathScaleY).u8(P.pathShearX).u8(P.pathShearY)
     .u8(P.pathTwist).u8(P.pathTwistBegin).u8(P.pathRadiusOffset)
     .u8(P.pathTaperX).u8(P.pathTaperY).u8(P.pathRevolutions).u8(P.pathSkew)
     .u8(P.profileCurve).u16(P.profileBegin).u16(P.profileEnd).u16(P.profileHollow);
-  const te = textureEntry(texture || primTexture(localID));
+  const te = textureEntry(texture || primTexture(localID), { faces: materials });
   w.u32(te.length).raw(te);       // S32 TextureEntry size, then the entry itself
   return w.bytes();
 }
@@ -341,6 +392,28 @@ class FakeSim {
       ],
     }));
 
+    // Mesh objects: the shape comes from an `LLMESH` asset, not from prim
+    // parameters, so until the asset's decoder and its download path both work
+    // these are simply missing from the world — which is most of it.
+    const house = {
+      localID: ++this.localID, id: "00000000-0000-4000-8000-00000000cc01",
+      position: at(-11, 9, 1.6), scale: [1, 1, 1], pcode: 9,
+      texture: "e4444444-0000-4000-8000-000000000004",
+      extra: meshExtraParams(FAKE.meshes.house),
+      materials: { rgba: { 0: 0xffeeeeee, 1: 0xff3030c0 } },  // pale walls, red roof
+    };
+    const meshBox = {
+      localID: ++this.localID, id: "00000000-0000-4000-8000-00000000cc02",
+      position: at(9, 10, 3.9), scale: [2.5, 2.5, 2.5], pcode: 9,
+      texture: "f5555555-0000-4000-8000-000000000005",
+      extra: meshExtraParams(FAKE.meshes.box),
+    };
+    for (const p of [house, meshBox]) this.primPositions.set(p.localID, p);
+    out.push(this.packet("ObjectUpdateCompressed", {
+      RegionData: { RegionHandle: this.regionHandle, TimeDilation: 65535 },
+      ObjectData: [house, meshBox].map((p) => ({ UpdateFlags: 0, Data: compressedObject(p) })),
+    }));
+
     // Our own avatar and a neighbour (both through the compressed path).
     this.selfLocalID = ++this.localID;
     this.neighbourLocalID = ++this.localID;
@@ -401,6 +474,30 @@ class FakeSim {
         Info: { TeleportFlags: 1, Message: toBytes("Preparando el destino") },
       }));
     }
+    if (def.name === "MapNameRequest" || def.name === "MapBlockRequest") {
+      const norm = (s) => String(s).toLowerCase().replace(/\s+/g, " ").trim();
+      const isNameQuery = def.name === "MapNameRequest";
+      const decoded = decodeMessage(def, packet).data || {};
+      const want = isNameQuery && decoded.NameData && decoded.NameData.Name ? norm(toText(decoded.NameData.Name)) : "";
+      const pos = decoded.PositionData || {};
+      const rows = [];
+      for (const r of FAKE.regions) {
+        if (isNameQuery) {
+          const n = norm(r.name);
+          if (!want || !(n === want || n.includes(want))) continue;
+        } else if (pos.MinX != null) {
+          if (r.gx < pos.MinX || r.gx > pos.MaxX || r.gy < pos.MinY || r.gy > pos.MaxY) continue;
+        }
+        rows.push({
+          X: r.gx, Y: r.gy, Name: toBytes(r.name), Access: 13, RegionFlags: 0,
+          WaterHeight: FAKE.water, Agents: 1 + (r.gx % 5), MapImageID: uuidBytes(NEIGHBOUR_ID),
+        });
+      }
+      reply.push(this.packet("MapBlockReply", {
+        AgentData: { AgentID: uuidBytes(AGENT_ID), Flags: 0 },
+        Data: rows,
+      }));
+    }
     if (def.name === "ChatFromViewer") {
       const msg = decodeMessage(def, packet).data.ChatData || {};
       reply.push(this.packet("ChatFromSimulator", {
@@ -432,8 +529,17 @@ class FakeSim {
 // ---------------------------------------------------------------------------
 let j2cModule = null;
 
-/** A real JPEG2000 codestream so the vendored OpenJPEG path is exercised. */
-async function makeJ2C(w, h, paint) {
+/**
+ * A real JPEG2000 codestream so the vendored OpenJPEG path is exercised.
+ *
+ * `components` matters: the grid sends most textures as an RGBA codestream
+ * (4 components) whose alpha channel is opaque, and that is exactly the shape
+ * the reader used to mis-read as interleaved RGBA — which produced colour-cycled
+ * stripes with a black bar down the side. Half of the harness's textures are
+ * encoded that way, so the fix is exercised by the same wasm decoder the phone
+ * uses, and not only by the unit tests.
+ */
+async function makeJ2C(w, h, paint, components = 3) {
   if (!j2cModule) {
     const url = "https://cdn.jsdelivr.net/npm/@cornerstonejs/codec-openjpeg@1.2.2/dist/openjpegwasm.js";
     await new Promise((res, rej) => {
@@ -450,15 +556,16 @@ async function makeJ2C(w, h, paint) {
     });
   }
   const mod = await j2cModule;
-  const rgb = new Uint8Array(w * h * 3);
+  const px = new Uint8Array(w * h * components);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const i = (y * w + x) * 3;
+    const i = (y * w + x) * components;
     const c = paint(x / w, y / h);
-    rgb[i] = c[0]; rgb[i + 1] = c[1]; rgb[i + 2] = c[2];
+    px[i] = c[0]; px[i + 1] = c[1]; px[i + 2] = c[2];
+    if (components === 4) px[i + 3] = 255;   // opaque, like a real SL texture
   }
   const enc = new mod.J2KEncoder();
-  const dec = enc.getDecodedBuffer({ width: w, height: h, bitsPerSample: 8, componentCount: 3, isSigned: false, colorSpace: 0 });
-  dec.set(rgb);
+  const dec = enc.getDecodedBuffer({ width: w, height: h, bitsPerSample: 8, componentCount: components, isSigned: false, colorSpace: 0 });
+  dec.set(px);
   enc.encode();
   return Uint8Array.from(enc.getEncodedBuffer());
 }
@@ -510,16 +617,28 @@ async function httpAnswer(url, method) {
         EventQueueGet: FAKE.eqUrl,
         GetTexture: FAKE.textureUrl,
         ViewerAsset: FAKE.textureUrl,
+        GetMesh: FAKE.meshUrl,
         GetDisplayNames: FAKE.textureUrl.replace("GetTexture", "GetDisplayNames"),
       }),
       type: "application/llsd+xml",
     };
   }
+  if (url.includes("mesh_id=")) {
+    const id = url.slice(url.indexOf("mesh_id=") + 8);
+    const bank = httpAnswer._meshes;
+    const bytes = bank && bank.get(id);
+    if (!bytes) return { text: "not found", type: "text/plain" };
+    // The real capability answers with the asset itself; a viewer that guessed
+    // the format would be caught by the Content-Type alone.
+    return { bytes, type: "application/vnd.ll.mesh" };
+  }
   if (url.includes("texture_id=")) {
     const id = url.slice(url.indexOf("texture_id=") + 11);
     const paint = texturePaint(id);
+    // Half the textures come back as RGBA codestreams, like the real grid.
+    const components = (parseInt(id.slice(0, 2), 16) || 0) % 2 ? 4 : 3;
     try {
-      return { bytes: await makeJ2C(64, 64, paint), type: "image/x-j2c" };
+      return { bytes: await makeJ2C(64, 64, paint, components), type: "image/x-j2c" };
     } catch (e) {
       return pngBytes(64, 64, paint);
     }
@@ -563,6 +682,18 @@ async function httpAnswer(url, method) {
 // ---------------------------------------------------------------------------
 export async function installFakeGrid(opts = {}) {
   installSink();
+  // The assets the fake GetMesh capability serves. They are built here, with the
+  // same encoder the self-test uses against the decoder, so a mismatch between
+  // the two shows up as "nothing draws" rather than as a silent wrong shape.
+  const meshBank = new Map();
+  try {
+    const [house, box] = await Promise.all([houseMeshAsset(), boxMeshAsset([3, 1, 3])]);
+    meshBank.set(FAKE.meshes.house, house.bytes);
+    meshBank.set(FAKE.meshes.box, box.bytes);
+  } catch (e) {
+    console.warn("[harness] no se pudieron construir las mallas:", (e && e.message) || e);
+  }
+  httpAnswer._meshes = meshBank;
   const sim = new FakeSim(opts);
   await sim.init();
   const sockets = new Map();
@@ -577,7 +708,9 @@ export async function installFakeGrid(opts = {}) {
       || at(0, 0x00, 0x00, 0x00, 0x0c, 0x6a, 0x50)  // jp2
       || at(0, 0x89, 0x50, 0x4e, 0x47)         // png
       || at(0, 0xff, 0xd8, 0xff)               // jpeg
-      || at(0, 0x47, 0x49, 0x46, 0x38);        // gif
+      || at(0, 0x47, 0x49, 0x46, 0x38)         // gif
+      || b[0] === 0x7b                         // LLMESH (binary LLSD map)
+      || at(0, 0x3c, 0x3f);                    // LLMESH behind the text tag
   };
   // The harness *replaces* the app's native bridge, which means the viewer can no
   // longer reach the real grid while it runs. Saving the previous bridge lets the
@@ -637,7 +770,7 @@ export async function installFakeGrid(opts = {}) {
   window.VisorNative = {
     platform: () => JSON.stringify({
       platform: "android", sdk: 36, model: "harness", manufacturer: "Perchance",
-      appVersion: "1.5.0", appBuild: 6, nativeBridge: true, udp: true,
+      appVersion: "1.6.0", appBuild: 7, nativeBridge: true, udp: true,
     }),
     netInfo: () => JSON.stringify({ tipo: "wifi (simulada)", validada: true, sinMedir: true, udpOk: true, puertoDePrueba: 40000 }),
     log: (m) => console.log("[harness nativo]", m),

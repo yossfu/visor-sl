@@ -190,46 +190,83 @@ function decodeInWorker(bytes, maxSize, wantPng) {
 }
 
 /**
- * Works out the real geometry of a decoded buffer. Two things can go wrong and
- * both used to be silent: the reported component count can disagree with the
- * buffer the decoder actually produced (a 3-component codestream reported as 4
- * makes every pixel read its alpha from the neighbour's red), and the decoder
- * can hand back a REDUCED frame (a quarter of the resolution) while still
- * reporting the full width/height. Reading either as if it were the other
- * produces a texture that is subtly wrong — or black — with nothing in the log.
+ * The real layout of the decoder's output buffer.
  *
- * Returns `{ width, height, components, mismatch }`; `mismatch: true` means
- * nothing added up and the caller is about to make a best effort.
+ * This is the piece that made every Second Life texture look like "stripes and
+ * black bars" on the phone. The decoder (@cornerstonejs/codec-openjpeg, see its
+ * `J2KDecoder.hpp`) sizes its output buffer from the *reported* frame —
+ * `width * height * componentCount * bytesPerSample` — but it does not fill it
+ * the way that arithmetic suggests:
+ *
+ *   componentCount == 1   ->  width*height samples, `bytes` each (8 or 16 bit)
+ *   componentCount >= 3   ->  RGB *triples* written at `x*3` inside rows whose
+ *                             pitch is `componentCount` bytes per pixel
+ *
+ * There is no code path that writes a 4th channel. So for a 4-component (RGBA)
+ * codestream — which is what the grid sends for every texture that carries
+ * alpha, and a large fraction of a region's textures do — the decoder writes
+ * 3 bytes at a 3-byte stride into rows that are 4 bytes per pixel wide, and the
+ * last `width` bytes of every row are left at zero.
+ *
+ * Reading such a buffer as interleaved RGBA (which this viewer did, taking the
+ * reported component count at face value) walks the data 4 bytes at a time over
+ * 3-byte-strided pixels: the colour phase rotates one channel per pixel, so the
+ * texture turns into thin colour-cycled stripes, and everything past three
+ * quarters of each row is the untouched zero tail — a solid black bar down the
+ * right-hand side. That is precisely what the phone showed in its decoded
+ * texture grid, and it is why the world had "no logical textures".
+ *
+ * `written` is how many samples per pixel the decoder actually produced, and
+ * `empty` marks the combination it cannot produce at all (more than one
+ * component with more than 8 bits per sample: that branch is compiled out).
  */
-export function frameGeometry(decodedLength, width, height, reported) {
+export function decodeLayout(info, decodedLength) {
+  const rawW = Math.max(0, info.width | 0);
+  const rawH = Math.max(0, info.height | 0);
+  const components = Math.max(1, info.componentCount | 0);
+  const bits = (info.bitsPerSample | 0) || 8;
+  const bytes = bits > 8 ? 2 : 1;
+  const written = components === 1 ? 1 : 3;
+  // With more than one component and more than 8 bits per sample the library's
+  // writer is compiled out entirely: the buffer comes back all zeros. That has
+  // to be reported, not drawn as a black box, and it does not depend on whether
+  // the reported frame matches the buffer.
+  const empty = written > 1 && bytes > 1;
   for (const k of [1, 2, 4, 8, 16]) {
-    const w = width / k, h = height / k;
-    if (!Number.isInteger(w) || !Number.isInteger(h) || w < 1 || h < 1) continue;
-    for (const c of [reported, 4, 3, 1]) {
-      if (c && w * h * c === decodedLength) {
-        return { width: w, height: h, components: c, mismatch: false };
-      }
+    const width = rawW / k, height = rawH / k;
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) continue;
+    if (width * height * components * bytes === decodedLength) {
+      return { width, height, components, bits, bytes, written, empty, mismatch: k !== 1 };
     }
   }
-  return { width, height, components: reported || 4, mismatch: true };
+  // The reported frame did not agree with the buffer at all: keep the most
+  // useful guess and let the caller record it instead of drawing noise.
+  return { width: rawW || 1, height: rawH || 1, components, bits, bytes, written, empty, mismatch: true };
 }
 
-function toRgba(decoded, width, height, components) {
+export function toRgba(decoded, layout) {
+  const { width, height, components, bytes, written } = layout;
   const rgba = new Uint8ClampedArray(width * height * 4);
-  if (components === 1) {
+  const rowStride = width * components * bytes;   // the decoder's own row pitch
+  const pxStride = written * bytes;               // what it writes per pixel
+  if (written === 1) {
     for (let i = 0, o = 0; i < width * height; i++, o += 4) {
-      const v = decoded[i] || 0;
+      const v = bytes === 2 ? (decoded[i * 2] | (decoded[i * 2 + 1] << 8)) >>> 8 : decoded[i] || 0;
       rgba[o] = v; rgba[o + 1] = v; rgba[o + 2] = v; rgba[o + 3] = 255;
     }
-  } else if (components >= 4) {
-    for (let i = 0, s = 0, o = 0; i < width * height; i++, s += components, o += 4) {
-      rgba[o] = decoded[s] || 0; rgba[o + 1] = decoded[s + 1] || 0;
-      rgba[o + 2] = decoded[s + 2] || 0; rgba[o + 3] = decoded[s + 3] || 0;
-    }
-  } else {
-    for (let i = 0, s = 0, o = 0; i < width * height; i++, s += components, o += 4) {
-      rgba[o] = decoded[s] || 0; rgba[o + 1] = decoded[s + 1] || 0;
-      rgba[o + 2] = decoded[s + 2] || 0; rgba[o + 3] = 255;
+    return rgba;
+  }
+  for (let y = 0; y < height; y++) {
+    let s = y * rowStride;
+    let o = y * width * 4;
+    for (let x = 0; x < width; x++, s += pxStride, o += 4) {
+      rgba[o] = decoded[s] || 0;
+      rgba[o + 1] = decoded[s + 1] || 0;
+      rgba[o + 2] = decoded[s + 2] || 0;
+      // The library never decodes the 4th plane, so an alpha texture stays
+      // opaque. That is a known, visible limitation (foliage, glass); it is
+      // still infinitely better than the stripes it used to draw.
+      rgba[o + 3] = 255;
     }
   }
   return rgba;
@@ -261,6 +298,7 @@ export async function decodeJ2CEx(bytes, maxSize, wantPng) {
         bitmap: res.bitmap, png: res.png || null,
         width: res.width, height: res.height,
         srcWidth: res.srcWidth || res.width, srcHeight: res.srcHeight || res.height,
+        components: res.components || 0, bits: res.bits || 0, mismatch: !!res.mismatch,
       };
     } catch (e) {
       report(e);
@@ -276,9 +314,13 @@ export async function decodeJ2CEx(bytes, maxSize, wantPng) {
   const rh = info.height || 0;
   if (!rw || !rh) throw new Error("imagen vacía");
   const decoded = decoder.getDecodedBuffer();
-  const geo = frameGeometry(decoded.length, rw, rh, info.componentCount);
-  const width = geo.width, height = geo.height;
-  const rgba = toRgba(decoded, width, height, geo.components);
+  const layout = decodeLayout(info, decoded.length);
+  if (layout.empty) {
+    throw new Error(`el codestream no se puede decodificar en esta librería (${layout.bits} bits × ` +
+      `${layout.components} componentes: esa rama no está implementada)`);
+  }
+  const width = layout.width, height = layout.height;
+  const rgba = toRgba(decoded, layout);
   const image = new ImageData(rgba, width, height);
   const biggest = Math.max(width, height);
   let bitmap;
@@ -305,7 +347,10 @@ export async function decodeJ2CEx(bytes, maxSize, wantPng) {
       png = null;
     }
   }
-  return { bitmap, png, width: bitmap.width, height: bitmap.height, srcWidth: width, srcHeight: height };
+  return {
+    bitmap, png, width: bitmap.width, height: bitmap.height, srcWidth: width, srcHeight: height,
+    components: layout.components, bits: layout.bits, mismatch: layout.mismatch,
+  };
 }
 
 /** The emscripten module itself (diagnostics / tests). */

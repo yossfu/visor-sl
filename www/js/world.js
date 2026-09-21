@@ -9,6 +9,7 @@ import { createAvatar, disposeAvatar, applyShape, applyPose, applyBakedTextures,
 import { AvatarAnimations } from "./avatar/animation.js";
 import { DEFAULT_ANIMS } from "./avatar/anim-data.js";
 import { PrimBatcher } from "./batch.js";
+import { decodeMeshHeader, decodeMeshLod, lodForDetail, nearestLod, MESH_LODS } from "./mesh.js";
 
 export const QUALITY = { low: 2, medium: 3, high: 4, ultra: 5 };
 
@@ -65,6 +66,15 @@ export class World {
     // The session registers a sculpt requester here (sculpt maps go through the
     // ordinary texture queue, but the world needs their *pixels*).
     this.onSculptNeeded = null;
+    // Mesh assets (the `LLMESH` asset a mesh prim points at). The compressed
+    // bytes are kept — they are what a LOD gets decoded from — and the decoded
+    // LODs are built on demand and bounded, because a region full of meshes
+    // decoded four ways each would be gigabytes.
+    this.meshAssets = new Map();    // uuid -> { uuid, bytes, info, decoded, pending }
+    this.meshAsked = new Set();     // mesh assets already requested from the grid
+    this.meshErrors = [];           // why a mesh could not be used (for the report)
+    this.meshStats = { assets: 0, drawn: 0, waiting: 0, failed: 0 };
+    this.onMeshNeeded = null;
   }
 
   /** True when this prim's shape comes from a map rather than from profile×path. */
@@ -99,6 +109,106 @@ export class World {
     } catch (e) {
       return false;
     }
+  }
+
+  /**
+   * A decoded-and-usable mesh asset. `bytes` stays around because each LOD is
+   * inflated on demand: a prim only ever draws one LOD, and keeping all four for
+   * every mesh in a region would cost far more memory than it is worth.
+   * Returns false when the bytes are not a mesh asset at all (an error page, a
+   * partial download) so the caller can count it as a failure instead of
+   * pretending the object was drawn.
+   */
+  setMeshAsset(uuid, bytes) {
+    if (!uuid || !bytes || !bytes.length) return false;
+    let info;
+    try {
+      info = decodeMeshHeader(bytes);
+    } catch (e) {
+      if (this.meshErrors.length < 6) this.meshErrors.push(`${uuid.slice(0, 8)}: ${(e && e.message) || e}`);
+      return false;
+    }
+    if (!info.lods.length) {
+      if (this.meshErrors.length < 6) this.meshErrors.push(`${uuid.slice(0, 8)}: el activo no trae ningún LOD`);
+      return false;
+    }
+    const previous = this.meshAssets.get(uuid);
+    const asset = { uuid, bytes, info, decoded: previous ? previous.decoded : new Map(), pending: new Set() };
+    this.meshAssets.set(uuid, asset);
+    this.meshAsked.add(uuid);
+    this.meshStats.assets = this.meshAssets.size;
+    this.rebuildMeshesFor(uuid);
+    return true;
+  }
+
+  /** Whether a mesh asset has arrived (used by the diagnostics panel). */
+  hasMeshAsset(uuid) {
+    return this.meshAssets.has(uuid);
+  }
+
+  /** Rebuilds every prim whose shape comes from this asset. */
+  rebuildMeshesFor(uuid) {
+    for (const rec of this.objects.values()) {
+      if (rec.params && rec.params.sculptId === uuid && World.sculptKind(rec.params) === "mesh") {
+        this.rebuildPrim(rec);
+      }
+    }
+  }
+
+  /**
+   * The drawable faces of a mesh prim: the faces of the LOD its `detail` asks
+   * for, or of the nearest LOD that is decoded while the wanted one inflates.
+   * A null answer means "nothing to draw yet" — the prim stays empty rather than
+   * being shown as its base cube, which is what a region full of fake boxes
+   * looks like.
+   */
+  meshFacesFor(rec) {
+    const id = rec.params && rec.params.sculptId;
+    if (!id) return null;
+    const asset = this.meshAssets.get(id);
+    if (!asset) return null;
+    const want = nearestLod(asset.info.lods, lodForDetail(rec.detail));
+    if (!want) return null;
+    let used = want;
+    let faces = asset.decoded.get(want);
+    if (!faces) {
+      this._requestMeshLod(asset, want);
+      for (const name of MESH_LODS) {
+        const alt = asset.decoded.get(name);
+        if (alt) { faces = alt; used = name; break; }
+      }
+    }
+    if (!faces) return null;
+    // Empty (`NoGeometry`) slots and degenerate submeshes carry no triangles;
+    // they are dropped here but their index is preserved in `face.id`, which is
+    // what the object's texture faces are keyed by.
+    const drawable = faces.filter((f) => !f.empty && f.vertexCount > 0 && f.indices.length >= 3);
+    if (!drawable.length) return null;
+    return { faces: drawable, mesh: true, lod: used, lodFull: used === want };
+  }
+
+  _requestMeshLod(asset, lod) {
+    if (asset.pending.has(lod) || asset.decoded.has(lod)) return;
+    asset.pending.add(lod);
+    decodeMeshLod(asset.bytes, asset.info, lod)
+      .then((faces) => {
+        asset.pending.delete(lod);
+        if (!faces || !faces.length) return;
+        asset.decoded.set(lod, faces);
+        // Two decoded LODs per asset is the working set (the one being drawn and
+        // the one being switched to); older ones are dropped.
+        while (asset.decoded.size > 2) {
+          const oldest = asset.decoded.keys().next().value;
+          if (oldest === lod) break;
+          asset.decoded.delete(oldest);
+        }
+        this.rebuildMeshesFor(asset.uuid);
+      })
+      .catch((e) => {
+        asset.pending.delete(lod);
+        this.meshStats.failed++;
+        if (this.meshErrors.length < 6) this.meshErrors.push(`${asset.uuid.slice(0, 8)} ${lod}: ${(e && e.message) || e}`);
+      });
   }
 
   /**
@@ -276,10 +386,15 @@ export class World {
    * phone report always agree with the scene.
    */
   refreshSculptStats() {
-    const s = { sculpted: 0, drawn: 0, waiting: 0, degenerate: 0, mesh: 0 };
+    const s = { sculpted: 0, drawn: 0, waiting: 0, degenerate: 0, mesh: 0, meshDrawn: 0, meshWaiting: 0, meshAssets: this.meshAssets.size };
     for (const rec of this.objects.values()) {
       const kind = rec.shapeKind || World.sculptKind(rec.params);
-      if (kind === "mesh") { s.mesh++; continue; }
+      if (kind === "mesh") {
+        s.mesh++;
+        if (rec.vol) s.meshDrawn++;
+        else s.meshWaiting++;
+        continue;
+      }
       if (kind !== "sculpt") continue;
       s.sculpted++;
       if (rec.vol) s.drawn++;
@@ -361,11 +476,10 @@ export class World {
     const group = new THREE.Group();
     rec.group = group;
     rec.detail = rec.detail || this.detailFor(rec);
-    // Sculpted prims: the geometry comes from the sculpt map (a texture), so the
-    // prim cannot be drawn until that map has been decoded. Mesh prims carry a
-    // mesh asset instead of a shape, which this viewer does not decode yet —
-    // drawing either one as its base cube is exactly what "un sinfín de
-    // geometrías extrañas" looks like, so neither is drawn.
+    // Sculpted prims get their geometry from a sculpt map (a texture) and mesh
+    // prims from an `LLMESH` asset. Neither can be drawn until that data has
+    // been decoded, and drawing the base cube in the meantime is exactly what
+    // "un sinfín de geometrías extrañas" looks like, so neither is drawn.
     const kind = World.sculptKind(rec.params);
     rec.shapeKind = kind;
     let vol = null;
@@ -381,6 +495,13 @@ export class World {
         // is already on its way (or already known to be missing).
         this.sculptAsked.add(id);
         this.onSculptNeeded(id);
+      }
+    } else if (kind === "mesh") {
+      const id = rec.params.sculptId;
+      vol = this.meshFacesFor(rec);
+      if (!vol && id && this.onMeshNeeded && !this.meshAsked.has(id)) {
+        this.meshAsked.add(id);
+        this.onMeshNeeded(id);
       }
     }
     rec.vol = vol;

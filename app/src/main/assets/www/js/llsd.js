@@ -360,14 +360,18 @@ export function serializeLLSDNotation(v) {
 // Binary
 // ---------------------------------------------------------------------------
 
+// Everything the binary form writes is BIG-ENDIAN — the viewer reads lengths
+// and integers through `ntohl` and reals through `ll_ntohd` — and a map, like an
+// array, carries its element count before the elements. Reading either of those
+// the other way makes a binary LLSD body parse into garbage instead of failing.
 class BinReader {
   constructor(bytes) { this.d = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength); this.p = 0; }
   u8() { return this.d.getUint8(this.p++); }
-  u16() { const v = this.d.getUint16(this.p, true); this.p += 2; return v; }
-  u32() { const v = this.d.getUint32(this.p, true); this.p += 4; return v; }
-  u64() { const v = this.d.getBigUint64(this.p, true); this.p += 8; return Number(v); }
-  i32() { const v = this.d.getInt32(this.p, true); this.p += 4; return v; }
-  f64() { const v = this.d.getFloat64(this.p, true); this.p += 8; return v; }
+  u16() { const v = this.d.getUint16(this.p, false); this.p += 2; return v; }
+  u32() { const v = this.d.getUint32(this.p, false); this.p += 4; return v; }
+  u64() { const v = this.d.getBigUint64(this.p, false); this.p += 8; return Number(v); }
+  i32() { const v = this.d.getInt32(this.p, false); this.p += 4; return v; }
+  f64() { const v = this.d.getFloat64(this.p, false); this.p += 8; return v; }
   str(n) { let s = ""; for (let i = 0; i < n; i++) s += String.fromCharCode(this.d.getUint8(this.p + i)); this.p += n; return s; }
   uuid() { const h = this.str(16); const s = [...h].map(c => c.charCodeAt(0).toString(16).padStart(2, "0")).join(""); return `${s.slice(0,8)}-${s.slice(8,12)}-${s.slice(12,16)}-${s.slice(16,20)}-${s.slice(20)}`; }
   bytes(n) { const a = new Uint8Array(n); for (let i = 0; i < n; i++) a[i] = this.d.getUint8(this.p + i); this.p += n; return a; }
@@ -382,14 +386,14 @@ export function parseLLSDBinary(bytes) {
 }
 
 function readBin(r) {
-  let count, tag;
+  let count;
   switch (r.u8()) {
     case 0x21: return null;
     case 0x31: return r.u8() !== 0;
     case 0x69: return r.i32();
     case 0x72: return r.f64();
     case 0x75: return r.uuid();
-    case 0x64: { const n = r.i32(); const s = r.str(n * 8); return s; }
+    case 0x64: return r.f64();
     case 0x6c: case 0x73: { const n = r.i32(); return r.str(n); }
     case 0x62: { const n = r.i32(); return r.bytes(n); }
     case 0x5b: {
@@ -401,21 +405,28 @@ function readBin(r) {
     }
     case 0x7b: {
       const map = {};
-      for (;;) {
-        tag = r.u8();
-        if (tag === 0x6b) { const k = readBin(r); map[k] = readBin(r); }
-        else if (tag === 0x7d) break;
-        else throw new Error("LLSD binary: bad map token");
+      count = r.i32();
+      for (let i = 0; i < count; i++) {
+        // A map key is `k` + length + bytes: unlike a value string it carries
+        // no `s` tag (LLSDBinaryFormatter::formatMap / parseString).
+        if (r.u8() !== 0x6b) throw new Error("LLSD binary: se esperaba una clave en el mapa");
+        const n = r.i32();
+        if (n < 0) throw new Error("LLSD binary: clave de longitud negativa");
+        const k = r.str(n);
+        map[k] = readBin(r);
       }
+      if (r.u8() !== 0x7d) throw new Error("LLSD binary: mapa sin cierre");
       return map;
     }
     default: throw new Error("LLSD binary: unknown type");
   }
 }
 
-export function serializeLLSDBinary(v) {
+export function serializeLLSDBinary(v, opts = {}) {
   const out = [];
-  const push32 = (n) => { out.push(n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >> 24) & 255); };
+  // Big-endian: this is the one detail of the binary form that a reader is
+  // entitled to assume.
+  const push32 = (n) => { out.push((n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255); };
   const pushStr = (s) => { for (const ch of s) out.push(ch.charCodeAt(0) & 255); };
   function write(v) {
     if (v instanceof Uint8Array) { out.push(0x62); push32(v.length); for (const b of v) out.push(b); return; }
@@ -423,7 +434,7 @@ export function serializeLLSDBinary(v) {
     if (typeof v === "boolean") { out.push(0x31, v ? 1 : 0); return; }
     if (typeof v === "number") {
       if (Number.isInteger(v)) { out.push(0x69); push32(v); }
-      else { out.push(0x72); const d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, v, true); for (let i = 0; i < 8; i++) out.push(d.getUint8(i)); }
+      else { out.push(0x72); const d = new DataView(new ArrayBuffer(8)); d.setFloat64(0, v, false); for (let i = 0; i < 8; i++) out.push(d.getUint8(i)); }
       return;
     }
     if (typeof v === "string") {
@@ -432,11 +443,19 @@ export function serializeLLSDBinary(v) {
       out.push(0x73); push32(v.length); pushStr(v); return;
     }
     if (Array.isArray(v)) { out.push(0x5b); push32(v.length); for (const it of v) write(it); out.push(0x5d); return; }
-    out.push(0x7b);
-    for (const k of Object.keys(v)) { out.push(0x6b); write(k); write(v[k]); }
+    out.push(0x7b); push32(Object.keys(v).length);
+    // A map key gets its length but NOT the `s` value tag
+    // (LLSDBinaryFormatter::formatMap writes `k` + length + bytes).
+    for (const k of Object.keys(v)) {
+      out.push(0x6b); push32(k.length); pushStr(k); write(v[k]);
+    }
     out.push(0x7d);
   }
   write(v);
+  // A mesh/`navmesh` block inside a container is the same encoding WITHOUT the
+  // `LLSD` magic and version byte — the header and every LOD block of an
+  // LLMESH asset start straight at the first tag.
+  if (opts.header === false) return new Uint8Array(out);
   return new Uint8Array([0x4c, 0x4c, 0x53, 0x44, 0x01, ...out]);
 }
 

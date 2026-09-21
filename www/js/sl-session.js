@@ -9,7 +9,7 @@ import {
 } from "./message-template.js";
 import { Circuit, buildMessage, decodeMessage } from "./udp.js";
 import { httpRequest, openUdp, hasUdp, platformInfo, netInfo, udpProbe, sessionService } from "./transport.js";
-import { cacheKey, readCached, writeCached, dropCached, cacheMode, CACHE_REV, looksLikeImage } from "./cache.js";
+import { cacheKey, readCached, writeCached, dropCached, cacheMode, CACHE_REV, looksLikeImage, looksLikeMesh } from "./cache.js";
 import { parseTextureEntry } from "./texture-entry.js";
 import { decodeTerrainLayer, LAYER_TYPE_LAND } from "./terrain.js";
 import {
@@ -69,6 +69,9 @@ const AGENT_UPDATE_HZ = 10;
 // holds its codestream, its decoded pixels and (while it is decoded) part of the
 // wasm heap all at once.
 const MAX_TEXTURE_INFLIGHT = 4;
+// Mesh assets are big and few (a handful of distinct meshes make up most of a
+// region once the repeats collapse), and each one is inflated after it lands.
+const MAX_MESH_INFLIGHT = 2;
 const QUIET_IN = /^(PacketAck|StartPingCheck|CompletePingCheck|ObjectUpdate|ObjectUpdateCached|ImprovedTerseObjectUpdate|CoarseLocationUpdate|SimStats|ViewerStats|ParcelOverlay|ChatFromSimulator|ObjectProperties|AvatarAnimation)$/;
 const PING_INTERVAL = 5000;
 const RESEND_INTERVAL = 300;
@@ -159,6 +162,16 @@ export class SLSession {
     this.textureCache = new Map();
     this.textureQueue = [];
     this.textureInFlight = 0;
+    // Mesh assets (LLMESH) have their own queue: they are bigger and fewer than
+    // textures, and a mesh that arrives late should never have to wait behind a
+    // hundred 64x64 wall textures.
+    this.meshPending = new Set();
+    this.meshQueue = [];
+    this.meshInFlight = 0;
+    // Assets the viewer already has in memory: what the app ships, and what a
+    // harness (the offline demo, the fake grid) injects so a region can be shown
+    // without a grid at all.
+    this.localAssets = new Map();
     this.pingID = 0;
     this.stats = { objects: 0, skipped: 0, messages: 0, bytesIn: 0, textures: 0 };
     this.traceIn = 0;
@@ -363,6 +376,9 @@ export class SLSession {
         this.sculptWanted.add(uuid);
         this.requestTexture(uuid);
       };
+      // A mesh prim asks for its asset the same way, but the asset is not a
+      // texture: it has its own queue (and its own decoder).
+      this.app.world.onMeshNeeded = (uuid) => this.requestMesh(uuid);
     }
     this.send("UseCircuitCode", {
       CircuitCode: { Code: this.circuitCode, SessionID: this.sessionID, ID: this.agentID },
@@ -674,12 +690,20 @@ export class SLSession {
         this.teleportPending = null;
         this.status("Teletransporte cancelado.");
         return;
-      case "CrossedRegion":
-        // Crossing a border is *not* a teleport: the simulator moves the agent
-        // and hands over the new region the same way, so it takes the same path.
+      case "CrossedRegion": {
+        // Crossing a border is not a teleport, but the handover is identical:
+        // the new region sends its address and seed capability and the agent is
+        // moved there the same way. Ignoring it — which this handler used to do
+        // — leaves the viewer behind at the border with the old region's world
+        // and nothing new ever arrives.
+        const crossInfo = Array.isArray(body.Info) ? body.Info[0] : body.Info;
         this.status("Cruzando a otra región…");
-        this.teleportPending = this.teleportPending || { crossing: true };
-        return;
+        this.log("CrossedRegion: el simulador entrega la región de destino" +
+          (crossInfo && crossInfo.SeedCapability ? " con seed capability" : "") +
+          " (la posición exacta llega con AgentMovementComplete).");
+        this.teleportPending = { crossing: true };
+        return this.onTeleportFinish(body, "CrossedRegion");
+      }
       case "TeleportFailed":
         this.teleportPending = null;
         this.status("El teletransporte falló: " + (body.Reason || "motivo desconocido"));
@@ -722,6 +746,140 @@ export class SLSession {
   }
 
   /**
+   * Region name -> grid coordinates, straight from the simulator.
+   *
+   * `MapNameRequest` is the message the official viewer's map floater sends when
+   * a name is typed into its search box; the simulator answers with a
+   * `MapBlockReply` whose `Data` blocks carry X, Y and the canonical region name
+   * — `llworldmap.cpp` (`sendMapNameRequest`) upstream, and exactly the fields
+   * Lumiya's `MapBlockReply` unpacks. It is also the message that fills the map
+   * with region names, so both the search and the map come from the same place.
+   *
+   * Doing this over UDP is the point. The previous implementation scraped
+   * `maps.secondlife.com`, so "find a region" depended on a third-party web page
+   * being reachable *and* parseable from inside the app — which is why the phone
+   * said "no encuentro la región". Here there is no web request at all: no CORS,
+   * no User-Agent to get wrong, no HTML to change under us.
+   *
+   * The simulator streams the matching regions as it finds them, so the search
+   * settles either on an exact name hit or after `settle` ms of quiet. Resolves
+   * with an array of `{name, gx, gy, access, flags, agents}` (exact match first).
+   */
+  searchRegionsByName(name, opts = {}) {
+    const query = String(name || "").trim();
+    if (this.state !== "online" || !this.circuit) return Promise.reject(new Error("sin conexión al grid"));
+    if (!query) return Promise.reject(new Error("escribe un nombre de región"));
+    const settle = opts.settle || 1500;
+    const timeout = opts.timeout || 15000;
+    const norm = (s) => String(s).toLowerCase().replace(/\s+/g, " ").trim();
+    const wanted = norm(query);
+    if (!this.mapSearches) this.mapSearches = new Map();
+    const key = "n:" + wanted;
+    const existing = this.mapSearches.get(key);
+    if (existing) return existing.promise;
+    let resolve, reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    const rec = { query, wanted, rows: new Map(), settle, resolve, reject, promise, settleTimer: null, timeoutTimer: null };
+    rec.finish = () => {
+      clearTimeout(rec.settleTimer);
+      clearTimeout(rec.timeoutTimer);
+      this.mapSearches.delete(key);
+      const rows = [...rec.rows.values()];
+      rows.sort((a, b) => {
+        const an = norm(a.name) === wanted ? 0 : 1, bn = norm(b.name) === wanted ? 0 : 1;
+        return an - bn || a.name.localeCompare(b.name);
+      });
+      this.log(`Búsqueda de región «${query}»: ${rows.length} coincidencia(s)` +
+        (rows.length ? ` — ${rows.slice(0, 5).map((r) => `${r.name} (${r.gx},${r.gy})`).join(", ")}` : "") + ".");
+      resolve(rows);
+    };
+    rec.timeoutTimer = setTimeout(() => {
+      if (!rec.rows.size) {
+        this.mapSearches.delete(key);
+        reject(new Error("el simulador no devolvió ninguna región con ese nombre"));
+      } else rec.finish();
+    }, timeout);
+    this.mapSearches.set(key, rec);
+    try {
+      // Flags 0xffff is what the official viewer sends; the simulator fills in
+      // EstateID/Godlike itself (they are documented as "filled in on sim").
+      this.send("MapNameRequest", {
+        AgentData: { AgentID: this.agentID, SessionID: this.sessionID, Flags: 0xffff, EstateID: 0, Godlike: false },
+        NameData: { Name: query },
+      });
+      this.log(`Búsqueda de región «${query}»: MapNameRequest enviado al simulador (sin pasar por la web).`);
+    } catch (e) {
+      clearTimeout(rec.timeoutTimer);
+      this.mapSearches.delete(key);
+      return Promise.reject(e);
+    }
+    return promise;
+  }
+
+  /** Regions inside a rectangle of GRID coordinates (not metres) — the map's own browse. */
+  requestMapBlock(minX, minY, maxX, maxY) {
+    if (this.state !== "online" || !this.circuit) return false;
+    const u16 = (v) => Math.max(0, Math.min(65535, Math.floor(Number(v) || 0)));
+    try {
+      this.send("MapBlockRequest", {
+        AgentData: { AgentID: this.agentID, SessionID: this.sessionID, Flags: 0xffff, EstateID: 0, Godlike: false },
+        PositionData: { MinX: u16(minX), MaxX: u16(maxX), MinY: u16(minY), MaxY: u16(maxY) },
+      });
+      return true;
+    } catch (e) {
+      this.log("MapBlockRequest: " + ((e && e.message) || e));
+      return false;
+    }
+  }
+
+  /**
+   * MapBlockReply carries both kinds of answer: the regions matching a
+   * MapNameRequest and the regions inside a MapBlockRequest rectangle. They go
+   * to the pending searches and to `onMapBlock` (the map panel) respectively.
+   */
+  onMapBlockReply(data) {
+    const rows = (data && data.Data) || [];
+    const norm = (s) => String(s).toLowerCase().replace(/\s+/g, " ").trim();
+    const list = rows.map((r) => ({
+      name: toText(r.Name),
+      gx: r.X | 0,
+      gy: r.Y | 0,
+      access: r.Access | 0,
+      flags: r.RegionFlags | 0,
+      agents: r.Agents | 0,
+      water: r.WaterHeight | 0,
+      mapImage: r.MapImageID && r.MapImageID.length ? uuidString(r.MapImageID) : null,
+    })).filter((r) => r.name);
+    if (!list.length) return;
+    this.mapBlockResults = list;
+    if (this.onMapBlock) { try { this.onMapBlock(list); } catch (e) { /* the panel is best-effort */ } }
+    if (!this.mapSearches || !this.mapSearches.size) return;
+    for (const rec of [...this.mapSearches.values()]) {
+      let exact = false;
+      for (const r of list) {
+        const n = norm(r.name);
+        if (n === rec.wanted || n.includes(rec.wanted)) {
+          rec.rows.set(n, r);
+          if (n === rec.wanted) exact = true;
+        }
+      }
+      if (exact) { rec.finish(); return; }
+      if (rec.rows.size && !rec.settleTimer) rec.settleTimer = setTimeout(rec.finish, rec.settle);
+    }
+  }
+
+  /** Drops every pending map search (circuit change, disconnect). */
+  clearMapSearches(reason = "") {
+    if (!this.mapSearches) return;
+    for (const rec of this.mapSearches.values()) {
+      clearTimeout(rec.settleTimer);
+      clearTimeout(rec.timeoutTimer);
+      rec.reject(new Error(reason || "se cambió de región"));
+    }
+    this.mapSearches.clear();
+  }
+
+  /**
    * Teleport to a region by GRID coordinate with a LOCAL position inside it.
    * `TeleportLocationRequest` is exactly what the official viewer sends for a
    * SLURL: a region handle, a position *local to that region* and a look-at
@@ -731,7 +889,7 @@ export class SLSession {
    * a TeleportFinish LLSD event on the CAPS event queue carrying the destination
    * simulator's address — that is what `moveToSim` follows up on.
    */
-  teleportToRegion(gridX, gridY, local = [128, 128, 25]) {
+  teleportToRegion(gridX, gridY, local = [128, 128, 25], name = "") {
     if (this.state !== "online" || !this.circuit || !this.udp) {
       this.log("Sin conexión: no se puede teletransportar.");
       return false;
@@ -739,8 +897,10 @@ export class SLSession {
     const gx = Math.max(0, Math.floor(Number(gridX) || 0));
     const gy = Math.max(0, Math.floor(Number(gridY) || 0));
     const pos = [clampRegion(local[0]), clampRegion(local[1]), Math.max(0, Number(local[2]) || 25)];
+    const handle = this.regionHandleFor(gx, gy);
     this.teleportPending = { gridX: gx, gridY: gy, local: pos, at: Date.now() };
-    this.log(`TP: teletransporte a la región (${gx}, ${gy}) en [${pos.map((v) => v.toFixed(0)).join(", ")}]…`);
+    this.log(`TP: teletransporte${name ? ` a «${name}»` : ""} a la región (${gx}, ${gy}) en [${pos.map((v) => v.toFixed(0)).join(", ")}]` +
+      ` · RegionHandle 0x${handle.toString(16)} …`);
     this.status("Teletransportando…");
     try {
       this.send("TeleportLocationRequest", {
@@ -820,20 +980,20 @@ export class SLSession {
    * body is `{ Info: [ { SimIP, SimPort, SeedCapability, ... } ] }` — note the
    * array, which is easy to miss (and then the address reads as undefined).
    */
-  onTeleportFinish(body) {
+  onTeleportFinish(body, label = "TeleportFinish") {
     const info = Array.isArray(body.Info) ? body.Info[0] : (body.Info || body);
     const host = ipString(info && info.SimIP);
     const port = Number(info && info.SimPort) || 0;
     if (!host || !port) {
-      this.log(`⚠ TeleportFinish sin dirección utilizable (IP ${JSON.stringify(info && info.SimIP)}, puerto ${info && info.SimPort}).`);
+      this.log(`⚠ ${label} sin dirección utilizable (IP ${JSON.stringify(info && info.SimIP)}, puerto ${info && info.SimPort}).`);
       this.status("El teletransporte llegó incompleto.");
       return;
     }
     const target = this.teleportPending;
     this.teleportPending = null;
     clearTimeout(this._tpTimer);
-    this.log(`TeleportFinish: simulador de destino ${host}:${port}` +
-      (target && !target.crossing ? ` (región ${target.gridX}, ${target.gridY})` : "") +
+    this.log(`${label}: simulador de destino ${host}:${port}` +
+      (target && target.gridX != null ? ` (región ${target.gridX}, ${target.gridY})` : "") +
       (info && info.SeedCapability ? " · con seed capability" : " · sin seed capability"));
     this.moveToSim(host, port, info && info.SeedCapability ? String(info.SeedCapability) : null, target)
       .catch((e) => {
@@ -867,6 +1027,7 @@ export class SLSession {
     for (const id of [...this.pendingTextures]) this.pendingTextures.delete(id);
     this.textureQueue.length = 0;
     this.textureInFlight = 0;
+    this.clearMapSearches("se cambió de región");
     this.compressedSeen = 0;
     this.compressedTailMisses = 0;
     this.builtPrims = 0;
@@ -925,6 +1086,7 @@ export class SLSession {
       case "TeleportFailed": return this.onTeleportFailed(data);
       case "TeleportLocal": return this.onTeleportLocal(data);
       case "TeleportFinish": return this.onTeleportFinish(data);
+      case "MapBlockReply": return this.onMapBlockReply(data);
       case "UUIDNameReply": return this.onUUIDNameReply(data);
       case "AgentDataUpdate": return this.onAgentDataUpdate(data);
       case "AvatarAppearance": return this.onAvatarAppearance(data);
@@ -1405,11 +1567,100 @@ export class SLSession {
     }
   }
 
+  // -- mesh assets ---------------------------------------------------------
+  //
+  // A mesh prim's shape is an `LLMESH` asset, named by the prim's SculptID (the
+  // protocol reuses the sculpt parameter for it: the server sends
+  // `PARAMS_MESH`, the viewer re-labels it `PARAMS_SCULPT`, and the low three
+  // bits of the "sculpt type" are 5). The asset is fetched from the region's
+  // GetMesh capability and cached on the device, because it is by far the most
+  // expensive thing a region sends: hundreds of prims can share one asset, and
+  // the same asset comes back on every visit.
+
+  meshCap() {
+    // GetMesh is the classic capability; a region that only advertises
+    // ViewerAsset serves meshes through that.
+    return this.caps.GetMesh || this.caps.ViewerAsset || null;
+  }
+
+  requestMesh(uuid) {
+    if (!uuid || !this.meshCap()) return;
+    if (this.meshPending.has(uuid) || (this.app.world && this.app.world.hasMeshAsset(uuid))) return;
+    this.meshPending.add(uuid);
+    this.meshQueue.push(uuid);
+    this.pumpMeshes();
+  }
+
+  pumpMeshes() {
+    while (this.meshInFlight < MAX_MESH_INFLIGHT && this.meshQueue.length) {
+      const uuid = this.meshQueue.shift();
+      this.meshInFlight++;
+      this.fetchMesh(uuid)
+        .catch(() => {})
+        .then(() => {
+          this.meshPending.delete(uuid);
+          this.meshInFlight--;
+          this.pumpMeshes();
+        });
+    }
+  }
+
+  async fetchMesh(uuid) {
+    const base = this.meshCap();
+    if (!base) return;
+    const url = String(base).replace(/\/+$/, "") + "/?mesh_id=" + uuid;
+    const key = cacheKey("mesh", uuid);
+    let bytes = this.localAssets && this.localAssets.get(uuid);
+    let from = "local";
+    if (!bytes) {
+      bytes = await readCached(key);
+      from = "caché";
+      if (bytes && !looksLikeMesh(bytes)) {
+        this.cacheDropped = (this.cacheDropped || 0) + 1;
+        this.log(`Malla ${uuid.slice(0, 8)}: la copia guardada no es un activo de malla (${bytes.length} B, primeros bytes: ${hexHead(bytes, 8)}); se borra.`);
+        await dropCached(key);
+        bytes = null;
+      }
+    }
+    if (!bytes) {
+      // Announce the asset type: a region that cannot serve `LLMESH` should say
+      // so rather than hand back an error page that only fails later.
+      const res = await this.http({ url, timeout: 90000, headers: { Accept: "application/vnd.ll.mesh" } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      bytes = res.bytes;
+      from = "grid";
+      if (!bytes.length) throw new Error("respuesta vacía");
+      if (!looksLikeMesh(bytes)) {
+        this.stats.meshFailures = (this.stats.meshFailures || 0) + 1;
+        throw new Error(`no parece una malla (${bytes.length} B, tipo "${header(res.headers, "content-type")}", primeros bytes: ${hexHead(bytes, 8)})`);
+      }
+      await writeCached(key, bytes);
+    }
+    const ok = this.app.world ? this.app.world.setMeshAsset(uuid, bytes) : false;
+    if (ok) {
+      this.stats.meshes = (this.stats.meshes || 0) + 1;
+      if (this.stats.meshes <= 3) {
+        const asset = this.app.world.meshAssets.get(uuid);
+        const head = asset ? `${asset.info.lods.length} LOD${asset.info.materialList.length ? `, materiales ${asset.info.materialList.length}` : ""}` : "?";
+        this.log(`Malla ${uuid.slice(0, 8)}: ${bytes.length} B de ${from} · ${head}.`);
+      }
+    } else {
+      this.stats.meshFailures = (this.stats.meshFailures || 0) + 1;
+      const why = this.app.world && this.app.world.meshErrors.length
+        ? this.app.world.meshErrors[this.app.world.meshErrors.length - 1] : "no decodifica";
+      this.log(`⚠ Malla ${uuid.slice(0, 8)}: el activo llegó (${bytes.length} B de ${from}) pero no se pudo usar: ${why}`);
+    }
+  }
+
   textureReport() {
     const ok = this.stats.textures || 0;
     const bad = this.stats.textureFailures || 0;
     const pending = this.pendingTextures ? this.pendingTextures.size : 0;
     let line = `TEXTURAS: pedidas ${this.requests || this.stats.textures + bad + pending}, decodificadas ${ok}, fallidas ${bad}, en cola ${pending}`;
+    if (this.textureFormats && this.textureFormats.size) {
+      line += ` · formas del codestream: ${[...this.textureFormats.entries()].map(([k, v]) => `${k}:${v}`).join(", ")}` +
+        (this.textureMismatch ? ` (⚠ ${this.textureMismatch} sin geometría reconocible)` : "");
+    }
     if (bad && this.textureProblems && this.textureProblems.length) {
       line += ` · ejemplos: ${this.textureProblems.slice(0, 3).join(" | ")}`;
     }
@@ -1431,8 +1682,15 @@ export class SLSession {
         if (sc.sculpted || sc.mesh) {
           line += ` · esculturas: ${sc.drawn} dibujadas de ${sc.sculpted}` +
             (sc.waiting ? `, ${sc.waiting} esperando su mapa` : "") +
-            (sc.degenerate ? `, ${sc.degenerate} con mapa sin relieve` : "") +
-            (sc.mesh ? `, ${sc.mesh} mesh (sin decodificador de mallas todavía)` : "");
+            (sc.degenerate ? `, ${sc.degenerate} con mapa sin relieve` : "");
+        }
+        if (sc.mesh) {
+          line += ` · mallas: ${sc.meshDrawn} dibujadas de ${sc.mesh}` +
+            (sc.meshWaiting ? `, ${sc.meshWaiting} esperando su activo` : "") +
+            ` (${sc.meshAssets} activos, ${this.stats.meshes || 0} descargados` +
+            (this.stats.meshFailures ? `, ⚠ ${this.stats.meshFailures} fallidos` : "") + ")";
+          const errs = world.meshErrors && world.meshErrors.length ? world.meshErrors : null;
+          if (errs) line += ` · errores de malla: ${errs.slice(0, 2).join(" | ")}`;
         }
       }
       line += ` · avatares: ${avs} (con cuerpo ${bodies})` +
@@ -1488,6 +1746,16 @@ export class SLSession {
       const res = await decodeJ2CEx(bytes, maxSize, wantPng);
       this.lastDecoded = { png: res.png, srcWidth: res.srcWidth, srcHeight: res.srcHeight };
       this.textureSourceSize = `${res.srcWidth}x${res.srcHeight}`;
+      // Which codestream shapes the region actually sends. This is the line
+      // that distinguishes "the textures are arriving wrong" from "the decoder
+      // mis-reads them": 4-component codestreams are the ones that used to come
+      // out as colour stripes, so they are counted by name.
+      if (res.components) {
+        if (!this.textureFormats) this.textureFormats = new Map();
+        const key = `${res.bits || 8}b×${res.components}c`;
+        this.textureFormats.set(key, (this.textureFormats.get(key) || 0) + 1);
+      }
+      if (res.mismatch) this.textureMismatch = (this.textureMismatch || 0) + 1;
       return res.bitmap;
     } catch (e) {
       this.lastDecodeError = (e && e.message) || String(e);

@@ -156,7 +156,7 @@ y `connect`), `indra/newview/llxmlrpclistener.cpp` (`Poller`),
 | `slproto/messages/*` (400+ mensajes) | **genérico**: la plantilla los cubre todos; implementados los que usa el flujo actual |
 | `slproto/avatar/*`, `baker/*` (avatares, esqueleto, morphs, baking) | **hecho en lo esencial**: `avatar/params.js` (avatar_lad.xml + drivers), `avatar/skeleton.js` (avatar_skeleton.xml), `avatar/llm.js` (mallas y morphs), `avatar/skin.js` (pose + *skinning*) y `avatar/builder.js`; falta el *baking* propio (se usan las texturas baked que manda el simulador) |
 | `res/avatar/AnimationData`, `AnimationSkeletonData`, `AvatarAnimationList` (animaciones) | **portado**: `avatar/anim-data.js` (formato LLKeyframeMotion + paquete de 118 animaciones que trae la app) y `avatar/animation.js` (secuencias, ease-in/out, bucle, blend por prioridad). Falta el transfer UDP para animaciones que no vengan en el paquete |
-| `slproto/mesh/*`, `render/lumiya/drawable/*` (mallas, sculpt, render de prims) | **no**: sculpt/mesh pendientes (los `sculptId` se leen, no se dibujan) |
+| `slproto/mesh/*`, `render/lumiya/drawable/*` (mallas, sculpt, render de prims) | **portado en lo esencial (ronda 11)**: esculturas (`prims.js`, de `llvolume.cpp`) y **mallas `LLMESH`** (`mesh.js`: cabecera LLSD binaria + bloques zlib + submeshes/LOD, de `LLVolume::unpackVolumeFacesInternal` y `LLMeshRepository`), pedidas a la capacidad `GetMesh`. Falta el `llmeshoptimizer`/micro-optimizaciones y los prims **flexibles** |
 | `slproto/modules/rlv` (Restrained Life) | **no** |
 | `slproto/inventory/*`, `modules/xfer`, `transfer` (inventario, transferencias) | **no** |
 | `slproto/chat/*`, `users/*` (chat, IM, nombres, perfiles) | **parcial**: chat local, IM entrante/saliente, nombres; falta UI de conversaciones |
@@ -170,7 +170,7 @@ y `connect`), `indra/newview/llxmlrpclistener.cpp` (`Poller`),
 
 1. Probar el login real y arreglar lo que falle (ver `TODO.md`).
 2. ~~Decodificador JPEG2000 (texturas)~~ **hecho** (OpenJPEG wasm); texturas del terreno desde la región: hecho el camino, pendiente de ver en el grid.
-3. Sculpt maps y mallas (`GetMesh`): lo que queda de geometría.
+3. ~~Sculpt maps y mallas (`GetMesh`): lo que queda de geometría.~~ **Hecho en la ronda 11**: esculturas + mallas `LLMESH` decodificadas y dibujadas (queda el rendimiento de las mallas grandes: soltar geometría de activos sin prims visibles, y prims flexibles).
 4. ~~Avatares con esqueleto y apariencia~~ **hecho** (formas, morphs, escalas de hueso, texturas baked y animaciones con los 118 assets de Lumiya). Queda el *baking* propio y el transfer de animaciones no incluidas.
 5. **Transferencias de assets por UDP** (`TransferRequest`/`TransferInfo`/`TransferPacket` + acks): es lo que desbloquea animaciones subidas por residentes, y después el inventario/wearables.
 6. Inventario (capacidades `FetchInventory2`/`FetchLib2`) y ventana de ropa.

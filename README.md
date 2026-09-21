@@ -54,9 +54,11 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
   torsión, estrechamiento, inclinación, revoluciones, curvas de perfil/camino,
   revolución completa…) y, desde la ronda 10, **las esculturas**: la forma sale
   de un *sculpt map* (R,G,B → X,Y,Z) con la resolución, las costuras y los flags
-  del visor oficial. Un prim esculpido al que todavía no le ha llegado su mapa,
-  y un objeto *mesh* (malla que este visor aún no decodifica), **no se dibujan**
-  — antes se dibujaba su forma base y eso llenaba la región de cajas.
+  del visor oficial. Desde la ronda 11, **las mallas (`LLMESH`) se decodifican y
+  se dibujan** (`mesh.js`, pedidas por `GetMesh`): un objeto de malla ya no es un
+  hueco. Un prim esculpido al que todavía no le ha llegado su mapa, y un objeto
+  de malla cuyo activo aún no ha llegado, **no se dibujan** — antes se dibujaba
+  su forma base y eso llenaba la región de cajas.
 - **Buscador de tierras y teletransporte**: por nombre, SLURL o coordenadas de
   rejilla, con el mapa del grid, elección del punto exacto dentro de la región y
   `TeleportLocationRequest` → circuito nuevo en el simulador de destino.
@@ -325,7 +327,7 @@ Eso apuntaba a tres cosas distintas y se arreglaron las tres:
       con `SculptType = 5`) lleva una malla que este visor todavía no decodifica;
       dibujar su forma base llenaba la región de cajas blancas. Ahora se
       reconocen, se cuentan (salen en el informe) y simplemente no se dibujan,
-      como los mapas sin relieve.
+      como los mapas sin relieve. **En la ronda 11 sí se decodifican** (ver 2e).
 - [x] **Texturas: decodificación en paralelo y caché de píxeles.** El decodificador
       JPEG2000 pasa a un *pool* de hasta 3 hilos (`decoderWorkers()`), y el
       diagnóstico dice cuántos. La caché del móvil guarda el **PNG ya
@@ -357,6 +359,100 @@ Eso apuntaba a tres cosas distintas y se arreglaron las tres:
       CORS de `super-fetch-plugin` (los mosaicos del mapa exigen un `User-Agent`;
       el CDN contesta 403 sin él).
 
+## 2e. Ronda 11 — mallas, búsqueda de regiones por UDP y teletransporte
+
+El informe 7 del móvil seguía diciendo «todo roto sin sentido, sin estructuras ni
+texturas lógicas», y además: los teletransportes no llegaban y el buscador de
+regiones no encontraba nada. Se atacó cada causa por separado, leyendo cómo lo
+hace el visor oficial y Lumiya (que es lo que se ha usado como referencia):
+
+- [x] **JPEG2000: un *codestream* de 4 componentes se leía como RGBA entrelazado.**
+      El decodificador (OpenJPEG en wasm) reserva un búfer de
+      `ancho × alto × componentes` bytes pero **sólo escribe tripletas RGB** en
+      `x*3`: con 4 componentes, cada fila queda con los píxeles a 3 bytes de paso
+      dentro de filas de 4, y el último 25 % de la fila sin escribir. Leer eso
+      como RGBA entrelazado da exactamente lo que se veía en las capturas del
+      móvil: **rayas verticales de colores ciclados y una barra negra a la
+      derecha**. Ahora `j2c.js` lee la geometría real que escribió el
+      decodificador (`ancho*componentes*bytes` de paso por fila), los codestreams
+      de 16 bits o multicomponente se rechazan en vez de dibujarse, y la
+      revisión de caché (**r3**) tira las texturas guardadas por la versión mala.
+- [x] **Buscador de regiones por el protocolo, no raspando la web.** `MapNameRequest`
+      (405/408) → `MapBlockReply` (409) para el nombre → coordenadas de rejilla, y
+      `MapBlockRequest` (407) → `MapBlockReply` para llenar el mapa de nombres de
+      región. Se elige el primer camino (UDP) y sólo si la región no lo contesta
+      se cae a la web de mapas de antes.
+- [x] **Teletransporte: `CrossedRegion` no se atendía.** Cruzar el borde de una
+      región es un salto de región: el simulador manda `CrossedRegion` por UDP (no
+      `TeleportFinish` por la cola de eventos) y el visor lo ignoraba, así que el
+      avatar aparecía en el borde y el mundo se quedaba atrás. Ahora se enruta por
+      el mismo camino que `TeleportFinish`. Además `send()` es fiable por
+      defecto, como en Lumiya (`teleportLocationRequest.isReliable = true`).
+- [x] **LLSD binario, corregido entero.** El lector era *little-endian*, los mapas
+      no llevaban recuento y las claves iban con etiqueta `s`. El formato real
+      (visor oficial, `LLSDBinaryParser`/`LLSDBinaryFormatter`) es **big-endian**,
+      el mapa lleva recuento (`LLSDBinaryFormatter::formatMap`) y la clave es
+      `k` + longitud + nombre. Nada de esto se notaba antes porque no se leía
+      ningún LLSD binario… hasta que hizo falta leer una malla.
+- [x] **Mallas (`LLMESH`) de verdad: `mesh.js`.** Cabecera LLSD binaria con la
+      tabla de bloques + bloques comprimidos con zlib, port de
+      `LLVolume::unpackVolumeFacesInternal` y `LLMeshRepository::headerReceived`:
+      posiciones/normales/UVs cuantizadas contra su `*Domain`, lista de
+      triángulos, `NoGeometry` conservado (la cara `i` del `TextureEntry` es el
+      material `i`) y elección de LOD con reserva. El activo se pide a **`GetMesh`**
+      (`/?mesh_id=…`), en su propia cola y con caché en el dispositivo, y **un prim
+      de malla cuyo activo aún no ha llegado no se dibuja** (nunca una caja de
+      relleno). `World.meshFacesFor` reutiliza toda la tubería de prims
+      (geometría compartida por activo+LOD, materiales por cara, batching).
+- [x] **`mesh-encode.js` escribe activos reales**, así que el mismo formato se
+      prueba de los dos lados: el autotest (97/97) y el arnés local
+      (`?test=grid`, que sirve una casa de dos materiales y una caja por su
+      `GetMesh`) comprueban el decodificador **contra un codificador**, no contra
+      un muñeco. El demo offline (`?test=demo`) tiene también dos edificios de
+      malla, sin grid ninguno.
+- [x] **Dos caras de la caja salían del revés** (`boxMesh`): las caras ±Y se
+      emitían con el orden de vértices invertido, así que el descarte de caras
+      posteriores se las comía y una caja se veía como **una sola pared**. Las
+      formas del arnés lo delataron (una «casa» sin tres de sus cuatro paredes).
+      Es el mismo tipo de fallo que producía «estructuras sin sentido», sólo que
+      en el codificador de pruebas en vez de en el decodificador.
+- [x] **Tejado a dos aguas en vez de pirámide cuadrada.** El tejado anterior era
+      un cuadrado de 6,4 m sobre una caja de 6 × 4: sobresalía más que el propio
+      edificio y dejaba una rendija entre tejado y pared. Ahora es un tejado a
+      dos aguas (`prismRoofMesh`, dos faldones + dos hastiales) con el alero
+      metido 6 cm dentro de la caja, que es como se hacen de verdad.
+- [x] **Las mallas van en metros, y el prim las multiplica** (como el cargador
+      de SL: el vértice se guarda en metros y la `scale` del objeto lo escala).
+      Los mapas de escultura, en cambio, están normalizados a −0,5…0,5. Tenerlo
+      escrito evita el error simétrico de «escalar una malla como una escultura»,
+      que fue justo lo que produjo un edificio de 25 m en el arnés.
+- [x] **Bug del *batcher* al reutilizar el mundo.** `PrimBatcher.dispose()` sacaba
+      su grupo de la escena y no lo volvía a poner: tras `world.dispose()` todos
+      los prims nuevos quedaban marcados como fusionados en una celda (y por tanto
+      ocultos) sin que nadie dibujara las celdas fusionadas. Se veía como una
+      isla con terreno y **ni un solo objeto**. Ahora se reengancha
+      (`attach()`), lo que además arregla `?test=demo`.
+- [x] Versión **1.6.0 (build 7)**.
+
+Comprobado en el editor, en el simulador falso (`?test=grid`), no sólo en los
+tests unitarios:
+
+- el **camino completo del teletransporte por la interfaz** (panel *Lands* →
+  «Sandbox Cordova» → *Buscar* → *Teletransportar*): la búsqueda resuelve
+  (1004, 1006) por UDP, la petición sale con `RegionHandle`, y llega
+  `TeleportStart` → `TeleportFinish` con *seed capability*; la región nueva
+  termina de llegar con sus 44 prims y el agente en 122, 122, 31.
+- La **búsqueda por nombre** por sí sola: «Harness» → 2 regiones, «Sandbox
+  Cordova» → 1, las dos por `MapNameRequest`/`MapBlockReply`.
+- El **mundo del simulador falso** visto con la herramienta de captura: terreno
+  con relieve, objetos sólidos, un edificio con tejado a dos aguas, 13–15 prims
+  distinguibles, ninguno flotante ni con geometría rota (las texturas del arnés
+  son degradados sintéticos a propósito).
+- El **arnés de esculturas** (`?test=sculpt`): esfera, toro, lámina ondulada,
+  cilindro, toro espejado y una casa de malla, todos sólidos y sobre el suelo;
+  los dos casos que **no** deben dibujarse (mapa sin relieve, malla sin activo)
+  no dibujan nada.
+
 ## 3. Arquitectura (código)
 
 | fichero | papel |
@@ -370,6 +466,8 @@ Eso apuntaba a tres cosas distintas y se arreglaron las tres:
 | `src/web/js/diag.js` | diagnóstico en el dispositivo (GPU, funciones, archivos, decodificador, contadores vivos) |
 | `src/web/js/cache.js` | política de la caché en disco: revisión (invalida lo guardado), modo sin caché, comprobación y autoreparación |
 | `src/web/js/prims.js` | motor de geometría de prims (port de Lumiya), **incluidas las esculturas** (`buildVolume`/`sculptMeshResolution`, port de `llvolume.cpp`) |
+| `src/web/js/mesh.js` | activo **`LLMESH`** (`.llm`): cabecera LLSD binaria + bloques zlib + submeshes/LOD → geometría (port de `unpackVolumeFacesInternal` y `LLMeshRepository`) |
+| `src/web/js/mesh-encode.js` | escribe activos `LLMESH` reales (casa/caja/multimaterial): lo usan el demo offline y los tests, para probar el decodificador contra un codificador |
 | `src/web/js/terrain.js` | terreno (BitBuffer, DCT, `Terrain`, malla) |
 | `src/web/js/texture-entry.js` | parseo de TextureEntry + matrices UV |
 | `src/web/js/textures.js` | texturas procedurales + `TextureLibrary` (claves `gen:*` y UUID) |
@@ -400,7 +498,7 @@ Eso apuntaba a tres cosas distintas y se arreglaron las tres:
 | `src/web/vendor/three.module.min.js` | three.js r169 (vendorizado) |
 | `src/web/vendor/openjpeg/` | OpenJPEG wasm (decodificador J2C/JPEG2000 real; `openjpegwasm_decode.js` + `.wasm`) |
 | `src/tools/pack.mjs` | empaqueta `visor-sl-app.zip` a partir de estas fuentes |
-| `src/tools/proto-selftest.mjs` | 76 pruebas del protocolo (ver abajo) |
+| `src/tools/proto-selftest.mjs` | 97 pruebas del protocolo (ver abajo) |
 | `src/android/**` | proyecto Gradle + WebView + `NativeBridge` (UDP/HTTP) |
 | `src/ci/build-apk.yml` | workflow de GitHub Actions |
 
@@ -446,7 +544,7 @@ que se importa antes de llamarla):
 
 ```js
 await import("./src/tools/proto-selftest.mjs");
-await window.runVisorSelfTest();   // → 76/76 correctas
+await window.runVisorSelfTest();   // → 97/97 correctas
 
 // Estrés de render (llena la región de prims con texturas y mide fps y llamadas
 // de dibujo): lo que se usa antes de tocar perf.js/batch.js.
@@ -454,7 +552,7 @@ const stress = await import("./src/web/js/test/stress.js");
 await stress.runStress(window.visor, { count: 1200, seconds: 5 });
 ```
 
-Comprueba **76 cosas** sin necesidad de cuenta: que la plantilla tiene 483
+Comprueba **97 cosas** sin necesidad de cuenta: que la plantilla tiene 483
 mensajes, que los números de mensaje son **byte a byte** los mismos que los de
 Lumiya (descubiertos en el código decompilado), que `ChatFromViewer` coincide con
 la referencia, que `AgentUpdate` mide 115 bytes, ida y vuelta de paquetes con
@@ -470,15 +568,24 @@ enteros, `token`/`mfa_hash`) y su reto MFA, lectura de respuestas LLSD (XML plan
 del simulador y notación), LLSD binary y un **ObjectUpdate completo byte a byte**
 más su decodificación; y desde la ronda 6, **animaciones** (cabecera, ease-in/out,
 prioridad por hueso, fotogramas de rotación en punto fijo → cuaternión y de
-posición ±5 m).
+posición ±5 m); y desde la ronda 11, **mallas** (cabecera LLSD binaria con sus
+bloques medidos desde el final de la cabecera, un cubo decodificado a 24 vértices
+y 12 triángulos con las posiciones de vuelta en su dominio, normales unitarias y
+UVs en 0..1, una ranura `NoGeometry` conservada para no desplazar los materiales,
+la cabecera de texto obsoleta, la elección de LOD con reserva) y el **LLSD
+binario** comprobado byte a byte contra el formato real (big-endian, recuento en
+el mapa, clave sin etiqueta `s`).
 
 Además hay un **simulador falso** para probar el camino completo del grid sin
 cuenta ni red: abre el visor con `?test=grid` (o `await
 import("./src/web/js/test/fake-grid.js").then(m => m.runFakeGrid(window.visor))`)
 y el visor se conecta a un simulador en memoria que responde login XML-RPC,
-capacidades, `GetTexture` (JPEG2000 real), EventQueueGet y envía RegionHandshake,
-4× LayerData (256 parches), ~40 prims comprimidos, ObjectUpdate con TextureEntry,
-dos avatares (con nombre), KillObject y pings — más un agente que camina.
+capacidades, `GetTexture` (**JPEG2000 real, y la mitad de 4 componentes — el
+mismo `codestream` RGBA que producía las rayas**), **`GetMesh` (un activo
+`LLMESH` real, escrito con `mesh-encode.js`)**, EventQueueGet y envía
+RegionHandshake, 4× LayerData (256 parches), ~40 prims comprimidos, dos objetos
+de malla (casa de dos materiales y caja), ObjectUpdate con TextureEntry, dos
+avatares (con nombre), KillObject y pings — más un agente que camina.
 Añadiendo **`&tp=gx,gy`** el arnés hace un **teletransporte completo** (petición →
 `TeleportStart` por UDP → `TeleportFinish` en la cola de eventos → circuito y
 región nuevos) y lo deja escrito en el registro.
