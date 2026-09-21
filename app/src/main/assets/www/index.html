@@ -1,0 +1,23 @@
+<link rel="stylesheet" href="css/app.css">
+<canvas id="view"></canvas>
+<div id="hud"></div>
+<div id="boot">
+  <div class="bootbox">
+    <div class="logo">Visor&nbsp;SL</div>
+    <div class="sub">motor de mundo virtual en WebGL</div>
+    <div class="spin"></div>
+  </div>
+</div>
+<script type="module">
+  import { boot } from "./js/app.js";
+  try {
+    boot();
+    const b = document.getElementById("boot");
+    if (b) b.classList.add("gone");
+    setTimeout(() => { const x = document.getElementById("boot"); if (x) x.remove(); }, 600);
+  } catch (e) {
+    const b = document.getElementById("boot");
+    if (b) b.innerHTML = '<div class="bootbox"><div class="logo">Error</div><div class="sub">' + String(e && e.message || e) + "</div></div>";
+    console.error(e);
+  }
+</script>

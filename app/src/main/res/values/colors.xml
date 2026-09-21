@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- Colores de la app. De momento solo el fondo del icono de lanzador. -->
-<resources>
-    <color name="ic_launcher_background">#0E1626</color>
-</resources>

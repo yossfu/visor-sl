@@ -1,14 +1,3 @@
-# Este archivo se coloca en `.github/workflows/build-apk.yml` del repositorio.
-# GitHub solo compila si el archivo esta EXACTAMENTE en esa ruta y al principio
-# del arbol, por eso en el codigo fuente vive como `workflow-build-apk.yml`
-# (la carpeta `src/` del proyecto perchance no admite nombres que empiecen por
-# punto) y el script que arma el repositorio lo renombra.
-#
-# Resultado: cada vez que subes cambios, o cuando le das al boton "Run workflow"
-# en la pestana Actions, GitHub compila la app en sus servidores y deja un
-# archivo `visor-sl-apk` descargable. No hace falta Android Studio ni SDK en tu
-# ordenador: GitHub ya lo tiene todo puesto.
-
 name: Compilar APK
 
 on:
@@ -17,7 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  apk:
+  build:
+    name: Compilar APK (Visor SL)
     runs-on: ubuntu-latest
     steps:
       - name: Descargar el codigo
@@ -29,24 +19,27 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Preparar el visor dentro de la app
-        run: node build-viewer.mjs
+      - name: Preparar el SDK de Android
+        uses: android-actions/setup-android@v3
 
-      # Mete DENTRO del APK el modelo real del cuerpo de sistema de Second Life
-      # (mallas avatar_*.llm + texturas base), que es lo que hace que el avatar
-      # se deforme igual que en SL. Si la descarga falla, el paso no rompe la
-      # compilacion: el visor los pedira por red en tiempo de ejecucion.
-      - name: Incluir el modelo del avatar real (cuerpo de sistema)
-        run: node fetch-character-assets.mjs
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
-      - name: Compilar el APK
-        run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Compilar el APK de depuracion
+        run: gradle assembleDebug --no-daemon --stacktrace
 
-      - name: Dejar el APK para descargar
+      - name: Compilar tambien el APK de release (firmado con la clave de depuracion)
+        run: gradle assembleRelease --no-daemon
+        continue-on-error: true
+
+      - name: Publicar el APK como artefacto descargable
         uses: actions/upload-artifact@v4
         with:
           name: visor-sl-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+          retention-days: 90

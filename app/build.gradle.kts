@@ -4,20 +4,28 @@ plugins {
 }
 
 android {
-    namespace = "org.visor.sl"
+    namespace = "net.visorsl.viewer"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "org.visor.sl"
+        applicationId = "net.visorsl.viewer"
         minSdk = 24
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = 1
+        versionName = "1.0.0"
     }
 
     buildTypes {
-        getByName("release") {
+        debug {
+            applicationIdSuffix = ".debug"
             isMinifyEnabled = false
+        }
+        release {
+            isMinifyEnabled = false
+            isShrinkResources = false
+            // Signed with the debug key so `assembleRelease` also produces an
+            // installable APK straight from GitHub Actions (no secrets needed).
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -25,19 +33,14 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-
     kotlinOptions {
         jvmTarget = "17"
     }
-
-    packaging {
-        resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
-        }
+    buildFeatures {
+        buildConfig = true
     }
 }
 
 dependencies {
-    // Unico peso externo: el servidor WebSocket local del retransmisor interno.
-    implementation("org.java-websocket:Java-WebSocket:1.5.7")
+    implementation("androidx.webkit:webkit:1.11.0")
 }
