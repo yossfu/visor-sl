@@ -304,6 +304,26 @@ function blockItems(obj, block) {
   return [];
 }
 
+// Lists the scalar fields the template expects but the object does not provide
+// (they would be encoded as zeros). Catches name mismatches between the code and
+// message_template.msg, which are otherwise invisible on the wire.
+const SIZE_FIELD_TYPES = new Set(["Fixed", "Variable"]);
+
+export function missingFields(def, obj) {
+  const out = [];
+  const data = obj || {};
+  for (const block of def.blocks) {
+    const items = block.countType === "Single" ? [data[block.name] || {}] : blockItems(data, block);
+    for (const item of items) {
+      for (const f of block.fields) {
+        if (SIZE_FIELD_TYPES.has(f.type)) continue;
+        if (item[f.name] === undefined || item[f.name] === null) out.push(`${block.name}.${f.name}`);
+      }
+    }
+  }
+  return out;
+}
+
 export function encodeBody(def, obj) {
   const out = [];
   const data = obj || {};
@@ -371,6 +391,10 @@ export function decodeBody(def, bytes, offset = 0) {
   return { data: result, bytesRead: pos - offset };
 }
 
+// Port of zero_code() from Linden's lltemplatemessagebuilder.cpp: a run of N
+// zero bytes becomes `00 <N>`, and a run longer than 254 wraps by emitting the
+// count again (so 256 zeros == `00 FF 00 01`). The packeted header (6 bytes) is
+// copied verbatim before this runs.
 export function zeroEncode(src) {
   const out = [];
   let run = 0;
@@ -380,8 +404,8 @@ export function zeroEncode(src) {
       if (run !== 0) {
         out.push(run);
         run = 0;
-        marked = false;
       }
+      marked = false;
       out.push(b);
     } else {
       if (!marked) {
@@ -389,9 +413,10 @@ export function zeroEncode(src) {
         marked = true;
       }
       run++;
-      if (run === 255) {
+      if (run > 254) {
         out.push(run);
         run = 0;
+        marked = false;
       }
     }
   }

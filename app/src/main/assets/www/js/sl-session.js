@@ -5,7 +5,7 @@
 import { LLSD } from "./llsd.js";
 import { md5Hex } from "./md5.js";
 import {
-  parseMessageTemplate, buildIndex, wireNumber, uuidString, toBytes, toText,
+  parseMessageTemplate, buildIndex, wireNumber, uuidString, toBytes, toText, missingFields,
 } from "./message-template.js";
 import { Circuit, buildMessage, decodeMessage } from "./udp.js";
 import { httpRequest, openUdp, hasUdp, platformInfo } from "./transport.js";
@@ -114,6 +114,8 @@ export class SLSession {
     this.textureCache = new Map();
     this.pingID = 0;
     this.stats = { objects: 0, skipped: 0, messages: 0, bytesIn: 0 };
+    this.traceIn = 0;
+    this.traceOut = 0;
     this.timers = [];
     this.lastStatusAt = 0;
   }
@@ -232,7 +234,11 @@ export class SLSession {
       throw new Error("UDP no disponible en el navegador (usa el APK de Visor SL).");
     }
     this.status(`Abriendo circuito UDP con ${host}:${port}…`);
+    if (!this.circuitCode) {
+      this.log("⚠ El login no devolvió circuit_code: el simulador ignorará los paquetes.");
+    }
     this.udp = await openUdp(host, port);
+    this.log(`UDP abierto (puerto local ${this.udp.localPort || "?"}).`);
     this.circuit = new Circuit((bytes) => this.udp.send(bytes));
     this.udp.onMessage((bytes) => this.onDatagram(bytes));
     this.udp.onError((e) => this.log("UDP: " + e.message));
@@ -241,6 +247,7 @@ export class SLSession {
     this.template = parseMessageTemplate(await fetch(templateUrl).then((r) => r.text()));
     this.defs = new Map(this.template.map((d) => [d.name, d]));
     this.index = buildIndex(this.template);
+    this.log(`Plantilla cargada: ${this.template.length} mensajes.`);
     if (this.app.world) {
       this.app.world.texlib.uuidLoader = (uuid) => {
         if (this.textureCache.has(uuid) || this.pendingTextures.has(uuid)) return;
@@ -251,6 +258,33 @@ export class SLSession {
     this.send("UseCircuitCode", {
       CircuitCode: { Code: this.circuitCode, SessionID: this.sessionID, ID: this.agentID },
     });
+    this.startHandshakeWatchdog();
+  }
+
+  // Retries the first handshake message while nothing has come back from the
+  // simulator, so a lost datagram (or a sim that ignores the first one) does
+  // not leave the viewer stuck on "Abriendo circuito UDP…" forever.
+  startHandshakeWatchdog() {
+    let tries = 0;
+    const timer = setInterval(() => {
+      const c = this.circuit;
+      if (!c || c.stats.received > 0 || tries >= 5) {
+        clearInterval(timer);
+        return;
+      }
+      tries++;
+      this.log(`Sin respuesta del simulador (${c.stats.sent} enviados, ${c.stats.bytesIn} B recibidos, ${c.unacked.size} sin confirmar). Reintento ${tries}/5.`);
+      if (tries === 5) {
+        this.log("El simulador no contesta por UDP. El login funcionó, así que es la red: muchas redes móviles/wifi de empresa bloquean UDP saliente. Prueba con datos móviles.");
+        return;
+      }
+      try {
+        this.send("UseCircuitCode", {
+          CircuitCode: { Code: this.circuitCode, SessionID: this.sessionID, ID: this.agentID },
+        });
+      } catch (_) { /* ignore */ }
+    }, 5000);
+    this.timers.push(timer);
   }
 
   def(name) {
@@ -260,23 +294,52 @@ export class SLSession {
   }
 
   send(name, body, opts) {
-    return this.circuit.sendMessage(this.def(name), body, opts);
+    const def = this.def(name);
+    if (!this.fieldChecked) this.fieldChecked = new Set();
+    if (!this.fieldChecked.has(name)) {
+      this.fieldChecked.add(name);
+      const miss = missingFields(def, body || {});
+      if (miss.length) this.log(`⚠ ${name}: el código no rellena ${miss.join(", ")} (se envían a cero).`);
+    }
+    const packet = this.circuit.sendMessage(def, body, opts);
+    if (this.traceOut < 10) {
+      this.traceOut++;
+      if (this.traceOut <= 2) {
+        const hex = [...packet].map((b) => b.toString(16).padStart(2, "0")).join(" ");
+        this.log(`→ ${name} (${packet.length} B): ${hex}`);
+      } else {
+        this.log(`→ ${name} (${packet.length} B)`);
+      }
+    }
+    return packet;
   }
 
   onDatagram(bytes) {
-    const packet = this.circuit.handlePacket(bytes);
-    const def = this.index.get(packet.messageNumber);
-    this.stats.messages++;
-    this.stats.bytesIn += bytes.length;
-    if (!def) return;
-    let decoded;
     try {
-      decoded = decodeMessage(def, packet);
+      const packet = this.circuit.handlePacket(bytes);
+      const def = this.index.get(packet.messageNumber);
+      this.stats.messages++;
+      this.stats.bytesIn += bytes.length;
+      if (this.traceIn < 12) {
+        this.traceIn++;
+        this.log(`← ${bytes.length} B #${packet.messageNumber}${def ? " " + def.name : " (desconocido)"}`);
+      }
+      if (!def) return;
+      let decoded;
+      try {
+        decoded = decodeMessage(def, packet);
+      } catch (e) {
+        this.log(`No se pudo leer ${def.name}: ${e.message}`);
+        return;
+      }
+      try {
+        this.handle(def.name, decoded.data, packet);
+      } catch (e) {
+        this.log(`Error procesando ${def.name}: ${e.message}`);
+      }
     } catch (e) {
-      this.log(`No se pudo leer ${def.name}: ${e.message}`);
-      return;
+      this.log("Datagrama ilegible: " + e.message);
     }
-    this.handle(def.name, decoded.data, packet);
   }
 
   startLoops() {

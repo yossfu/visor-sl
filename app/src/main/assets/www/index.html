@@ -11,24 +11,37 @@
 <script>
   (function () {
     window.visorBooted = false;
-    function show(text) {
-      if (window.visorBooted) return;
-      var b = document.getElementById("boot");
+    function showBootError(text) {
+      const b = document.getElementById("boot");
       if (!b) return;
       b.classList.remove("gone");
       b.innerHTML =
         '<div class="bootbox"><div class="logo">Error</div><div class="sub">' +
         String(text) + "</div></div>";
     }
+    function report(text) {
+      const msg = String(text);
+      if (!window.visorBooted) { showBootError(msg); return; }
+      const log = document.getElementById("log");
+      if (log) {
+        const line = document.createElement("div");
+        line.className = "line";
+        line.textContent = "⚠ " + msg;
+        log.appendChild(line);
+        while (log.children.length > 60) log.removeChild(log.firstChild);
+        log.scrollTop = log.scrollHeight;
+      }
+      console.error("[visor]", msg);
+    }
     function describe(e) {
       if (!e) return "error desconocido";
-      var t = e.target;
+      const t = e.target;
       if (t && (t.src || t.href)) return "no se pudo cargar " + (t.src || t.href);
-      var err = e.error || e.reason;
+      const err = e.error || e.reason;
       return String(e.message || (err && (err.message || err)) || err || e);
     }
-    window.addEventListener("error", function (e) { show(describe(e)); }, true);
-    window.addEventListener("unhandledrejection", function (e) { show(describe(e)); });
+    window.addEventListener("error", function (e) { report(describe(e)); }, true);
+    window.addEventListener("unhandledrejection", function (e) { report(describe(e)); });
   })();
 </script>
 <script type="module">

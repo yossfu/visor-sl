@@ -66,12 +66,19 @@ function nativeCall(fn, arg) {
   if (!bridge) return Promise.reject(new Error("puente nativo no disponible"));
   installSink();
   const id = "v" + ++counter;
+  const budget = (arg && arg.timeout ? arg.timeout : 15000) + 10000;
   return new Promise((resolve, reject) => {
-    pending.set(id, resolve);
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`el puente nativo no respondió a ${fn} en ${Math.round(budget / 1000)}s`));
+    }, budget);
+    const done = (value) => { clearTimeout(timer); resolve(value); };
+    pending.set(id, done);
     let ack;
     try {
       ack = bridge[fn](JSON.stringify(Object.assign({ id }, arg)));
     } catch (e) {
+      clearTimeout(timer);
       pending.delete(id);
       reject(e);
       return;
@@ -79,6 +86,7 @@ function nativeCall(fn, arg) {
     try {
       const parsed = typeof ack === "string" ? JSON.parse(ack) : ack;
       if (parsed && parsed.ok === false) {
+        clearTimeout(timer);
         pending.delete(id);
         reject(new Error(parsed.error || "error nativo"));
       }
@@ -140,6 +148,7 @@ export class UdpChannel {
   constructor(id) {
     this.id = id;
     this.closed = false;
+    this.localPort = 0;
     this.handlers = { message: null, error: null, close: null };
     this.stats = { in: 0, out: 0, bytesIn: 0, bytesOut: 0 };
   }
@@ -184,8 +193,9 @@ export async function openUdp(host, port) {
   const ch = new UdpChannel(id);
   channels.set(id, ch);
   try {
-    const res = await nativeCall("udpOpen", { id, host, port });
+    const res = await nativeCall("udpOpen", { id, host, port, timeout: 5000 });
     if (!res.ok) throw new Error(res.error || `no se pudo abrir UDP ${host}:${port}`);
+    ch.localPort = res.localPort || 0;
   } catch (e) {
     udpSinks.delete(id);
     channels.delete(id);
