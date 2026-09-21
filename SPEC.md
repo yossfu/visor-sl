@@ -53,10 +53,23 @@ android.net.ConnectivityManager$TooManyRequestsException
   no puede teselarlos todos. Se mantiene una "residencia" de ~900 prims cercanos
   y el resto espera como metadatos; es el equivalente ligero a las listas de
   interés del visor oficial.
-- **Sin WorkManager / sin dependencias pesadas de Android**: sólo
-  `androidx.webkit` para servir los assets por `WebViewAssetLoader`
-  (origen `https://appassets.androidplatform.net/`), lo que permite usar
-  módulos ES, `fetch` y service workers sin restricciones de `file://`.
+- **Sin WorkManager / sin dependencias pesadas de Android**: cero dependencias
+  (`dependencies {}`). MainActivity sirve el visor con un interceptor propio
+  (`shouldInterceptRequest` → `assets/www`) sobre el origen
+  `https://appassets.androidplatform.net/`, con MIME correctos para módulos ES.
+  `WebViewAssetLoader` se descartó porque quita el prefijo registrado del path
+  (sólo sirve ficheros en la raíz de `assets/`) y devuelve `text/plain` para
+  extensiones desconocidas, que el navegador rechaza al importar módulos.
+- **Diagnóstico en vez de adivinar**: como no hay forma de ver el móvil del
+  usuario, el visor trae sus propias pruebas (`runUdpDiagnosis`): red activa,
+  creación de socket UDP, un datagrama de control a un STUN público y un
+  `UseCircuitCode` real al simulador desde sockets desechables. Se ejecuta sola
+  tras 25 s de circuito mudo y cuando falla una conexión, y todo queda en el
+  registro copiable con ⧉ (el texto del modal no se puede copiar).
+- **Protocolo del puente nativo**: cada llamada lleva `id` (empareja la
+  respuesta) y, en UDP, `chan` (identifica el socket). Son campos distintos
+  porque mezclarlos dejaba todas las llamadas UDP esperando al timeout; ver
+  `README.md` § «Protocolo del puente nativo».
 
 ## Requisitos de entrega
 

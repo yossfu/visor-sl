@@ -73,6 +73,13 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
   ObjectUpdate (PCode 47) y CoarseLocationUpdate.
 - **HUD**: fps/tris/prims/objetos, inspector de prims en vivo, panel de mundo,
   registro/chat, modal de login.
+- **Diagnóstico de red/UDP** (botón ⧉ del registro y «Diagnóstico de red y UDP» en
+  el menú ☰): informa de la red activa (wifi/datos/VPN), de si se puede crear un
+  socket UDP, y manda **un datagrama de control a un servidor STUN de Google y un
+  `UseCircuitCode` real al simulador** desde sockets desechables, diciendo cuál de
+  los dos contesta. Separa así «esta red bloquea el UDP» de «el simulador ignoró
+  nuestro paquete». Además se ejecuta solo cada vez que falla una conexión, y todo
+  queda en el registro copiable (el modal no se puede copiar).
 
 ## 3. Arquitectura (código)
 
@@ -97,7 +104,7 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
 | `src/web/data/message_template.msg` | plantilla de mensajes oficial de SL (241 KB) |
 | `src/web/vendor/three.module.min.js` | three.js r169 (vendorizado) |
 | `src/tools/pack.mjs` | empaqueta `visor-sl-app.zip` a partir de estas fuentes |
-| `src/tools/proto-selftest.mjs` | 24 pruebas del protocolo (ver abajo) |
+| `src/tools/proto-selftest.mjs` | 42 pruebas del protocolo (ver abajo) |
 | `src/android/**` | proyecto Gradle + WebView + `NativeBridge` (UDP/HTTP) |
 | `src/ci/build-apk.yml` | workflow de GitHub Actions |
 
@@ -105,6 +112,23 @@ Las rutas de esa tabla son las de la **carpeta de trabajo** (el `src/web/` del
 editor). En el zip y en el repositorio el visor vive en
 `app/src/main/assets/www/` (y una copia igual en `www/`), y los documentos
 `README.md`/`SPEC.md`/`TODO.md`/`LUMIYA.md` van en la raíz.
+
+### Protocolo del puente nativo (JS ↔ `NativeBridge.kt`)
+
+Cada llamada JS→nativo es un JSON con `id` y el nativo contesta con
+`window.visornative({id, ok, …})`. En las llamadas de UDP viajan **dos**
+identificadores distintos, a propósito:
+
+- `id`: identifica **la llamada** (lo pone `nativeCall()` en `transport.js` y el
+  nativo lo devuelve tal cual). Es la clave con la que JS empareja la respuesta.
+- `chan`: identifica **el socket UDP** (canal) y es la clave de
+  `udpChannels`/`channels` en los dos lados. Los datagramas entrantes viajan en
+  lotes (`kind:"udpBatch"`, uno cada ~20 ms) y cada elemento lleva su `chan`.
+
+Si el `id` del llamador pisara el de seguimiento, la respuesta nunca se
+emparejaría y **toda** llamada UDP se quedaría colgada hasta agotar el tiempo de
+espera — exactamente el fallo de la primera prueba real («Abriendo circuito UDP
+con …» y después «Desconectado.»). No volver a pasar `id` desde el llamador.
 
 ## 4. Pruebas
 
@@ -114,7 +138,7 @@ En el editor de Perchance (o en la consola del visor web):
 await window.runVisorSelfTest();
 ```
 
-Comprueba **31 cosas** sin necesidad de cuenta: que la plantilla tiene 483
+Comprueba **42 cosas** sin necesidad de cuenta: que la plantilla tiene 483
 mensajes, que los números de mensaje son **byte a byte** los mismos que los de
 Lumiya (descubiertos en el código decompilado), que `ChatFromViewer` coincide con
 la referencia, que `AgentUpdate` mide 115 bytes, ida y vuelta de paquetes con

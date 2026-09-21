@@ -126,14 +126,60 @@ export class App {
     try {
       reply = await this.session.login(opts);
     } catch (e) {
-      try { await this.session.disconnect(); } catch (_) {}
+      const s = this.session;
+      if (s) this.rememberDiag(s);
+      this.ui.log("⚠ No se pudo conectar: " + ((e && e.message) || e));
+      try { await s.disconnect(); } catch (_) {}
       this.session = null;
       throw e;
     }
+    this.rememberDiag(this.session);
     this.viewer.controls.focus(this.session.agentPos, 14);
     this.bindControls();
     this.ui.log("Controles: W/A/S/D moverse, Q/E subir-bajar, Espacio volar, Shift correr (en la app Android).");
     return reply;
+  }
+
+  rememberDiag(session) {
+    if (!session) return;
+    this.diag = {
+      host: session.simHost, port: session.simPort, circuitCode: session.circuitCode,
+      sessionID: session.sessionID, agentID: session.agentID,
+      region: session.regionName, agent: session.agentName,
+    };
+  }
+
+  /**
+   * Runs the network/UDP battery in the HUD log: active network, whether a UDP
+   * socket can be created at all, whether a public STUN server answers (does
+   * this network let UDP out?) and whether the simulator answers a real
+   * UseCircuitCode packet.
+   */
+  async diagnoseUdp() {
+    const mod = await import("./sl-session.js");
+    const s = this.session || new mod.SLSession(this, {});
+    if (!s.defs) {
+      try {
+        const t = await mod.loadMessageTemplate();
+        s.template = t.msgs;
+        s.defs = t.defs;
+        s.index = t.index;
+      } catch (e) {
+        this.ui.log("No se pudo cargar la plantilla de mensajes: " + ((e && e.message) || e));
+      }
+    }
+    if (this.diag) {
+      s.simHost = s.simHost || this.diag.host;
+      s.simPort = s.simPort || this.diag.port;
+      s.circuitCode = s.circuitCode || this.diag.circuitCode;
+      s.sessionID = s.sessionID || this.diag.sessionID;
+      s.agentID = s.agentID || this.diag.agentID;
+    }
+    this.ui.log("— Diagnóstico de red y UDP —");
+    if (!s.simHost) {
+      this.ui.log("Sin datos del simulador todavía: inicia sesión una vez y repite el diagnóstico.");
+    }
+    await s.runUdpDiagnosis();
   }
 
   async disconnect() {

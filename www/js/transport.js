@@ -4,7 +4,6 @@
 // Perchance super-fetch proxy for HTTP, and UDP is simply unavailable.
 
 const pending = new Map();
-const udpSinks = new Map();
 const channels = new Map();
 let counter = 0;
 let sinkInstalled = false;
@@ -49,9 +48,20 @@ function installSink() {
       return;
     }
     if (!msg || !msg.id) return;
+    if (msg.kind === "udpBatch") {
+      for (const item of msg.batch || []) deliverDatagram(item);
+      return;
+    }
     if (msg.kind === "udp") {
-      const sink = udpSinks.get(msg.id);
-      if (sink) sink(b64decode(msg.data), msg.from, msg.port);
+      deliverDatagram(msg);
+      return;
+    }
+    if (msg.kind === "udpSend") {
+      if (msg.ok === false) channelError(msg.id, "envío UDP: " + (msg.error || "error nativo"));
+      return;
+    }
+    if (msg.kind === "udpError") {
+      channelError(msg.id, msg.error || "error de recepción UDP");
       return;
     }
     const resolve = pending.get(msg.id);
@@ -61,12 +71,39 @@ function installSink() {
   };
 }
 
+function deliverDatagram(msg) {
+  const ch = channels.get(msg.chan || msg.id);
+  if (!ch) return;
+  let bytes;
+  try {
+    bytes = b64decode(msg.data);
+  } catch (e) {
+    return;
+  }
+  ch.stats.in++;
+  ch.stats.bytesIn += bytes.length;
+  if (ch.handlers.message) ch.handlers.message(bytes, msg.from, msg.port);
+}
+
+function channelError(key, text) {
+  const ch = channels.get(key);
+  if (ch && ch.handlers.error) ch.handlers.error(new Error(text));
+}
+
 function nativeCall(fn, arg) {
   const bridge = nativeBridge();
   if (!bridge) return Promise.reject(new Error("puente nativo no disponible"));
+  if (typeof bridge[fn] !== "function") {
+    return Promise.reject(new Error(`la app Android no tiene ${fn}() (APK antiguo: reinstala)`));
+  }
   installSink();
   const id = "v" + ++counter;
   const budget = (arg && arg.timeout ? arg.timeout : 15000) + 10000;
+  // `id` identifies THIS call so the reply can be matched; `chan` (if the caller
+  // set one) identifies a UDP socket. The tracking id must win: letting a
+  // caller-supplied `id` through silently broke every UDP call (the answer came
+  // back under the channel's id and was dropped).
+  const request = Object.assign({}, arg, { id });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pending.delete(id);
@@ -76,7 +113,7 @@ function nativeCall(fn, arg) {
     pending.set(id, done);
     let ack;
     try {
-      ack = bridge[fn](JSON.stringify(Object.assign({ id }, arg)));
+      ack = bridge[fn](JSON.stringify(request));
     } catch (e) {
       clearTimeout(timer);
       pending.delete(id);
@@ -88,7 +125,7 @@ function nativeCall(fn, arg) {
       if (parsed && parsed.ok === false) {
         clearTimeout(timer);
         pending.delete(id);
-        reject(new Error(parsed.error || "error nativo"));
+        reject(new Error(`${fn}: ${parsed.error || "error nativo"}`));
       }
     } catch (e) {
       /* ack is informational only */
@@ -157,7 +194,7 @@ export class UdpChannel {
     if (this.closed) return;
     this.stats.out++;
     this.stats.bytesOut += bytes.length;
-    nativeCall("udpSend", { id: this.id, data: b64encode(bytes) }).catch((e) => {
+    nativeCall("udpSend", { chan: this.id, data: b64encode(bytes) }).catch((e) => {
       if (this.handlers.error) this.handlers.error(e);
     });
   }
@@ -169,9 +206,8 @@ export class UdpChannel {
   close() {
     if (this.closed) return;
     this.closed = true;
-    udpSinks.delete(this.id);
     channels.delete(this.id);
-    nativeCall("udpClose", { id: this.id }).catch(() => {});
+    nativeCall("udpClose", { chan: this.id }).catch(() => {});
     if (this.handlers.close) this.handlers.close();
   }
 }
@@ -183,23 +219,37 @@ export async function openUdp(host, port) {
     );
   }
   const id = "u" + ++counter;
-  udpSinks.set(id, (bytes, from, fromPort) => {
-    const ch = channels.get(id);
-    if (!ch) return;
-    ch.stats.in++;
-    ch.stats.bytesIn += bytes.length;
-    if (ch.handlers.message) ch.handlers.message(bytes, from, fromPort);
-  });
   const ch = new UdpChannel(id);
   channels.set(id, ch);
   try {
-    const res = await nativeCall("udpOpen", { id, host, port, timeout: 5000 });
+    const res = await nativeCall("udpOpen", { chan: id, host, port, timeout: 8000 });
     if (!res.ok) throw new Error(res.error || `no se pudo abrir UDP ${host}:${port}`);
     ch.localPort = res.localPort || 0;
   } catch (e) {
-    udpSinks.delete(id);
     channels.delete(id);
     throw e;
   }
   return ch;
+}
+
+/**
+ * One datagram out of a throwaway socket, waiting for any reply. The HUD
+ * diagnostic uses it to separate "socket cannot be created" from "outbound UDP
+ * blocked" from "the simulator never answered".
+ */
+export async function udpProbe(host, port, bytes, waitMs = 4000) {
+  if (!hasNative()) throw new Error("puente nativo no disponible (hace falta el APK)");
+  return nativeCall("udpProbe", {
+    host, port, data: b64encode(bytes), waitMs, timeout: waitMs + 8000,
+  });
+}
+
+export function netInfo() {
+  const bridge = nativeBridge();
+  if (!bridge || typeof bridge.netInfo !== "function") return null;
+  try {
+    return JSON.parse(bridge.netInfo());
+  } catch (e) {
+    return { error: String(e && e.message ? e.message : e) };
+  }
 }

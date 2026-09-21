@@ -106,3 +106,29 @@ y `connect`), `indra/newview/llxmlrpclistener.cpp` (`Poller`),
 4. Avatares con esqueleto y apariencia (baking) — la parte más grande de Lumiya.
 5. Inventario y transferencias (Xfer) para wearables y objetos.
 6. UI de conversaciones (IM por residente, historial), grupos, minimapa.
+
+## 5. Puente nativo Android: dos identificadores, no uno
+
+Lumiya hablaba UDP directamente porque era una app Java. Aquí el motor vive en un
+WebView y el socket lo abre `NativeBridge.kt`, así que cada datagrama cruza la
+frontera JS↔Java. Lo que hay que respetar:
+
+- La llamada `@JavascriptInterface` **bloquea el hilo del renderer** mientras se
+  ejecuta, y el método corre en el hilo *JavaBridge*: por eso abrir el socket y
+  enviar se hacen en un pool propio (`udpPool`, un solo hilo → se conserva el
+  orden de los datagramas) y la respuesta se devuelve **empujando** un JSON a
+  `window.visornative(...)`. `nativeCall()` en `transport.js` empareja la
+  respuesta con la llamada por el campo `id`, y el socket por el campo `chan`.
+- **Ese emparejamiento fue el fallo de la primera prueba real**: el `id` del
+  llamador pisaba el de seguimiento, la respuesta de `udpOpen` llegaba con otra
+  clave y toda llamada UDP se quedaba esperando hasta el timeout (18 s), que en el
+  registro se veía como «Abriendo circuito UDP…» y luego «Desconectado.».
+- La recepción se acumula y se entrega en lotes (`kind:"udpBatch"`, uno cada
+  ~20 ms): un `evaluateJavascript` por datagrama no aguanta el caudal de un sim
+  con gente (cientos de paquetes por segundo).
+- Diagnóstico incorporado (`runUdpDiagnosis` en `sl-session.js`): red activa,
+  creación de socket, y **dos pruebas de ida y vuelta con sockets desechables** —
+  un STUN de Google (control: ¿la red deja salir UDP?) y un `UseCircuitCode` real
+  al simulador. Es la forma de distinguir un fallo de red de un fallo de paquete.
+  Se ejecuta sola cuando el circuito lleva 25 s sin recibir nada.
+

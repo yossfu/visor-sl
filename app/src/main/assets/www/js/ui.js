@@ -111,6 +111,7 @@ export class UI {
         b("Conectar a Second Life", () => this.showLogin()),
         b("Desconectar", () => this.app.disconnect()),
       ]),
+      b("Diagnóstico de red y UDP", () => this.app.diagnoseUdp().catch((e) => this.error(e.message))),
       el("h3", { text: "Texturas" }),
       el("div", { class: "hint", text: "El grid entrega texturas JPEG2000; si el decodificador no está disponible se muestra un color plano por textura." }),
       el("div", { class: "hint", text: "Conecta con tu cuenta de Second Life para entrar al mundo real (necesita el APK con el puente nativo para UDP)." }),
@@ -233,8 +234,17 @@ export class UI {
     this.logEl.scrollTop = this.logEl.scrollHeight;
   }
 
+  /** Logs a failure and remembers it so the ⧉ button always carries it. */
+  error(msg) {
+    const text = String(msg == null ? "" : msg);
+    this.lastError = text;
+    this.log("⚠ " + text);
+  }
+
   copyLog() {
-    const text = (this.logEl ? this.logEl.textContent : "").trim();
+    const lines = [...(this.logEl ? this.logEl.children : [])].map((c) => c.textContent.trim()).filter(Boolean);
+    let text = lines.join("\n");
+    if (this.lastError && !text.includes(this.lastError)) text += "\nÚLTIMO ERROR: " + this.lastError;
     const done = (ok) => this.log(ok ? "Registro copiado. Pégalo en el chat si algo falla." : "No se pudo copiar el registro.");
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
@@ -300,13 +310,22 @@ export class UI {
         close();
         return;
       } catch (e) {
+        const text = (e && e.message) || String(e);
         if (e && e.mfaHash) mfaHash = e.mfaHash;
         if (e && e.mfaChallenge) {
           status.textContent = "Escribe el código de verificación MFA y vuelve a pulsar Entrar.";
           token.value = "";
           token.focus();
-        } else {
-          status.textContent = "Error: " + ((e && e.message) || e);
+          return;
+        }
+        status.textContent = "Error: " + text;
+        this.error("Error al conectar: " + text);
+        // Leave a full trace of the failure in the log panel (the modal can't be
+        // copied) and check whether this network lets UDP out at all.
+        try {
+          await this.app.diagnoseUdp();
+        } catch (err) {
+          this.error("Diagnóstico: " + ((err && err.message) || err));
         }
       }
     };

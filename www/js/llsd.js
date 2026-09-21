@@ -441,7 +441,8 @@ export function serializeLLSDBinary(v) {
 }
 
 function parseText(raw) {
-  const text = String(raw == null ? "" : raw).trim();
+  let text = String(raw == null ? "" : raw).trim();
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1).trim();
   if (text.startsWith("<")) {
     if (/<methodResponse|<methodCall/.test(text.slice(0, 400))) return parseXmlRpc(text);
     return parseLLSDXML(text);

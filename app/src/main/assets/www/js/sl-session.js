@@ -8,7 +8,7 @@ import {
   parseMessageTemplate, buildIndex, wireNumber, uuidString, toBytes, toText, missingFields,
 } from "./message-template.js";
 import { Circuit, buildMessage, decodeMessage } from "./udp.js";
-import { httpRequest, openUdp, hasUdp, platformInfo } from "./transport.js";
+import { httpRequest, openUdp, hasUdp, platformInfo, netInfo, udpProbe } from "./transport.js";
 import { parseTextureEntry } from "./texture-entry.js";
 import { decodeTerrainLayer } from "./terrain.js";
 import {
@@ -81,6 +81,13 @@ function asUuid(value) {  if (!value) return null;
   const s = String(value).trim();
   if (/^[0-9a-fA-F-]{32,36}$/.test(s)) return s.length === 32 ? uuidString(Uint8Array.from(s.match(/../g).map((h) => parseInt(h, 16)))) : s;
   return null;
+}
+
+// The message template ships next to the viewer (data/message_template.msg).
+export async function loadMessageTemplate() {
+  const url = new URL("../data/message_template.msg", import.meta.url);
+  const msgs = parseMessageTemplate(await fetch(url).then((r) => r.text()));
+  return { msgs, defs: new Map(msgs.map((d) => [d.name, d])), index: buildIndex(msgs) };
 }
 
 export class SLSession {
@@ -219,9 +226,24 @@ export class SLSession {
 
   async loadCapabilities(seedUrl) {
     const res = await this.http({ url: seedUrl, headers: { Accept: "application/llsd+xml" } });
-    this.caps = LLSD.parse(res.text) || {};
-    const names = Object.keys(this.caps).filter((k) => k !== "seed_capability");
-    this.log(`Capacidades: ${names.length} (${names.slice(0, 6).join(", ")}…)`);
+    const raw = res.text || "";
+    let caps = null;
+    try {
+      caps = LLSD.parse(res.bytes && res.bytes.length ? res.bytes : raw);
+    } catch (e) {
+      this.log("Caps: no se pudo interpretar la respuesta: " + e.message);
+    }
+    if (!caps || typeof caps !== "object" || Array.isArray(caps) || caps instanceof Uint8Array) {
+      const head = String(raw).replace(/\s+/g, " ").slice(0, 140);
+      this.log(`⚠ Capacidades ilegibles (HTTP ${res.status}, ${raw.length} B): ${head}`);
+      this.caps = {};
+      return this.caps;
+    }
+    this.caps = caps;
+    const names = Object.keys(caps).filter((k) => k !== "seed_capability");
+    const key = ["EventQueueGet", "GetTexture", "FetchInventoryDescendents2", "GetDisplayNames"]
+      .filter((k) => caps[k]);
+    this.log(`Capacidades: ${names.length}${key.length ? " · " + key.join(", ") : ""}`);
     return this.caps;
   }
 
@@ -229,6 +251,8 @@ export class SLSession {
 
   async openCircuit(host, port) {
     if (!host || !port) throw new Error("El login no devolvió simulador (sim_ip/sim_port).");
+    this.simHost = host;
+    this.simPort = port;
     if (!hasUdp()) {
       this.status("Este navegador no puede abrir UDP: entra desde la app Android para ver el mundo real.");
       throw new Error("UDP no disponible en el navegador (usa el APK de Visor SL).");
@@ -237,17 +261,39 @@ export class SLSession {
     if (!this.circuitCode) {
       this.log("⚠ El login no devolvió circuit_code: el simulador ignorará los paquetes.");
     }
-    this.udp = await openUdp(host, port);
+    this.log("App: " + JSON.stringify(platformInfo()) + " · Red: " + JSON.stringify(netInfo()));
+    if (!this.defs) {
+      try {
+        const t = await loadMessageTemplate();
+        this.template = t.msgs;
+        this.defs = t.defs;
+        this.index = t.index;
+        this.log(`Plantilla cargada: ${this.template.length} mensajes.`);
+      } catch (e) {
+        this.log("⚠ No se pudo cargar la plantilla de mensajes: " + (e && e.message ? e.message : e));
+      }
+    }
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3 && !this.udp; attempt++) {
+      if (attempt > 1) this.log(`Intento ${attempt}/3 de abrir el socket UDP…`);
+      try {
+        this.udp = await openUdp(host, port);
+      } catch (e) {
+        lastError = e;
+        this.log(`⚠ Intento ${attempt}/3 de abrir el socket UDP: ${e && e.message ? e.message : e}`);
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 700));
+      }
+    }
+    if (!this.udp) {
+      const detail = lastError && lastError.message ? lastError.message : String(lastError);
+      this.log("No se pudo abrir el socket UDP. Detalle: " + detail);
+      throw new Error("Abrir UDP falló: " + detail);
+    }
     this.log(`UDP abierto (puerto local ${this.udp.localPort || "?"}).`);
     this.circuit = new Circuit((bytes) => this.udp.send(bytes));
     this.udp.onMessage((bytes) => this.onDatagram(bytes));
     this.udp.onError((e) => this.log("UDP: " + e.message));
     this.udp.onClose(() => this.log("Circuito UDP cerrado."));
-    const templateUrl = new URL("../data/message_template.msg", import.meta.url);
-    this.template = parseMessageTemplate(await fetch(templateUrl).then((r) => r.text()));
-    this.defs = new Map(this.template.map((d) => [d.name, d]));
-    this.index = buildIndex(this.template);
-    this.log(`Plantilla cargada: ${this.template.length} mensajes.`);
     if (this.app.world) {
       this.app.world.texlib.uuidLoader = (uuid) => {
         if (this.textureCache.has(uuid) || this.pendingTextures.has(uuid)) return;
@@ -273,9 +319,14 @@ export class SLSession {
         return;
       }
       tries++;
-      this.log(`Sin respuesta del simulador (${c.stats.sent} enviados, ${c.stats.bytesIn} B recibidos, ${c.unacked.size} sin confirmar). Reintento ${tries}/5.`);
+      const sock = this.udp && this.udp.stats ? this.udp.stats : { in: 0, bytesIn: 0 };
+      this.log(
+        `Sin respuesta del simulador (${c.stats.sent} enviados, socket: ${sock.in} datagramas/${sock.bytesIn} B, ` +
+        `circuito: ${c.stats.received} leídos, ${c.unacked.size} sin confirmar). Reintento ${tries}/5.`
+      );
       if (tries === 5) {
-        this.log("El simulador no contesta por UDP. El login funcionó, así que es la red: muchas redes móviles/wifi de empresa bloquean UDP saliente. Prueba con datos móviles.");
+        this.log("El simulador no contesta por UDP. Compruebo si la red deja salir UDP…");
+        this.runUdpDiagnosis().catch((e) => this.log("Diagnóstico: " + (e && e.message ? e.message : e)));
         return;
       }
       try {
@@ -285,6 +336,72 @@ export class SLSession {
       } catch (_) { /* ignore */ }
     }, 5000);
     this.timers.push(timer);
+  }
+
+  /**
+   * Sends one datagram to a public STUN server (a known-good UDP echo) and one
+   * real UseCircuitCode to the simulator, from throwaway sockets, and says which
+   * of the two came back. That separates "this network blocks outgoing UDP" from
+   * "the simulator ignored our packet".
+   */
+  async runUdpDiagnosis(opts = {}) {
+    if (!hasUdp()) {
+      this.log("Diagnóstico: sin puente nativo, aquí no hay UDP.");
+      return;
+    }
+    const net = netInfo();
+    if (net) this.log("Red: " + JSON.stringify(net));
+    this.log("App: " + JSON.stringify(platformInfo()));
+    const stun = Uint8Array.from([
+      0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42,
+      0x76, 0x69, 0x73, 0x6f, 0x72, 0x73, 0x6c, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+    ]);
+    let control = null;
+    try {
+      const r = await udpProbe("stun.l.google.com", 19302, stun, 4000);
+      if (!r.ok) {
+        this.log("Prueba de control (STUN de Google): FALLÓ al enviar: " + r.error);
+      } else if (r.received) {
+        control = true;
+        this.log(`Prueba de control (STUN de Google): OK, respuesta de ${r.from}:${r.fromPort} (${r.received} B).`);
+      } else {
+        control = false;
+        this.log(`Prueba de control (STUN de Google): enviado desde el puerto ${r.localPort} y SIN respuesta.`);
+      }
+    } catch (e) {
+      this.log("Prueba de control (STUN): " + (e && e.message ? e.message : e));
+    }
+    const circuitBusy = !!(this.circuit && this.circuit.stats.received > 0);
+    if (this.simHost && this.simPort && this.circuitCode && !circuitBusy && !opts.skipSim) {
+      try {
+        const pkt = this.buildUseCircuitCodePacket();
+        const r = await udpProbe(this.simHost, this.simPort, pkt, 6000);
+        if (!r.ok) {
+          this.log(`Simulador ${this.simHost}:${this.simPort}: FALLÓ al enviar: ${r.error}`);
+        } else if (r.received) {
+          this.log(`Simulador ${this.simHost}:${this.simPort}: respondió ${r.received} B desde ${r.from}:${r.fromPort}.`);
+        } else {
+          this.log(`Simulador ${this.simHost}:${this.simPort}: paquete UseCircuitCode de ${pkt.length} B enviado desde el puerto ${r.localPort} y SIN respuesta.`);
+        }
+      } catch (e) {
+        this.log("Simulador: " + (e && e.message ? e.message : e));
+      }
+    } else if (circuitBusy) {
+      this.log("El circuito ya está recibiendo datos: no mando la prueba por otro socket (rompería el circuito).");
+    }
+    if (control === false) {
+      this.log("Veredicto: esta red no deja salir UDP (ni Google responde). Prueba con datos móviles u otra wifi.");
+    } else if (control === true) {
+      this.log("Veredicto: UDP sale bien (Google responde desde este móvil), así que el problema es del paquete o del simulador, no de la red.");
+    }
+  }
+
+  buildUseCircuitCodePacket() {
+    const def = this.def("UseCircuitCode");
+    const probe = new Circuit(() => {});
+    return probe.sendMessage(def, {
+      CircuitCode: { Code: this.circuitCode, SessionID: this.sessionID, ID: this.agentID },
+    });
   }
 
   def(name) {
@@ -373,7 +490,10 @@ export class SLSession {
 
   startEventQueue() {
     const url = this.caps.EventQueueGet;
-    if (!url) return;
+    if (!url) {
+      this.log("Sin EventQueueGet: no habrá teletransporte ni mensajes en vivo.");
+      return;
+    }
     let ack = 0;
     const poll = async () => {
       while (this.state === "online") {

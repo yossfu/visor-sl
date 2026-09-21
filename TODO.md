@@ -5,20 +5,37 @@ una cuenta real en el grid.
 
 ## 0. Primera conexión real (comprobaciones)
 
-Ya cubierto y probado sin red (31/31 en `runVisorSelfTest`): struct XML-RPC del
-login idéntico al del visor oficial (Firestorm), usuario de una sola palabra →
-`last="Resident"`, reto MFA con `token`+`mfa_hash`, lectura de las respuestas
-LLSD (XML plano y notación), capacidades, plantilla de mensajes, ObjectUpdate.
+**Última prueba real (cuenta ExeQiel, APK `app-release.apk`):** el login XML-RPC
+funcionó (sesión iniciada, circuito 712942918) y el fallo estaba justo después:
+el visor se quedaba en «Abriendo circuito UDP con 54.190.153.220:13005…» y
+terminaba en «Desconectado.».
 
-- [ ] **Login XML-RPC**: confirmar en el grid real que
-      `login.agni.lindenlab.com/cgi-bin/login.cgi` acepta el struct enviado
-      (canal/versión/mac/options). El motivo exacto del servidor se muestra en el
-      registro del HUD (botón ⧉ para copiarlo).
+Causas ya corregidas en esta revisión:
+
+- **`udpOpen` colgado (la causa del fallo).** `nativeCall()` mandaba al puente
+  nativo un `id` que el llamador usaba a la vez como clave del socket, de modo que
+  la respuesta de `udpOpen` volvía con otro identificador y **nunca** se
+  emparejaba: 15-18 s de espera y desconexión. Ahora `id` (identifica la llamada)
+  y `chan` (identifica el socket UDP) son campos distintos en los dos lados.
+- **Capacidades ilegibles** («Capacidades: 6 (0, 1, 2, 3, 4, 5…)»): la respuesta
+  del seed capability se parseaba como texto. Ahora se le pasan los bytes a
+  `LLSD.parse` (detecta XML, notación o LLSD binario, ignora el BOM) y, si aun así
+  no sale un mapa, el registro muestra el estado HTTP y el principio del cuerpo.
+- **Los errores no quedaban en el registro**: el motivo sólo se veía en el modal
+  (no copiable). Ahora todo error va al registro con ⚠ y el botón ⧉ copia el
+  texto con saltos de línea reales.
+
+Pendiente de comprobar en el grid real:
+
+- [ ] **Login XML-RPC**: confirmar que `login.agni.lindenlife…` (ver `GRIDS` en
+      `sl-session.js`) acepta el struct enviado (canal/versión/mac/options). El
+      motivo exacto del servidor ya aparece en el registro del HUD.
 - [ ] **MFA**: si la cuenta tiene verificación en dos pasos, comprobar el flujo
       `mfa_challenge` → código de 6 dígitos → `mfa_hash` recordado.
-- [ ] **`sim_ip`/`sim_port`**: comprobar que `openCircuit` conecta y que el
-      RegionHandshake llega (si no, el circuito no está bien: revisar
-      `UseCircuitCode`).
+- [ ] **`sim_ip`/`sim_port`**: comprobar que `openCircuit` abre el socket y que
+      llega el RegionHandshake. Si el socket abre pero no contesta nadie, el
+      diagnóstico automático dirá si el problema es la red (STUN tampoco
+      responde → probar datos móviles u otra wifi) o nuestro paquete.
 - [ ] **Posiciones "terse"**: si los objetos salen desplazados, ajustar
       `POS_XY`/`POS_Z`/`VEL_XY`/`VEL_Z` en `object-update.js` (los valores se
       eligieron desde el código decompilado y son la única incógnita grande).

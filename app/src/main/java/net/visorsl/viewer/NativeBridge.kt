@@ -1,6 +1,9 @@
 package net.visorsl.viewer
 
 import android.app.Activity
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.util.Base64
 import android.util.Log
 import android.webkit.JavascriptInterface
@@ -16,7 +19,9 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -35,17 +40,55 @@ class NativeBridge(private val activity: Activity) {
         var webViewRef: WebView? = null
         private const val TAG = "VisorSL"
         private const val MAX_DATAGRAM = 4096
+        private const val MAX_RX_QUEUE = 2048
+        private const val RX_FLUSH_MS = 20L
     }
 
     private val httpPool = Executors.newFixedThreadPool(4)
+
+    /**
+     * Socket setup and sending run here — never on the WebView "JavaBridge"
+     * thread, which is blocked (the page is waiting on us) and which some
+     * devices/ROMs refuse to let create sockets. One thread, so datagrams keep
+     * their order.
+     */
+    private val udpPool = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "visor-udp-io").apply { isDaemon = true }
+    }
+
+    /** A blocked probe (waiting seconds for a reply) must not hold up udpPool. */
+    private val probePool = Executors.newCachedThreadPool()
+
     private val udpChannels = ConcurrentHashMap<String, UdpChannel>()
+
+    /** Received datagrams wait here and go to JS in batches (one call per ~20 ms). */
+    private val rxQueue = ConcurrentLinkedQueue<JSONObject>()
+    private var rxDropped = 0
+    private val flusher = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "visor-udp-rx").apply { isDaemon = true }
+    }
+
     @Volatile private var modalOpen = false
 
-    inner class UdpChannel(val host: String, var port: Int) {
+    init {
+        flusher.scheduleAtFixedRate({
+            try {
+                flushRx()
+            } catch (t: Throwable) {
+                Log.w(TAG, "rx flush: $t")
+            }
+        }, 0, RX_FLUSH_MS, TimeUnit.MILLISECONDS)
+    }
+
+    inner class UdpChannel() {
         val socket = DatagramSocket()
         val running = AtomicBoolean(true)
-        var lastPeer: InetSocketAddress? = null
+        @Volatile var peer: InetSocketAddress? = null
         var thread: Thread? = null
+        @Volatile var sent = 0
+        @Volatile var sentBytes = 0
+        @Volatile var received = 0
+        @Volatile var receivedBytes = 0
     }
 
     @JavascriptInterface
@@ -129,47 +172,33 @@ class NativeBridge(private val activity: Activity) {
     @JavascriptInterface
     fun udpOpen(requestJson: String): String {
         val req = JSONObject(requestJson)
-        val id = req.getString("id")
+        val id = req.optString("id")
+        val chan = req.optString("chan", id)
         val host = req.getString("host")
         val port = req.getInt("port")
-        closeChannel(id)
-        try {
-            val ch = UdpChannel(host, port)
-            ch.socket.soTimeout = 0
-            ch.lastPeer = InetSocketAddress(InetAddress.getByName(host), port)
-            val t = Thread {
-                val buf = ByteArray(MAX_DATAGRAM)
-                while (ch.running.get()) {
-                    try {
-                        val pkt = DatagramPacket(buf, buf.size)
-                        ch.socket.receive(pkt)
-                        ch.lastPeer = InetSocketAddress(pkt.address, pkt.port)
-                        val msg = JSONObject()
-                        msg.put("id", id)
-                        msg.put("kind", "udp")
-                        msg.put("data", Base64.encodeToString(buf, 0, pkt.length, Base64.NO_WRAP))
-                        msg.put("from", pkt.address?.hostAddress ?: "")
-                        msg.put("port", pkt.port)
-                        push(msg)
-                    } catch (e: Exception) {
-                        if (ch.running.get()) Log.w(TAG, "udp recv: ${e.message}")
-                    }
-                }
+        Log.i(TAG, "udpOpen $host:$port (chan=$chan)")
+        udpPool.execute {
+            val out = JSONObject()
+            out.put("id", id); out.put("chan", chan); out.put("kind", "udpOpen")
+            try {
+                closeChannel(chan)
+                val ch = UdpChannel()
+                ch.peer = InetSocketAddress(InetAddress.getByName(host), port)
+                val rx = Thread { receiveLoop(chan, ch) }
+                rx.isDaemon = true
+                rx.name = "visor-udp-rx-$chan"
+                ch.thread = rx
+                rx.start()
+                udpChannels[chan] = ch
+                out.put("ok", true)
+                out.put("localPort", ch.socket.localPort)
+                Log.i(TAG, "udpOpen ok local=${ch.socket.localPort}")
+            } catch (t: Throwable) {
+                out.put("ok", false)
+                out.put("error", describe(t))
+                Log.e(TAG, "udpOpen $host:$port falló: ${describe(t)}")
             }
-            t.isDaemon = true
-            t.name = "visor-udp-$id"
-            ch.thread = t
-            t.start()
-            udpChannels[id] = ch
-            val ok = JSONObject()
-            ok.put("id", id); ok.put("kind", "udpOpen"); ok.put("ok", true)
-            ok.put("localPort", ch.socket.localPort)
-            push(ok)
-        } catch (t: Throwable) {
-            val err = JSONObject()
-            err.put("id", id); err.put("kind", "udpOpen"); err.put("ok", false)
-            err.put("error", t.javaClass.simpleName + ": " + (t.message ?: ""))
-            push(err)
+            push(out)
         }
         return ack(id)
     }
@@ -177,26 +206,186 @@ class NativeBridge(private val activity: Activity) {
     @JavascriptInterface
     fun udpSend(requestJson: String): String {
         val req = JSONObject(requestJson)
-        val id = req.getString("id")
-        val ch = udpChannels[id] ?: return ack(id, false, "no channel")
-        return try {
-            val data = Base64.decode(req.getString("data"), Base64.DEFAULT)
-            val peer = if (req.has("host")) {
-                InetSocketAddress(InetAddress.getByName(req.getString("host")), req.getInt("port"))
-            } else ch.lastPeer
-            if (peer == null) return ack(id, false, "no peer")
-            ch.socket.send(DatagramPacket(data, data.size, peer))
-            ack(id)
-        } catch (t: Throwable) {
-            ack(id, false, t.message ?: t.javaClass.simpleName)
+        val id = req.optString("id")
+        val chan = req.optString("chan", id)
+        val dataB64 = req.optString("data", "")
+        val host = if (req.has("host")) req.getString("host") else null
+        val port = if (req.has("port")) req.getInt("port") else 0
+        udpPool.execute {
+            val out = JSONObject()
+            out.put("id", id); out.put("chan", chan); out.put("kind", "udpSend")
+            val ch = udpChannels[chan]
+            if (ch == null) {
+                out.put("ok", false); out.put("error", "no hay canal UDP abierto ($chan)")
+                push(out)
+                return@execute
+            }
+            try {
+                val data = Base64.decode(dataB64, Base64.DEFAULT)
+                val peer = if (host != null) {
+                    InetSocketAddress(InetAddress.getByName(host), port)
+                } else ch.peer
+                if (peer == null) throw IllegalStateException("el canal no tiene destino")
+                ch.socket.send(DatagramPacket(data, data.size, peer))
+                ch.sent++
+                ch.sentBytes += data.size
+                out.put("ok", true); out.put("sent", data.size)
+            } catch (t: Throwable) {
+                out.put("ok", false); out.put("error", describe(t))
+                Log.w(TAG, "udpSend falló: ${describe(t)}")
+            }
+            push(out)
         }
+        return ack(id)
     }
 
     @JavascriptInterface
     fun udpClose(requestJson: String): String {
-        val id = JSONObject(requestJson).optString("id")
-        closeChannel(id)
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        val chan = req.optString("chan", id)
+        udpPool.execute { closeChannel(chan) }
         return ack(id)
+    }
+
+    /**
+     * Sends one datagram from a *throwaway* socket and waits for any reply.
+     * Used by the HUD diagnostic to tell apart "the socket cannot be created",
+     * "outbound UDP is blocked", and "the simulator never answered".
+     */
+    @JavascriptInterface
+    fun udpProbe(requestJson: String): String {
+        val req = JSONObject(requestJson)
+        val id = req.optString("id")
+        val host = req.getString("host")
+        val port = req.getInt("port")
+        val data = Base64.decode(req.optString("data", ""), Base64.DEFAULT)
+        val waitMs = req.optInt("waitMs", 4000)
+        probePool.execute {
+            val out = JSONObject()
+            out.put("id", id); out.put("kind", "udpProbe")
+            out.put("host", host); out.put("port", port)
+            var sock: DatagramSocket? = null
+            try {
+                val s = DatagramSocket()
+                sock = s
+                out.put("localPort", s.localPort)
+                s.soTimeout = 500
+                val addr = InetAddress.getByName(host)
+                s.send(DatagramPacket(data, data.size, InetSocketAddress(addr, port)))
+                out.put("sent", data.size)
+                val buf = ByteArray(MAX_DATAGRAM)
+                val deadline = System.currentTimeMillis() + waitMs
+                var got = 0
+                var from = ""
+                var fromPort = 0
+                while (System.currentTimeMillis() < deadline) {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    try {
+                        s.receive(pkt)
+                    } catch (_: java.net.SocketTimeoutException) {
+                        continue
+                    }
+                    got += pkt.length
+                    from = pkt.address?.hostAddress ?: ""
+                    fromPort = pkt.port
+                    break
+                }
+                out.put("ok", true)
+                out.put("received", got)
+                out.put("from", from)
+                out.put("fromPort", fromPort)
+                Log.i(TAG, "udpProbe $host:$port recibidos=$got de=$from:$fromPort")
+            } catch (t: Throwable) {
+                out.put("ok", false); out.put("error", describe(t))
+                Log.e(TAG, "udpProbe $host:$port falló: ${describe(t)}")
+            } finally {
+                try { sock?.close() } catch (_: Exception) {}
+            }
+            push(out)
+        }
+        return ack(id)
+    }
+
+    /** Active network (wifi/mobile/vpn), whether it is validated, and whether a UDP socket can even be created here. */
+    @JavascriptInterface
+    fun netInfo(): String {
+        val o = JSONObject()
+        try {
+            val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = cm.activeNetwork
+            val caps = if (net != null) cm.getNetworkCapabilities(net) else null
+            val tipo = when {
+                caps == null -> "sin red"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "datos móviles"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+                else -> "otra"
+            }
+            o.put("tipo", tipo)
+            o.put("validada", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false)
+            o.put("sinMedir", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ?: false)
+        } catch (t: Throwable) {
+            o.put("errorRed", describe(t))
+        }
+        try {
+            val s = DatagramSocket()
+            o.put("udpOk", true)
+            o.put("puertoDePrueba", s.localPort)
+            s.close()
+        } catch (t: Throwable) {
+            o.put("udpOk", false)
+            o.put("udpError", describe(t))
+        }
+        return o.toString()
+    }
+
+    private fun receiveLoop(chan: String, ch: UdpChannel) {
+        val buf = ByteArray(MAX_DATAGRAM)
+        var reportedErrors = 0
+        while (ch.running.get()) {
+            try {
+                val pkt = DatagramPacket(buf, buf.size)
+                ch.socket.receive(pkt)
+                ch.peer = InetSocketAddress(pkt.address, pkt.port)
+                ch.received++
+                ch.receivedBytes += pkt.length
+                val msg = JSONObject()
+                msg.put("chan", chan)
+                msg.put("data", Base64.encodeToString(buf, 0, pkt.length, Base64.NO_WRAP))
+                msg.put("from", pkt.address?.hostAddress ?: "")
+                msg.put("port", pkt.port)
+                if (rxQueue.size < MAX_RX_QUEUE) rxQueue.add(msg) else rxDropped++
+            } catch (t: Throwable) {
+                if (!ch.running.get()) return
+                if (reportedErrors++ < 3) {
+                    Log.w(TAG, "udp recv: ${describe(t)}")
+                    val err = JSONObject()
+                    err.put("id", chan); err.put("chan", chan); err.put("kind", "udpError"); err.put("ok", false)
+                    err.put("error", "recepción: " + describe(t))
+                    push(err)
+                }
+            }
+        }
+    }
+
+    /** Hands the queued datagrams to the page as one JSON array. */
+    private fun flushRx() {
+        if (rxQueue.isEmpty() && rxDropped == 0) return
+        val arr = JSONArray()
+        while (arr.length() < 96) {
+            val o = rxQueue.poll() ?: break
+            arr.put(o)
+        }
+        val dropped = rxDropped
+        rxDropped = 0
+        if (arr.length() == 0 && dropped == 0) return
+        val msg = JSONObject()
+        msg.put("id", "rx"); msg.put("kind", "udpBatch")
+        msg.put("batch", arr)
+        if (dropped > 0) msg.put("dropped", dropped)
+        push(msg)
     }
 
     private fun closeChannel(id: String) {
@@ -204,6 +393,20 @@ class NativeBridge(private val activity: Activity) {
             ch.running.set(false)
             try { ch.socket.close() } catch (_: Exception) {}
         }
+    }
+
+    private fun describe(t: Throwable): String {
+        val sb = StringBuilder(t.javaClass.simpleName)
+        t.message?.let { if (it.isNotEmpty()) sb.append(": ").append(it) }
+        var c = t.cause
+        var depth = 0
+        while (c != null && depth < 3) {
+            sb.append(" ← ").append(c.javaClass.simpleName)
+            c.message?.let { if (it.isNotEmpty()) sb.append(": ").append(it) }
+            c = c.cause
+            depth++
+        }
+        return sb.toString()
     }
 
     private fun readAll(stream: java.io.InputStream): ByteArray {
@@ -241,6 +444,9 @@ class NativeBridge(private val activity: Activity) {
 
     fun shutdown() {
         udpChannels.keys.toList().forEach { closeChannel(it) }
+        try { flusher.shutdownNow() } catch (_: Exception) {}
+        try { probePool.shutdownNow() } catch (_: Exception) {}
+        try { udpPool.shutdownNow() } catch (_: Exception) {}
         httpPool.shutdownNow()
     }
 
