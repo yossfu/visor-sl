@@ -78,8 +78,12 @@ una cuenta real en el grid.
 
 - [ ] Icono definitivo del lanzador (hay un vector provisional).
 - [ ] Firmar el APK de release con una clave propia (hoy usa la de debug).
-- [ ] Comprobar el WebView real en Android: `WebViewAssetLoader` sirviendo
-      `/www/`, UDP por `NativeBridge`, permisos de red.
+- [ ] Comprobar el WebView real en Android: UDP por `NativeBridge`, permisos de
+      red y handshake real. (El servido de `assets/www` ya está resuelto a mano
+      en `MainActivity.serveAsset`: `WebViewAssetLoader` **quita** el prefijo
+      registrado del path, así que sólo sirve ficheros que estén en la raíz de
+      `assets/`, no en `assets/www/`; y devuelve `text/plain` para extensiones
+      desconocidas, lo que el navegador rechaza en módulos ES.)
 - [ ] Pantalla de ajustes (grid, distancia de dibujo, calidad, cámara).
 - [ ] Modo "conectar sin contraseña guardada" + no guardar credenciales.
 

@@ -8,10 +8,37 @@
     <div class="spin"></div>
   </div>
 </div>
+<script>
+  (function () {
+    window.visorBooted = false;
+    function show(text) {
+      if (window.visorBooted) return;
+      var b = document.getElementById("boot");
+      if (!b) return;
+      b.classList.remove("gone");
+      b.innerHTML =
+        '<div class="bootbox"><div class="logo">Error</div><div class="sub">' +
+        String(text) + "</div></div>";
+    }
+    function describe(e) {
+      if (!e) return "error desconocido";
+      var t = e.target;
+      if (t && (t.src || t.href)) return "no se pudo cargar " + (t.src || t.href);
+      var err = e.error || e.reason;
+      return String(e.message || (err && (err.message || err)) || err || e);
+    }
+    window.addEventListener("error", function (e) { show(describe(e)); }, true);
+    window.addEventListener("unhandledrejection", function (e) { show(describe(e)); });
+  })();
+</script>
 <script type="module">
   import { boot } from "./js/app.js";
   try {
+    if (!document.createElement("canvas").getContext("webgl2")) {
+      throw new Error("Este dispositivo no soporta WebGL2, que es necesario para el visor 3D. Actualiza el navegador / Android System WebView.");
+    }
     boot();
+    window.visorBooted = true;
     const b = document.getElementById("boot");
     if (b) b.classList.add("gone");
     setTimeout(() => { const x = document.getElementById("boot"); if (x) x.remove(); }, 600);

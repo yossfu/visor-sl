@@ -138,3 +138,8 @@ service workers (p. ej. el navegador interno de la app de Google en iOS).
 - Los avatares son cápsulas con el nombre, no mallas con esqueleto.
 - Sin inventario, apariencia, sculpt maps, mallas, grupos, búsqueda, voz, RLV,
   minimapa ni dinero (ver `LUMIYA.md`).
+- La app Android sirve el visor desde `assets/www` con un interceptor propio
+  (`MainActivity.serveAsset`), con MIME correctos (`text/javascript` para los
+  módulos ES), `Cache-Control: no-store` y página de error legible si algo
+  falla. Necesita WebGL2: si el WebView del móvil es viejo, la propia página lo
+  avisa.
