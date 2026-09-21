@@ -138,10 +138,10 @@ Requisitos concretos (todos obligatorios):
 | 2. Almacenamiento + sesión rápida | **hecho**: caché de texturas en disco (`cachePut/cacheGet`), preferencias (último usuario/grid, hash de contraseña, MFA recordado) y botón para guardar el registro en *Descargas*. Todo en carpetas propias de la app: **no hace falta pedir permiso de almacenamiento** en Android (y se explica en el registro); sólo se pide el de notificaciones |
 | 3. Sesión en segundo plano + notificación | **hecho**: `SessionService` en primer plano (`specialUse`), sin WorkManager, con la WebView (y su socket UDP) viva al pasar a segundo plano |
 | 4. GPU | **hecho**: `hardwareAccelerated`, `LAYER_TYPE_HARDWARE`, `powerPreference: high-performance`, WebGL2; al arrancar se registra la GPU real y se avisa si es software |
-| 5. Paridad con Lumiya | terreno, prims (forma + textura, **arreglado el bloque comprimido**), **avatar real con forma, texturas y animaciones**: hechos. Ropa del inventario: la puesta se ve (bake del simulador); cambiar de ropa necesita inventario y transferencias → siguiente hito. Falta: sculpt/mallas, inventario, grupos, búsqueda, minimapa, voz |
+| 5. Paridad con Lumiya | terreno (**tipo 76 + cabecera: arreglado en la ronda 10**), prims (forma + textura, bloque comprimido **y esculturas**; los mesh no se dibujan), **avatar real con forma, texturas y animaciones**: hechos. **Buscador de tierras y teletransporte**: hechos. Ropa del inventario: la puesta se ve (bake del simulador); cambiar de ropa necesita inventario y transferencias → siguiente hito. Falta: mallas (LLMesh), inventario, grupos, búsqueda en el grid, minimapa, voz |
 | 6. Controles tipo Genshin | **hecho**: joystick izquierdo, cámara por arrastre en la mitad derecha, botones de saltar/volar/correr/sentar, doble toque para saltar y stick a tope = correr |
-| 7. Investigación exhaustiva | **hecho y documentado** en `LUMIYA.md`: formatos de red verificados contra el código decompilado de Lumiya y contra el visor oficial de Linden (`ObjectUpdateCompressed`, ExtraParams, `AnimationData`, `SLSkeletonBone`/`getPelvisToFoot`, `LLPolySkeletalDistortion`) |
-| 8. Avisos del informe 4 | **hecho**: `KillObject` ya no falla (bloque `Variable` truncado por los *acks adjuntos* → ahora se recorta a lo que cabe); 70/70 pruebas del protocolo |
+| 7. Investigación exhaustiva | **hecho y documentado** en `LUMIYA.md`: formatos de red verificados contra el código decompilado de Lumiya y contra el visor oficial de Linden (`ObjectUpdateCompressed`, ExtraParams, `AnimationData`, `SLSkeletonBone`/`getPelvisToFoot`, `LLPolySkeletalDistortion`, y en la ronda 10 la máscara de caras de `llprimitive.cpp` y las esculturas de `llvolume.cpp`) |
+| 8. Avisos del informe 4 | **hecho**: `KillObject` ya no falla (bloque `Variable` truncado por los *acks adjuntos* → ahora se recorta a lo que cabe); 76/76 pruebas del protocolo |
 
 ---
 
@@ -182,7 +182,7 @@ hilo). Razones, por orden de peso:
 
 - **Todo el valor que ya funciona es web**: protocolo SL, terreno, prims,
   avatares con morphs y huesos, animaciones y UI son ~150 KB de JS verificados
-  contra el simulador falso más 70/70 pruebas de protocolo. Portarlo a Kotlin/C++
+  contra el simulador falso más 76/76 pruebas de protocolo. Portarlo a Kotlin/C++
   para Filament es rehacerlo **sin poder verificarlo aquí**: este entorno no
   compila ni ejecuta código Android nativo, así que se enviaría a ciegas al móvil.
 - **El cuello de botella real era el exceso de llamadas de dibujo**, no el motor:
@@ -207,4 +207,38 @@ está en `LUMIYA.md` §7.
 | 4. Almacenamiento | **hecho**: panel con rutas, tamaño de caché, espacio libre, permiso clásico donde existe y selector de carpeta del sistema; el registro se puede guardar en *Descargas* |
 | 5. Lumiya | **hecho**: `LUMIYA.md` §7 (cómo dibujaba Lumiya, qué se ha aplicado y qué queda: descarga progresiva por `Range`) |
 | 6. Motor gráfico | **decidido**: se mantiene WebGL2 (razones arriba); el camino a un render nativo queda documentado y sólo se recorrerá si el diagnóstico del móvil lo justifica |
+
+---
+
+## Ronda 10 (informe 7: el mundo no carga, y hace falta teletransportarse)
+
+> AHI ESTAN LOS ARCHIVOS DE LUMIYA EXTRACTED QUISA AYUDEN.. YAHORA EN ELVISOR SI
+> SE VE EL AVATAR PERO SE VE DEFORME, NO ADQUIERE TEXTURAS NI MIS ANIMACIONES NI
+> LA ROPA.. PERO LO CRUCIAL ES IR POR PASOS, PRIMERO ME INTERESA QU EL MUNDO
+> CARGUE CORRECTAMENTE, SOLO VEO CUBOS CON CUADRICULAS BLANCAS, Y UN SIN FIN DE
+> GEOMETRIAS XTRA;AS. NO SE ESTA LOGRANDO QUE SE CARGUEN LOS OBJETOS DEL MUNDO Y
+> SUS TEXTURAS. INDAGA BIEN EN TOODOS LOS ARCHIVOS DE LUMIYA Y USA LO NECESARIO.
+> CORRIGE COSAS, TAMBIEN NECESITO QUE PUEDA ACCEDER A UN BUSCADOR DE LANDS DESDE
+> EL JUEGO PARA PROBAR EL TP
+
+Requisitos, en el orden que pide el usuario:
+
+1. **Ir por pasos**, y el primer paso es el mundo: que carguen **los objetos del
+   mundo y sus texturas** («cubos con cuadrículas blancas y un sinfín de
+   geometrías extrañas» = texturas del grid que no llegan + formas que no son
+   las suyas).
+2. **Investigar a fondo los fuentes de Lumiya** (y el visor oficial) y aplicar lo
+   necesario.
+3. **Un buscador de tierras dentro del juego, para probar el teletransporte (TP)**.
+4. Después: el **avatar** (deforme, sin texturas, sin animaciones ni ropa) —
+   sigue pendiente como paso 2 explícito del usuario.
+
+Estado frente a esos requisitos:
+
+| Requisito | Estado |
+| --- | --- |
+| 1. El mundo carga | **hecho y pendiente de confirmar en el móvil**: el terreno nunca llegaba porque es `LayerID.Type = 76` (no 0) y lleva cabecera de 4 bytes; la máscara de caras del `TextureEntry` estaba en orden inverso (texturas en caras equivocadas); las **esculturas** ahora se generan de verdad y un prim sin su mapa **no se dibuja**; los objetos **mesh** tampoco se dibujan como cajas |
+| 2. Investigar Lumiya | **hecho**: `SLAgentCircuit.HandleLayerData`, `TerrainData.ProcessLayerData`, `SLTextureEntry.ReadFaceBitfield`, `PrimVolume.sculpt*`, más `llprimitive.cpp`/`llvolume.cpp` del visor oficial (ver `LUMIYA.md`) |
+| 3. Buscador de tierras + TP | **hecho**: panel *Lands* con búsqueda por nombre/SLURL/coordenadas, mapa del grid, elección del punto exacto y `TeleportLocationRequest` → `TeleportStart` → `TeleportFinish` → circuito nuevo. Probado de punta a punta con `?test=grid&tp=1004,1006` |
+| 4. Avatar (paso siguiente) | **pendiente**: el usuario dice que se ve deforme y sin texturas/animaciones/ropa; el siguiente paso es diagnosticarlo con un informe 8 (y `?test=avatar`) |
 

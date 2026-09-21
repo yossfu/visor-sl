@@ -148,15 +148,22 @@ export async function assetCheck() {
 export async function j2cCheck() {
   let decodeJ2C = null;
   let inWorker = false;
+  let workers = 0;
   try {
     const mod = await import("./j2c.js");
     decodeJ2C = mod.decodeJ2C;
     await mod.warmUp();
     inWorker = mod.decodingInWorker();
+    try { workers = mod.decoderWorkers(); } catch (_) { workers = 0; }
   } catch (e) {
     return [["decodificador JPEG2000", false, "no se pudo cargar el wasm: " + ((e && e.message) || e)]];
   }
-  const out = [["decodificador JPEG2000", true, inWorker ? "wasm cargado y decodificando en un hilo aparte" : "wasm cargado (decodifica en el hilo principal)"]];
+  // The number of decoders matters: a region asks for hundreds of textures at
+  // once and a single worker decodes them one by one, which is why the prims
+  // used to stay untextured for the first minute in a busy region.
+  const out = [["decodificador JPEG2000", true, !inWorker
+    ? "wasm cargado (decodifica en el hilo principal)"
+    : `wasm cargado y decodificando en ${workers > 1 ? workers + " hilos en paralelo" : "un hilo aparte"}`]];
   try {
     const res = await fetch(new URL("../data/avatar/j2c-sample.bin", import.meta.url).href);
     if (!res.ok) { out.push(["prueba de decodificación", null, "no hay muestra incluida"]); return out; }

@@ -402,7 +402,103 @@ const BOTTOM_MASK = 1024, CAP_MASK = 2, END_MASK = 4, FLAT_MASK = 256,
   HOLLOW_MASK = 64, INNER_MASK = 16, OPEN_MASK = 128, OUTER_MASK = 32,
   SIDE_MASK = 8, SINGLE_MASK = 1, TOP_MASK = 512;
 
-export function buildVolume(vp, detail = 4) {
+// ---------------------------------------------------------------------------
+// Sculpt maps
+// ---------------------------------------------------------------------------
+
+// llvolume.h: the sculpt type is the low 3 bits, bit 6 inverts and bit 7 mirrors.
+export const SCULPT_TYPE_MASK = 0x07;
+export const SCULPT_FLAG_INVERT = 0x40;
+export const SCULPT_FLAG_MIRROR = 0x80;
+
+const SCULPT_MIN_AREA = 0.002;
+const SCULPT_MAX_AREA = 384;
+const SCULPT_MIN_AREA_DETAIL = 1;
+
+function sculptSides(detail) {
+  if (detail <= 1) return 6;
+  if (detail <= 2) return 8;
+  if (detail <= 3) return 16;
+  return 32;
+}
+
+/**
+ * How many vertices the path (rows) and the profile (columns) get for a sculpt
+ * map of this size — `sculpt_calc_mesh_resolution` in llvolume.cpp: as square as
+ * the map while still using every vertex, never more than the LOD allows and
+ * never more than the map can carry.
+ */
+export function sculptMeshResolution(width, height, detail = 4) {
+  const maxLod = sculptSides(detail) ** 2;
+  const maxMap = Math.trunc((width * height) / 4);
+  const vertices = maxMap > 0 ? Math.min(maxLod, maxMap) : maxLod;
+  const ratio = (width === 0 || height === 0) ? 1 : width / height;
+  let s = Math.trunc(Math.sqrt(vertices / ratio));
+  if (s < 4) s = 4;
+  let t = Math.trunc(vertices / s);
+  if (t < 4) t = 4;
+  s = Math.trunc(vertices / t);
+  return { s, t };
+}
+
+/**
+ * Fills the volume's vertex grid straight from the sculpt map: the map's R,G,B
+ * are the vertex's X,Y,Z (each 0..255 mapped to -0.5..0.5) — `sculptGenerateMapVertices`
+ * in llvolume.cpp. The stitching rules are what make one 2D image describe a
+ * sphere (both seams pinch to the middle row/column), a torus (both seams wrap),
+ * a cylinder (only the side seam wraps) or a plane (nothing wraps).
+ */
+function fillSculptMesh(mesh, nPath, nProf, sculptType, map) {
+  const stitching = sculptType & SCULPT_TYPE_MASK;
+  const invert = (sculptType & SCULPT_FLAG_INVERT) !== 0;
+  const mirror = (sculptType & SCULPT_FLAG_MIRROR) !== 0;
+  const reverseHorizontal = invert ? !mirror : mirror;
+  const w = map.width, h = map.height, comps = map.components;
+  const data = map.data;
+  const rowDiv = nPath > 1 ? nPath - 1 : 1;
+  const colDiv = nProf > 1 ? nProf - 1 : 1;
+  for (let s = 0; s < nPath; s++) {
+    for (let t = 0; t < nProf; t++) {
+      const revT = reverseHorizontal ? nProf - t - 1 : t;
+      let x = Math.trunc((revT / colDiv) * w);
+      let y = Math.trunc((s / rowDiv) * h);
+      if (y === 0) {                                   // top row stitching
+        if (stitching === LL_SCULPT_TYPE_SPHERE) x = w >> 1;
+      }
+      if (y === h) {                                   // bottom row stitching
+        y = (stitching === LL_SCULPT_TYPE_TORUS) ? 0 : h - 1;
+        if (stitching === LL_SCULPT_TYPE_SPHERE) x = w >> 1;
+      }
+      if (x === w) {                                   // side stitching
+        x = (stitching === LL_SCULPT_TYPE_SPHERE || stitching === LL_SCULPT_TYPE_TORUS ||
+          stitching === LL_SCULPT_TYPE_CYLINDER) ? 0 : w - 1;
+      }
+      if (x < 0) x = 0; else if (x > w - 1) x = w - 1;
+      if (y < 0) y = 0; else if (y > h - 1) y = h - 1;
+      const i = (y * w + x) * comps;
+      const px = data[i] / 255 - 0.5, py = data[i + 1] / 255 - 0.5, pz = data[i + 2] / 255 - 0.5;
+      mesh[s * nProf + t] = new V3(mirror ? -px : px, py, pz);
+    }
+  }
+}
+
+/** Total mesh area, used to reject maps that carry no usable shape. */
+function sculptSurfaceArea(mesh, nPath, nProf) {
+  const sub = (a, b) => [a.x - b.x, a.y - b.y, a.z - b.z];
+  const crossLen = (a, b) => Math.hypot(a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]);
+  let area = 0;
+  for (let s = 0; s < nPath - 1; s++) {
+    for (let t = 0; t < nProf - 1; t++) {
+      const p1 = mesh[s * nProf + t], p2 = mesh[(s + 1) * nProf + t];
+      const p3 = mesh[s * nProf + t + 1], p4 = mesh[(s + 1) * nProf + t + 1];
+      if (!p1 || !p2 || !p3 || !p4) continue;
+      area += (crossLen(sub(p1, p2), sub(p1, p3)) + crossLen(sub(p4, p2), sub(p4, p3))) / 2;
+    }
+  }
+  return area;
+}
+
+export function buildVolume(vp, detail = 4, sculpt = null) {
   const profile = new PrimProfile();
   const path = new PrimPath();
   let lodFaces = Math.floor(detail * 0.66);
@@ -410,26 +506,52 @@ export function buildVolume(vp, detail = 4) {
   if (tc === LL_PCODE_PATH_LINE && (vp.path.scaleX !== 1.0 || vp.path.scaleY !== 1.0) &&
     (pc === 1 || pc === 2 || pc === 3 || pc === 4)) lodFaces = 0;
 
+  // A sculpt does not extrude the profile along the path at all: the path and
+  // the profile are generated only to decide the *topology* (how many rows and
+  // columns, which faces exist, where the UVs run) and every vertex is then read
+  // straight out of the sculpt map (llvolume.cpp `LLVolume::sculpt`). Asking for
+  // the sculpt resolution is what makes the grid dense enough to carry the shape.
+  const isSculpt = !!sculpt && (vp.sculptType & 7) !== 0 &&
+    sculpt.width > 0 && sculpt.height > 0 && sculpt.components >= 3 && !!sculpt.data;
+  let requestedS = 0, requestedT = 0;
+  if (isSculpt) {
+    const res = sculptMeshResolution(sculpt.width, sculpt.height, detail);
+    requestedS = res.s;
+    requestedT = res.t;
+  }
+
   const flexiSections = vp.flexible ? Math.max(0, (vp.flexible.numFlexiSections | 0) - 2) : lodFaces;
-  path.generate(vp.path, detail, flexiSections, false, 0);
-  profile.generate(vp.profile, path.open, detail, lodFaces, false, 0);
+  path.generate(vp.path, detail, isSculpt ? 0 : flexiSections, isSculpt, requestedS);
+  profile.generate(vp.profile, path.open, detail, isSculpt ? 0 : lodFaces, isSculpt, requestedT);
 
   const key = (x) => Math.round(x * 1e6) / 1e6;
   void key;
   const nPath = path.points.length, nProf = profile.points.length;
   if (!nPath || !nProf) return null;
   const mesh = new Array(nPath * nProf);
-  const tmp = new V3(), rotv = new V3();
-  for (let t = 0; t < nPath; t++) {
-    const pp = path.points[t];
-    for (let s = 0; s < nProf; s++) {
-      tmp.set(pp.scale.x * profile.points[s].x, profile.points[s].y * pp.scale.y, 0);
-      const v = pp.rot.rotate(tmp, rotv);
-      mesh[t * nProf + s] = new V3(v.x, v.y, v.z).add(pp.pos);
+  if (isSculpt) {
+    fillSculptMesh(mesh, nPath, nProf, vp.sculptType & 0xff, sculpt);
+  } else {
+    const tmp = new V3(), rotv = new V3();
+    for (let t = 0; t < nPath; t++) {
+      const pp = path.points[t];
+      for (let s = 0; s < nProf; s++) {
+        tmp.set(pp.scale.x * profile.points[s].x, profile.points[s].y * pp.scale.y, 0);
+        const v = pp.rot.rotate(tmp, rotv);
+        mesh[t * nProf + s] = new V3(v.x, v.y, v.z).add(pp.pos);
+      }
     }
   }
   let faceMask = 0;
   for (const f of profile.faces) faceMask |= f.faceID;
+
+  // A sculpt map with no usable relief (a flat or blank image) describes no
+  // object at all: the official viewer rejects those instead of drawing a
+  // collapsed blob, and so do we (the prim is simply not drawn).
+  if (isSculpt && detail > SCULPT_MIN_AREA_DETAIL) {
+    const area = sculptSurfaceArea(mesh, nPath, nProf);
+    if (area < SCULPT_MIN_AREA || area > SCULPT_MAX_AREA) return null;
+  }
 
   const out = [];
   for (let i = 0; i < profile.faces.length; i++) {
@@ -647,10 +769,11 @@ export function faceNormals(face) {
   return normals;
 }
 
-// Full pipeline: raw prim params -> renderable face list
-export function primToFaces(params, detail = 4) {
+// Full pipeline: raw prim params -> renderable face list. `sculpt` is the
+// decoded sculpt map ({width, height, components, data}) when the prim has one.
+export function primToFaces(params, detail = 4, sculpt = null) {
   const vp = toVolumeParams(defaultPrimParams(params));
-  const vol = buildVolume(vp, detail);
+  const vol = buildVolume(vp, detail, sculpt);
   if (!vol) return null;
   for (const f of vol.faces) {
     if (f.normal) {

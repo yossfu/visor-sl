@@ -11,7 +11,7 @@ import { Circuit, buildMessage, decodeMessage } from "./udp.js";
 import { httpRequest, openUdp, hasUdp, platformInfo, netInfo, udpProbe, sessionService } from "./transport.js";
 import { cacheKey, readCached, writeCached, dropCached, cacheMode, CACHE_REV, looksLikeImage } from "./cache.js";
 import { parseTextureEntry } from "./texture-entry.js";
-import { decodeTerrainLayer } from "./terrain.js";
+import { decodeTerrainLayer, LAYER_TYPE_LAND } from "./terrain.js";
 import {
   decodeTerseObjectData, decodeImprovedTerse, primParamsFromShape, primParamsFromPacked,
   decodeExtraParams, parseCompressedObjectData,
@@ -356,6 +356,13 @@ export class SLSession {
       // Baked textures of the residents go through the same GetTexture queue;
       // the world asks for them, the session owns the queue.
       this.app.world.onTextureNeeded = (uuid) => this.requestTexture(uuid);
+      // A sculpted prim needs its map's *pixels*, not a texture object, so it
+      // asks through its own hook (the map still travels the texture queue).
+      if (!this.sculptWanted) this.sculptWanted = new Set();
+      this.app.world.onSculptNeeded = (uuid) => {
+        this.sculptWanted.add(uuid);
+        this.requestTexture(uuid);
+      };
     }
     this.send("UseCircuitCode", {
       CircuitCode: { Code: this.circuitCode, SessionID: this.sessionID, ID: this.agentID },
@@ -625,10 +632,16 @@ export class SLSession {
       this.log("Sin EventQueueGet: no habrá teletransporte ni mensajes en vivo.");
       return;
     }
+    // A teleport starts a *second* event queue against the new region; without
+    // this generation tag the old poll (whose HTTP request is still in flight)
+    // would wake up when the state goes back to "online" and poll the dead
+    // region's queue forever alongside the new one.
+    if (this.queueGeneration === undefined) this.queueGeneration = 0;
+    const gen = this.queueGeneration;
     let ack = 0;
     let failures = 0;
     const poll = async () => {
-      while (this.state === "online") {
+      while (this.state === "online" && gen === this.queueGeneration) {
         try {
           const res = await this.http({
             url, method: "POST",
@@ -656,16 +669,236 @@ export class SLSession {
   handleEventQueueEvent(ev) {
     const body = ev.body || {};
     switch (ev.message) {
-      case "TeleportFinish":
-        this.status("Teletransporte completado: " + (body.SimName || body.RegionName || ""));
-        if (body.SimIP) this.openCircuit(body.SimIP, body.SimPort).catch((e) => this.log(e.message));
-        break;
+      case "TeleportFinish": return this.onTeleportFinish(body);
+      case "TeleportCancel":
+        this.teleportPending = null;
+        this.status("Teletransporte cancelado.");
+        return;
       case "CrossedRegion":
+        // Crossing a border is *not* a teleport: the simulator moves the agent
+        // and hands over the new region the same way, so it takes the same path.
         this.status("Cruzando a otra región…");
-        break;
+        this.teleportPending = this.teleportPending || { crossing: true };
+        return;
+      case "TeleportFailed":
+        this.teleportPending = null;
+        this.status("El teletransporte falló: " + (body.Reason || "motivo desconocido"));
+        this.log("TeleportFailed: " + JSON.stringify(body).slice(0, 200));
+        return;
+      case "AgentMovementComplete":
+        return;
       default:
-        break;
+        return;
     }
+  }
+
+  /**
+   * The region handle packs the region's origin in global metres:
+   * `(originX << 32) | originY`, both multiples of 256 (the simulator's own
+   * handle in `AgentMovementComplete.RegionHandle`, and what
+   * `TeleportLocationRequest` expects). Grid coordinates are that origin / 256,
+   * which is also the coordinate printed under the SL map tiles.
+   */
+  gridCoordsOf(handle) {
+    const h = Number(handle) || 0;
+    return {
+      x: Math.floor(Math.floor(h / 4294967296) / 256),
+      y: Math.floor((h % 4294967296) / 256),
+    };
+  }
+
+  regionHandleFor(gridX, gridY) {
+    return gridX * 256 * 4294967296 + gridY * 256;
+  }
+
+  /** Where we are now: region name, grid coordinate and local position. */
+  locationInfo() {
+    const c = this.gridCoordsOf(this.regionHandle);
+    return {
+      region: this.regionName || "?",
+      gridX: c.x, gridY: c.y,
+      local: this.agentPos ? [this.agentPos[0], this.agentPos[1], this.agentPos[2]] : [128, 128, 25],
+    };
+  }
+
+  /**
+   * Teleport to a region by GRID coordinate with a LOCAL position inside it.
+   * `TeleportLocationRequest` is exactly what the official viewer sends for a
+   * SLURL: a region handle, a position *local to that region* and a look-at
+   * (Lumiya's `TeleportToGlobalPosition` does the same conversion).
+   *
+   * The simulator answers with TeleportStart/TeleportProgress on UDP and, finally,
+   * a TeleportFinish LLSD event on the CAPS event queue carrying the destination
+   * simulator's address — that is what `moveToSim` follows up on.
+   */
+  teleportToRegion(gridX, gridY, local = [128, 128, 25]) {
+    if (this.state !== "online" || !this.circuit || !this.udp) {
+      this.log("Sin conexión: no se puede teletransportar.");
+      return false;
+    }
+    const gx = Math.max(0, Math.floor(Number(gridX) || 0));
+    const gy = Math.max(0, Math.floor(Number(gridY) || 0));
+    const pos = [clampRegion(local[0]), clampRegion(local[1]), Math.max(0, Number(local[2]) || 25)];
+    this.teleportPending = { gridX: gx, gridY: gy, local: pos, at: Date.now() };
+    this.log(`TP: teletransporte a la región (${gx}, ${gy}) en [${pos.map((v) => v.toFixed(0)).join(", ")}]…`);
+    this.status("Teletransportando…");
+    try {
+      this.send("TeleportLocationRequest", {
+        AgentData: { AgentID: this.agentID, SessionID: this.sessionID },
+        Info: {
+          RegionHandle: this.regionHandleFor(gx, gy),
+          Position: pos,
+          LookAt: [clampRegion(pos[0] + 10), pos[1], pos[2]],
+        },
+      });
+    } catch (e) {
+      this.teleportPending = null;
+      this.log("⚠ La petición de teletransporte no se pudo enviar: " + ((e && e.message) || e));
+      return false;
+    }
+    // A teleport that never answers used to leave the viewer saying "teleporting"
+    // forever: say so instead, and let the user try again.
+    clearTimeout(this._tpTimer);
+    this._tpTimer = setTimeout(() => {
+      if (this.teleportPending) {
+        this.teleportPending = null;
+        this.log("⚠ El simulador no respondió al teletransporte en 30 s (¿región llena, cerrada o restringida?).");
+        this.status("El teletransporte no respondió.");
+      }
+    }, 30000);
+    return true;
+  }
+
+  /** Teleport to a place inside the region we are already in (instant, local TP). */
+  teleportLocal(x, y, z = 25) {
+    if (this.state !== "online") return false;
+    return this.teleportToRegion(this.locationInfo().gridX, this.locationInfo().gridY, [x, y, z]);
+  }
+
+  /**
+   * TeleportStart/TeleportProgress/TeleportFailed arrive on UDP while the
+   * destination simulator is being prepared; they are informational, but they
+   * are also the only sign of life if the CAPS event queue never delivers the
+   * final TeleportFinish — so log them and clear the pending flag on failure.
+   */
+  onTeleportStart(data) {
+    const flags = (data && data.Info && data.Info.TeleportFlags) || 0;
+    this.log(`TeleportStart (banderas 0x${Number(flags).toString(16)}): el grid está preparando el destino…`);
+    this.status("Teletransportando…");
+  }
+
+  onTeleportProgress(data) {
+    const info = (data && data.Info) || {};
+    const msg = info.Message ? toText(info.Message) : "";
+    if (msg) this.log("Teletransporte: " + msg);
+  }
+
+  onTeleportFailed(data) {
+    const info = (data && data.Info) || {};
+    const reason = info.Reason ? toText(info.Reason) : "motivo desconocido";
+    this.teleportPending = null;
+    clearTimeout(this._tpTimer);
+    this.log("⚠ TeleportFailed: " + reason);
+    this.status("El teletransporte falló: " + reason);
+  }
+
+  /** The region moved us inside itself (no simulator change). */
+  onTeleportLocal(data) {
+    const info = (data && data.Info) || {};
+    if (info.Position) {
+      this.agentPos = info.Position;
+      if (this.app.viewer) this.app.viewer.controls.focus(this.agentPos, 12);
+    }
+    this.teleportPending = null;
+    clearTimeout(this._tpTimer);
+    this.status("Teletransporte dentro de la región completado.");
+  }
+
+  /**
+   * A TeleportFinish event: the destination simulator's address and the seed
+   * capability for its capabilities, so the agent can be moved there. The event
+   * body is `{ Info: [ { SimIP, SimPort, SeedCapability, ... } ] }` — note the
+   * array, which is easy to miss (and then the address reads as undefined).
+   */
+  onTeleportFinish(body) {
+    const info = Array.isArray(body.Info) ? body.Info[0] : (body.Info || body);
+    const host = ipString(info && info.SimIP);
+    const port = Number(info && info.SimPort) || 0;
+    if (!host || !port) {
+      this.log(`⚠ TeleportFinish sin dirección utilizable (IP ${JSON.stringify(info && info.SimIP)}, puerto ${info && info.SimPort}).`);
+      this.status("El teletransporte llegó incompleto.");
+      return;
+    }
+    const target = this.teleportPending;
+    this.teleportPending = null;
+    clearTimeout(this._tpTimer);
+    this.log(`TeleportFinish: simulador de destino ${host}:${port}` +
+      (target && !target.crossing ? ` (región ${target.gridX}, ${target.gridY})` : "") +
+      (info && info.SeedCapability ? " · con seed capability" : " · sin seed capability"));
+    this.moveToSim(host, port, info && info.SeedCapability ? String(info.SeedCapability) : null, target)
+      .catch((e) => {
+        this.log("⚠ No se pudo entrar en la región de destino: " + ((e && e.message) || e));
+        this.status("El teletransporte falló al conectar con la región.");
+        this.state = "online"; // the old circuit may still be alive
+      });
+  }
+
+  /**
+   * Follows a teleport: drops the old circuit (WITHOUT logging out — that would
+   * end the session) and starts over against the new simulator. A teleport is
+   * really a login into another region: same circuit code, same session, same
+   * agent, and the destination's seed capability instead of login.cgi.
+   */
+  async moveToSim(host, port, seedCap, target) {
+    this.state = "moving";
+    this.queueGeneration = (this.queueGeneration || 0) + 1;  // stops the old event-queue poll
+    for (const id of this.timers) clearInterval(id);
+    this.timers = [];
+    if (this.reportTimer) { clearTimeout(this.reportTimer); this.reportTimer = null; }
+    try { if (this.udp) this.udp.close(); } catch (e) { /* already gone */ }
+    this.udp = null;
+    this.circuit = null;
+    // Nothing that is on screen belongs to the new region.
+    this.objects.clear();
+    this.byLocalID.clear();
+    this.resident.clear();
+    this.avatars.clear();
+    this.names.clear();
+    for (const id of [...this.pendingTextures]) this.pendingTextures.delete(id);
+    this.textureQueue.length = 0;
+    this.textureInFlight = 0;
+    this.compressedSeen = 0;
+    this.compressedTailMisses = 0;
+    this.builtPrims = 0;
+    this.builtTextured = 0;
+    this.builtUntextured = 0;
+    this.terrainPatches = 0;
+    this.layerMessages = 0;
+    this.layerTypes = null;
+    this.layerLogged = this.layerTypeLogged = this.layerZeroLogged = this.layerHeaderLogged = false;
+    this.appearanceInfo = null;
+    if (this.avatarAnims) this.avatarAnims.clear();
+    this.movementComplete = false;
+    this.movementSent = false;
+    this.firstPrimLogged = false;
+    this.firstObjectLogged = false;
+    this.regionHandle = this.regionHandleFor(target && target.gridX || 0, target && target.gridY || 0) || this.regionHandle;
+    this.agentPos = target && target.local ? [target.local[0], target.local[1], target.local[2]] : [128, 128, 25];
+    if (this.app.enterGridMode) this.app.enterGridMode();
+    this.status("Conectando con la región de destino…");
+    // The seed capability belongs to the new region; the old one's capabilities
+    // point at the old simulator and would fetch textures from the wrong place.
+    this.caps = {};
+    if (seedCap) {
+      this.seedCap = seedCap;
+      await this.loadCapabilities(seedCap).catch((e) => this.log("Caps: " + e.message));
+    } else {
+      this.log("⚠ La región de destino no envió seed capability: sin texturas ni cola de eventos hasta otra conexión.");
+    }
+    await this.openCircuit(host, port);
+    this.state = "online";
+    this.startLoops();
+    this.startEventQueue();
   }
 
   // -- message handlers ----------------------------------------------------
@@ -687,6 +920,11 @@ export class SLSession {
       case "StartPingCheck": return this.onStartPing(data);
       case "PacketAck": return this.onPacketAck(data);
       case "SimulatorViewerTimeMessage": return this.onTimeSync(data);
+      case "TeleportStart": return this.onTeleportStart(data);
+      case "TeleportProgress": return this.onTeleportProgress(data);
+      case "TeleportFailed": return this.onTeleportFailed(data);
+      case "TeleportLocal": return this.onTeleportLocal(data);
+      case "TeleportFinish": return this.onTeleportFinish(data);
       case "UUIDNameReply": return this.onUUIDNameReply(data);
       case "AgentDataUpdate": return this.onAgentDataUpdate(data);
       case "AvatarAppearance": return this.onAvatarAppearance(data);
@@ -752,12 +990,16 @@ export class SLSession {
   onMovementComplete(data) {
     const d = data.Data || {};
     this.movementComplete = true;
+    if (d.RegionHandle) this.regionHandle = Number(d.RegionHandle);
     if (d.Position) this.agentPos = d.Position;
     if (this.app.viewer) {
       this.app.viewer.controls.focus(this.agentPos, 12);
       this.app.viewer.controls.groundHeight = (x, y) => this.app.world.heightAt(x, y);
     }
-    this.log(`AgentMovementComplete: estás en ${(d.Position || []).map((v) => Number(v).toFixed(1)).join(", ")} — el mundo debería empezar a llegar.`);
+    const here = this.locationInfo();
+    this.log(`AgentMovementComplete: estás en ${(d.Position || []).map((v) => Number(v).toFixed(1)).join(", ")}` +
+      ` · región «${here.region}» (rejilla ${here.gridX}, ${here.gridY}) — el mundo debería empezar a llegar.`);
+    this.app.ui?.setRegionInfo?.(here);
     // We are really in-world now: keep the session alive in the background and
     // schedule the automatic texture/terrain report (on a real region "white
     // prims" is either "nothing arrived" or "it arrived but did not decode", and
@@ -783,22 +1025,32 @@ export class SLSession {
     this.layerMessages = (this.layerMessages || 0) + 1;
     this.layerTypes = this.layerTypes || {};
     this.layerTypes[type] = (this.layerTypes[type] || 0) + 1;
-    if (!this.layerLogged) {
-      this.layerLogged = true;
-      this.log(`LayerData: primer mensaje — tipo ${type}, ${payload ? payload.length : 0} B` +
-        (payload && payload.length ? `, primeros bytes: ${hexHead(payload, 12)}` : " (sin bloque de datos)"));
+    if (!payload || !payload.length) {
+      if (!this.layerLogged) {
+        this.layerLogged = true;
+        this.log(`LayerData: primer mensaje — tipo ${type}, sin bloque de datos.`);
+      }
+      return;
     }
-    if (!payload || !payload.length) return;
-    if (data.LayerID && data.LayerID.Type !== 0) {
+    // The ground is type 76 (LAYER_TYPE_LAND), not 0: the simulator sends the
+    // water plane as a second stream (type 55) that carries no land heights.
+    // Reading only type 0 is why the terrain never left its placeholder.
+    if (type !== LAYER_TYPE_LAND && type !== 0) {
       if (!this.layerTypeLogged) {
         this.layerTypeLogged = true;
-        this.log(`LayerData: los mensajes llegan con tipo ${data.LayerID.Type} (el terreno es el 0); ese contenido no es una rejilla de alturas y se ignora.`);
+        this.log(`LayerData: llegan tipos ${Object.keys(this.layerTypes).join(", ")} — el terreno es el 76 y los demás (agua) se ignoran.`);
       }
       return;
     }
     try {
+      const { header, patches } = decodeTerrainLayer(payload);
+      if (!this.layerHeaderLogged) {
+        this.layerHeaderLogged = true;
+        this.log(`LayerData: tipo ${type}, cabecera ${header ? `stride 0x${header.stride.toString(16)} patch ${header.patchSize}x${header.patchSize} tipo ${header.type}` : "ausente"}, ` +
+          `${payload.length} B, primeros bytes: ${hexHead(payload, 8)} → ${patches.length} parches.`);
+      }
       let n = 0;
-      for (const patch of decodeTerrainLayer(payload)) {
+      for (const patch of patches) {
         if (patch.patchId >= 1024) continue;
         this.app.world.terrain.applyPatch(patch);
         n++;
@@ -807,7 +1059,7 @@ export class SLSession {
       if (n) this.app.world.setTerrainKnown(true);
       if (!n && !this.layerZeroLogged) {
         this.layerZeroLogged = true;
-        this.log(`Terreno: un LayerData de tipo 0 trae ${payload.length} B y el decodificador no saca ningún parche de ahí` +
+        this.log(`Terreno: un LayerData de tipo ${type} trae ${payload.length} B y el decodificador no saca ningún parche de ahí` +
           ` (empieza por ${payload[0]}, que es el final de flujo: o el bloque viene vacío, o el tamaño delante de los datos no es el que esperamos).`);
       }
       const before = this.terrainPatches || 0;
@@ -1071,8 +1323,31 @@ export class SLSession {
     if (decoded) {
       this.textureCache.set(uuid, decoded);
       if (this.app.world) this.app.world.applyTexture(uuid, decoded);
+      // A sculpt map is geometry, not decoration: hand its pixels to the world so
+      // the prims waiting on it finally get built.
+      if (this.sculptWanted && this.sculptWanted.has(uuid) && this.app.world) {
+        this.sculptWanted.delete(uuid);
+        const img = decoded.bitmap || decoded.image || decoded;
+        if (!this.app.world.setSculptMap(uuid, img)) {
+          this.log(`Escultura ${uuid.slice(0, 8)}: el mapa llegó pero no se pudo leer (¿imagen vacía?).`);
+        }
+      }
       this.stats.textures++;
-      if (!fromCache) await writeCached(key, bytes);
+      if (!fromCache) {
+        // Store the DECODED pixels, not the codestream: a phone pays tens to
+        // hundreds of milliseconds to decode a J2C, and re-decoding every stored
+        // texture on every login is why a region looked just as untextured on the
+        // tenth visit as on the first. The PNG the decoder produced (same size,
+        // far cheaper to read back) is what goes to the device cache; the raw
+        // codestream is only stored when the decoder could not make one.
+        const png = this.lastDecoded && this.lastDecoded.png;
+        await writeCached(key, png || bytes);
+        if (png) this.cachePng = (this.cachePng || 0) + 1;
+      } else if (this.lastDecoded && this.lastDecoded.png) {
+        // Cached as a codestream by an older build: upgrade it in place so the
+        // next visit is fast.
+        await writeCached(key, this.lastDecoded.png);
+      }
     } else {
       this.stats.textureFailures = (this.stats.textureFailures || 0) + 1;
       this.textureProblems = this.textureProblems || [];
@@ -1148,6 +1423,18 @@ export class SLSession {
         ` (${this.builtTextured || 0} con textura real, ${this.builtUntextured || 0} sin textura)`;
       line += ` · comprimidos: ${this.compressedSeen || 0} leídos` +
         (this.compressedTailMisses ? ` (⚠ ${this.compressedTailMisses} sin forma/textura)` : " (todos con forma y textura)");
+      // Sculpted prims get their shape from a texture, so "cuántos se dibujan y
+      // cuántos esperan su mapa" is the difference between "el mundo está roto"
+      // and "las texturas todavía están llegando".
+      if (world.refreshSculptStats) {
+        const sc = world.refreshSculptStats();
+        if (sc.sculpted || sc.mesh) {
+          line += ` · esculturas: ${sc.drawn} dibujadas de ${sc.sculpted}` +
+            (sc.waiting ? `, ${sc.waiting} esperando su mapa` : "") +
+            (sc.degenerate ? `, ${sc.degenerate} con mapa sin relieve` : "") +
+            (sc.mesh ? `, ${sc.mesh} mesh (sin decodificador de mallas todavía)` : "");
+        }
+      }
       line += ` · avatares: ${avs} (con cuerpo ${bodies})` +
         (info ? `, apariencia ${info.count}/${info.expected} parámetros, ${info.weights} con peso, ${info.baked} baked` : ", sin apariencia recibida") +
         `, texturas de avatar pedidas ${world.avatarTextureRequests || 0}` +
@@ -1170,15 +1457,38 @@ export class SLSession {
     return this.caps.GetTexture || this.caps.ViewerAsset || null;
   }
 
+  /**
+   * Bytes -> ImageBitmap. The bytes are either what GetTexture returned (a J2C
+   * codestream, which only the wasm decoder understands) or a copy that came
+   * back out of the on-device cache, which is a PNG (see `fetchTexture`). The
+   * magic decides, not the content type: a cached entry has no type at all, and
+   * feeding a PNG to the J2C decoder fails in a way that looks exactly like "the
+   * texture never arrived".
+   */
   async decodeImage(bytes, contentType) {
     const type = String(contentType || "").toLowerCase().split(";")[0].trim();
     const maxSize = (this.app && this.app.profile && this.app.profile.texMax) || 512;
+    this.lastDecoded = null;
+    const magic = (bytes && bytes.length >= 4) ? `${bytes[0]},${bytes[1]},${bytes[2]},${bytes[3]}` : "";
+    const isPng = magic === "137,80,78,71";
+    const isJpeg = bytes && bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    const isWebp = bytes && bytes.length >= 12 && magic === "82,73,70,70";
+    const isGif = magic === "71,73,70,56";
+    const isBmp = bytes && bytes.length >= 2 && bytes[0] === 66 && bytes[1] === 77;
     try {
-      if (/^(image\/(jpeg|png|webp|bmp|gif|avif))$/.test(type) || type === "image/jpg") {
-        return await fitBitmap(await createImageBitmap(new Blob([bytes], { type })), maxSize);
+      if (isPng || isJpeg || isWebp || isGif || isBmp ||
+          /^(image\/(jpeg|png|webp|bmp|gif|avif))$/.test(type) || type === "image/jpg") {
+        const bmp = await createImageBitmap(new Blob([bytes], { type: type || (isPng ? "image/png" : "image/jpeg") }));
+        this.lastDecoded = { png: isPng ? bytes : null, srcWidth: bmp.width, srcHeight: bmp.height, plain: true };
+        return await fitBitmap(bmp, maxSize);
       }
-      const { decodeJ2C } = await import("./j2c.js");
-      return await decodeJ2C(bytes, maxSize);
+      const { decodeJ2CEx } = await import("./j2c.js");
+      // Only pay for the PNG when it is actually going to be stored.
+      const wantPng = cacheMode() !== "off";
+      const res = await decodeJ2CEx(bytes, maxSize, wantPng);
+      this.lastDecoded = { png: res.png, srcWidth: res.srcWidth, srcHeight: res.srcHeight };
+      this.textureSourceSize = `${res.srcWidth}x${res.srcHeight}`;
+      return res.bitmap;
     } catch (e) {
       this.lastDecodeError = (e && e.message) || String(e);
       return null;
@@ -1572,6 +1882,26 @@ function header(headers, name) {
 
 function hexHead(bytes, n = 12) {
   return [...bytes.slice(0, n)].map((b) => b.toString(16).padStart(2, "0")).join(" ");
+}
+
+/** SLURL positions live inside a region, whose terrain is 256×256 m. */
+function clampRegion(v) {
+  const n = Number(v);
+  return Math.min(255, Math.max(0, Number.isFinite(n) ? n : 128));
+}
+
+/**
+ * SimIP arrives as a 4-byte binary LLSD field (older grids) or as a plain
+ * dotted string (some servers), so accept both and hand back dotted-quad text.
+ */
+function ipString(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value.trim();
+  if (value instanceof Uint8Array || Array.isArray(value)) {
+    const b = Array.from(value);
+    if (b.length === 4 && b.every((x) => Number.isFinite(x))) return b.join(".");
+  }
+  return "";
 }
 
 /**

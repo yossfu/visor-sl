@@ -66,44 +66,77 @@ function idctLine16(src, dst, row) {
   }
 }
 
-// Decodes one TerrainLayer datagram into { patchId, x, y, heightMap } patches.
+/**
+ * The LayerID.Type byte of the LayerData message. The simulator does *not* use
+ * 0 for the ground: it sends the terrain patches as type 76 (0x4c, "land") and a
+ * second stream of type 55 (0x37, "water") that only carries the water plane
+ * heights. A viewer that reads only type 0 therefore never sees a single patch
+ * and keeps its placeholder terrain forever — which is exactly what Lumiya's
+ * `SLAgentCircuit.HandleLayerData` avoids with `if (Type != 76) return;`.
+ * (`LayerData.Java`, `TerrainData.ProcessLayerData`.)
+ */
+export const LAYER_TYPE_LAND = 76;
+export const LAYER_TYPE_WATER = 55;
+
+/**
+ * Decodes one LayerData datagram. The payload is a 4-byte header followed by a
+ * single continuous bit stream of DCT-compressed patches (no re-alignment
+ * between them):
+ *
+ *   stride U16, patchSize U8, type U8, then patch… patch… 0x61 (END_OF_PATCHES)
+ *
+ * Returns `{ header, patches }` where each patch is `{ patchId, x, y, heightMap }`.
+ * A datagram that ends mid-patch (the stream is not aligned to the message) stops
+ * the loop instead of reading zeros forever.
+ */
 export function decodeTerrainLayer(bytes) {
-  const bb = new BitBuffer(bytes);
   const patches = [];
-  for (;;) {
-    const quantWBits = bb.getBits(8);
-    if (quantWBits === 97) break;
-    const dcOffset = bb.getFloat();
-    const range = bb.getBits(16);
-    const patchIds = bb.getBits(10);
-    const wordBits = (quantWBits & 15) + 2;
-    const coeffs = new Int32Array(256);
-    for (let i = 0; i < 256;) {
-      if (bb.getBits(1) === 0) { coeffs[i] = 0; i++; }
-      else if (bb.getBits(1) === 0) { while (i < 256) coeffs[i++] = 0; }
-      else if (bb.getBits(1) !== 0) { coeffs[i] = -bb.getBits(wordBits); i++; }
-      else { coeffs[i] = bb.getBits(wordBits); i++; }
+  if (!bytes || bytes.length < 5) return { header: null, patches };
+  const bb = new BitBuffer(bytes);
+  const header = { stride: bb.getBits(16), patchSize: bb.getBits(8), type: bb.getBits(8) };
+  const size = header.patchSize === 32 ? 32 : 16;
+  const nCells = size * size;
+  try {
+    for (;;) {
+      const quantWBits = bb.getBits(8);
+      if (quantWBits === 97) break;
+      const dcOffset = bb.getFloat();
+      const range = bb.getBits(16);
+      const patchIds = bb.getBits(10);
+      const wordBits = (quantWBits & 15) + 2;
+      const coeffs = new Int32Array(nCells);
+      for (let i = 0; i < nCells;) {
+        if (bb.getBits(1) === 0) { coeffs[i] = 0; i++; }
+        else if (bb.getBits(1) === 0) { while (i < nCells) coeffs[i++] = 0; }
+        else if (bb.getBits(1) !== 0) { coeffs[i] = -bb.getBits(wordBits); i++; }
+        else { coeffs[i] = bb.getBits(wordBits); i++; }
+      }
+      const tmp = new Float32Array(nCells);
+      const ordered = new Float32Array(nCells);
+      for (let i = 0; i < nCells; i++) ordered[i] = coeffs[CopyMatrix16[i]] * DequantizeTable16[i];
+      const mid = new Float32Array(nCells);
+      for (let c = 0; c < size; c++) idctColumn16(ordered, mid, c);
+      for (let r = 0; r < size; r++) idctLine16(mid, tmp, r);
+      const q = (quantWBits >> 4) + 2;
+      const scale = (1.0 / (1 << q)) * range;
+      const base = dcOffset + (1 << (q - 1)) * scale;
+      const heightMap = new Float32Array(nCells);
+      for (let i = 0; i < nCells; i++) heightMap[i] = tmp[i] * scale + base;
+      patches.push({ patchId: patchIds, x: (patchIds >> 5) & 31, y: patchIds & 31, size, heightMap });
     }
-    const tmp = new Float32Array(256);
-    const ordered = new Float32Array(256);
-    for (let i = 0; i < 256; i++) ordered[i] = coeffs[CopyMatrix16[i]] * DequantizeTable16[i];
-    const mid = new Float32Array(256);
-    for (let c = 0; c < 16; c++) idctColumn16(ordered, mid, c);
-    for (let r = 0; r < 16; r++) idctLine16(mid, tmp, r);
-    const q = (quantWBits >> 4) + 2;
-    const scale = (1.0 / (1 << q)) * range;
-    const base = dcOffset + (1 << (q - 1)) * scale;
-    const heightMap = new Float32Array(256);
-    for (let i = 0; i < 256; i++) heightMap[i] = tmp[i] * scale + base;
-    patches.push({ patchId: patchIds, x: (patchIds >> 5) & 31, y: patchIds & 31, heightMap });
+  } catch (e) {
+    // Truncated datagram: keep whatever decoded cleanly and drop the rest.
   }
-  return patches;
+  return { header, patches };
 }
 
-export function serializeTerrainPatches(patches) {
+export function serializeTerrainPatches(patches, header = {}) {
   // inverse of the coeff packer — used by tests/offline tools
   const bits = [];
   const put = (v, n) => { for (let i = n - 1; i >= 0; i--) bits.push((v >> i) & 1); };
+  put(header.stride ?? 16, 16);
+  put(header.patchSize ?? 16, 8);
+  put(header.type ?? LAYER_TYPE_LAND, 8);
   for (const p of patches) {
     put(p.quantWBits & 0xff, 8);
     const f = new DataView(new ArrayBuffer(4));
@@ -168,11 +201,14 @@ export class Terrain {
   }
   applyPatch(patch) {
     const px = patch.x * PATCH_SIZE, py = patch.y * PATCH_SIZE;
+    const size = patch.size || PATCH_SIZE;
+    // A 32x32 patch (some grids) is subsampled onto the 16x16 patch grid.
+    const step = Math.max(1, Math.round(size / PATCH_SIZE));
     for (let j = 0; j < PATCH_SIZE; j++) {
       for (let i = 0; i < PATCH_SIZE; i++) {
         const sx = px + i, sy = py + j;
         if (sx < SAMPLES_PER_EDGE && sy < SAMPLES_PER_EDGE) {
-          this.samples[sy * SAMPLES_PER_EDGE + sx] = patch.heightMap[j * PATCH_SIZE + i];
+          this.samples[sy * SAMPLES_PER_EDGE + sx] = patch.heightMap[(j * step) * size + i * step];
         }
       }
     }

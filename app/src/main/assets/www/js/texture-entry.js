@@ -50,11 +50,23 @@ export class TextureEntry {
 
 class Reader {
   constructor(bytes) { this.b = bytes; this.p = 0; }
-  u8() { return this.b[this.p++]; }
+  // Past the end reads as 0 rather than `undefined`: a truncated TextureEntry
+  // (which real sims do send) used to throw on `undefined.toString` and take the
+  // whole prim down with it.
+  u8() { return this.p < this.b.length ? this.b[this.p++] : 0; }
   s16() { const v = (this.b[this.p] | (this.b[this.p + 1] << 8)); this.p += 2; return (v << 16) >> 16; }
   u32() { const v = (this.b[this.p] | (this.b[this.p + 1] << 8) | (this.b[this.p + 2] << 16) | (this.b[this.p + 3] << 24)) >>> 0; this.p += 4; return v; }
-  f32() { const v = new DataView(this.b.buffer, this.b.byteOffset + this.p, 4).getFloat32(0, true); this.p += 4; return v; }
+  f32() {
+    if (this.p + 4 > this.b.length) { this.p = this.b.length; return 0; }
+    const v = new DataView(this.b.buffer, this.b.byteOffset + this.p, 4).getFloat32(0, true);
+    this.p += 4;
+    return v;
+  }
   uuid() {
+    if (this.p + 16 > this.b.length) {
+      this.p = this.b.length;
+      return "00000000-0000-0000-0000-000000000000";
+    }
     const h = [];
     for (let i = 0; i < 16; i++) h.push(this.b[this.p + i].toString(16).padStart(2, "0"));
     this.p += 16;
@@ -64,12 +76,22 @@ class Reader {
   rgba() {
     return [this.b[this.p] / 255, this.b[this.p + 1] / 255, this.b[this.p + 2] / 255, this.b[this.p + 3] / 255];
   }
+  /**
+   * The variable-length face bitfield. The groups are BIG-endian: each byte
+   * carries the next 7 bits (bit 6..0) of the value, most significant group
+   * first, and the high bit means "another byte follows"
+   * (`unpack_TEField` in the official viewer's llprimitive.cpp, and Lumiya's
+   * SLTextureEntry.ReadFaceBitfield). Reading them little-endian — which this
+   * did — only agrees for a single-byte field, i.e. for prims with 7 faces or
+   * fewer, and silently mis-assigns the texture on everything else.
+   */
   readFaceBitfield() {
-    let value = 0, bits = 0, shift = 0, byte;
+    let value = 0, bits = 0, byte;
     do {
-      byte = this.u8();
-      value |= (byte & 0x7f) << shift;
-      shift += 7; bits += 7;
+      if (this.p >= this.b.length) return { value: 0, bits: 0 };
+      byte = this.b[this.p++];
+      value = ((value << 7) | (byte & 0x7f)) >>> 0;
+      bits += 7;
     } while (byte & 0x80);
     return { value: value >>> 0, bits };
   }

@@ -237,6 +237,37 @@ body.touch-mode .bar.bottom { padding: 5px 8px calc(5px + env(safe-area-inset-bo
 }
 .texcell .hint { text-align: center; font-size: 10.5px; margin-top: 2px; }
 
+/* ---------- Lands panel (region finder + teleport) ---------- */
+.modal.wide.lands { width: 640px; max-height: 94vh; }
+.modal.lands > * { margin-bottom: 5px; }
+.modal.lands h2 { margin-bottom: 4px; }
+.modal.lands .landspicks { margin-bottom: 5px; }
+.modal.lands .landspicks .hint { margin-bottom: 3px; }
+.modal.lands .row.wrap .btn { flex: 0 0 auto; padding: 5px 9px; font-size: 12px; }
+.landsbody { display: grid; grid-template-columns: 1fr; gap: 6px; min-height: 0; }
+.landsleft, .landsright { min-width: 0; }
+.landsright > * { margin-bottom: 6px; }
+.landsmap {
+  /* The canvas is 768×768 internally; it is sized by HEIGHT so the browser keeps
+     the square aspect (width:auto on a replaced element does exactly that), and
+     capped so the whole dialog fits a phone screen — a tall dialog that hides its
+     own "Teletransportar" button is worse than a small map. */
+  height: min(32vh, 78vw); width: auto; max-width: 100%; margin: 0 auto;
+  display: block; border-radius: 8px;
+  border: 1px solid var(--line); background: #0d1319; cursor: crosshair;
+  touch-action: manipulation;
+}
+.landszoom { align-items: center; flex-wrap: wrap; }
+.landszoom .spacer { flex: 1 1 auto; }
+.landszoom .hint { white-space: nowrap; }
+/* Wide/short (a phone held sideways): map and controls side by side, so the
+   teleport button never ends up below the fold. */
+@media (min-aspect-ratio: 1/1) and (min-width: 520px) {
+  .landsbody { grid-template-columns: auto 1fr; }
+  .landsmap { height: min(38vh, 280px); }
+  .landsright .hint { display: none; }
+}
+
 /* ---------- boot overlay ---------- */
 #boot {
   position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;

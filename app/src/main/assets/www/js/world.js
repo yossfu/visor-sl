@@ -56,6 +56,49 @@ export class World {
     // The session registers a texture requester here; the avatar code needs it
     // because baked textures arrive through the same GetTexture queue.
     this.onTextureNeeded = null;
+    // Sculpt maps, keyed by their texture UUID. A sculpted prim draws nothing
+    // until its map has been decoded — drawing the base shape instead is what
+    // fills a region with phantom boxes ("geometrías extrañas").
+    this.sculptMaps = new Map();
+    this.sculptAsked = new Set();   // sculpt ids already requested from the grid
+    this.sculptStats = { sculpted: 0, drawn: 0, waiting: 0, degenerate: 0, mesh: 0 };
+    // The session registers a sculpt requester here (sculpt maps go through the
+    // ordinary texture queue, but the world needs their *pixels*).
+    this.onSculptNeeded = null;
+  }
+
+  /** True when this prim's shape comes from a map rather than from profile×path. */
+  static sculptKind(params) {
+    const t = (params && params.sculptType) || 0;
+    if ((t & 7) === 0) return "none";
+    return (t & 7) === 5 ? "mesh" : "sculpt";
+  }
+
+  /** Turns an ImageBitmap of a sculpt map into the raw RGB the mesh needs. */
+  setSculptMap(uuid, bitmap) {
+    if (!uuid || !bitmap || !bitmap.width || !bitmap.height) return false;
+    try {
+      const w = bitmap.width, h = bitmap.height;
+      const canvas = (typeof OffscreenCanvas !== "undefined")
+        ? new OffscreenCanvas(w, h) : document.createElement("canvas");
+      if (canvas.width !== w) { canvas.width = w; canvas.height = h; }
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(bitmap, 0, 0);
+      const px = ctx.getImageData(0, 0, w, h).data;
+      // The mesh only ever reads R,G,B, so keep just those three per texel.
+      const rgb = new Uint8Array(w * h * 3);
+      for (let i = 0, j = 0; i < px.length; i += 4, j += 3) {
+        rgb[j] = px[i]; rgb[j + 1] = px[i + 1]; rgb[j + 2] = px[i + 2];
+      }
+      this.sculptMaps.set(uuid, { width: w, height: h, components: 3, data: rgb });
+      // Rebuild everything that was waiting for exactly this map.
+      for (const rec of this.objects.values()) {
+        if (rec.params && rec.params.sculptId === uuid) this.rebuildPrim(rec);
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   /**
@@ -221,10 +264,33 @@ export class World {
     return this.texlib.get(key);
   }
 
-  buildPrimGeometry(params, detail) {
-    const vol = primToFaces(params, detail);
+  buildPrimGeometry(params, detail, sculpt) {
+    const vol = primToFaces(params, detail, sculpt);
     if (!vol) return null;
     return vol;
+  }
+
+  /**
+   * How many objects are currently sculpted, drawn, waiting for their map,
+   * rejected and mesh — recomputed on demand so the diagnostics panel and the
+   * phone report always agree with the scene.
+   */
+  refreshSculptStats() {
+    const s = { sculpted: 0, drawn: 0, waiting: 0, degenerate: 0, mesh: 0 };
+    for (const rec of this.objects.values()) {
+      const kind = rec.shapeKind || World.sculptKind(rec.params);
+      if (kind === "mesh") { s.mesh++; continue; }
+      if (kind !== "sculpt") continue;
+      s.sculpted++;
+      if (rec.vol) s.drawn++;
+      else {
+        const id = rec.params && rec.params.sculptId;
+        if (id && this.sculptMaps.has(id)) s.degenerate++;
+        else s.waiting++;
+      }
+    }
+    this.sculptStats = s;
+    return s;
   }
 
   addPrim(obj) {
@@ -295,7 +361,28 @@ export class World {
     const group = new THREE.Group();
     rec.group = group;
     rec.detail = rec.detail || this.detailFor(rec);
-    const vol = this.buildPrimGeometry(rec.params, rec.detail);
+    // Sculpted prims: the geometry comes from the sculpt map (a texture), so the
+    // prim cannot be drawn until that map has been decoded. Mesh prims carry a
+    // mesh asset instead of a shape, which this viewer does not decode yet —
+    // drawing either one as its base cube is exactly what "un sinfín de
+    // geometrías extrañas" looks like, so neither is drawn.
+    const kind = World.sculptKind(rec.params);
+    rec.shapeKind = kind;
+    let vol = null;
+    if (kind === "none") {
+      vol = this.buildPrimGeometry(rec.params, rec.detail, null);
+    } else if (kind === "sculpt") {
+      const id = rec.params.sculptId;
+      const map = id ? this.sculptMaps.get(id) : null;
+      if (map) vol = this.buildPrimGeometry(rec.params, rec.detail, map);
+      else if (id && this.onSculptNeeded && !this.sculptAsked.has(id)) {
+        // Ask once per map: a prim is rebuilt on every LOD change and every move,
+        // and re-asking each time would flood the texture queue with a map that
+        // is already on its way (or already known to be missing).
+        this.sculptAsked.add(id);
+        this.onSculptNeeded(id);
+      }
+    }
     rec.vol = vol;
     if (vol) {
       const shapeSig = rec._shapeSig || (rec._shapeSig = stableKey(rec.params));
@@ -838,6 +925,10 @@ export class World {
     this._avatarErrorReported = false;
     this.resident = this.resident || new Map();
     this.resident.clear();
+    // Sculpt maps of the previous region are kept (they are immutable assets and
+    // re-using one costs nothing), but "already asked for" is reset so a map that
+    // never arrived gets another chance in the region we are entering.
+    if (this.sculptAsked) this.sculptAsked.clear();
     if (this.avatarAppearances) this.avatarAppearances.clear();
     this._lodQueue = [];
     this.selection = null;

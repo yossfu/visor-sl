@@ -16,6 +16,7 @@ import { buildMessage, buildPacket, parsePacket, decodeMessage } from "../udp.js
 import { uuidBytes, uuidString, toBytes } from "../message-template.js";
 import { loadMessageTemplate } from "../sl-session.js";
 import { installSink } from "../transport.js";
+import { LAYER_TYPE_LAND } from "../terrain.js";
 
 export const FAKE = {
   region: "Harness Cove",
@@ -97,6 +98,8 @@ function writer() {
 function terrainPatches(perChunk = 64) {
   const chunks = [];
   let b = bitWriter();
+  const header = () => { b.put(16, 16); b.put(16, 8); b.put(LAYER_TYPE_LAND, 8); };
+  header();
   for (let n = 0; n < 256; n++) {
     const px = Math.floor(n / 16), py = n % 16;
     const h = terrainH(px * 16 + 8, py * 16 + 8);
@@ -111,6 +114,7 @@ function terrainPatches(perChunk = 64) {
       b.put(97, 8);
       chunks.push(b.bytes());
       b = bitWriter();
+      header();
     }
   }
   b.put(97, 8);
@@ -218,8 +222,17 @@ class FakeSim {
     this.defs = t.defs;
     this.index = t.index;
     this.seq = 1000;
-    this.regionHandle = 1000n;
+    this.regionHandle = 1000n * 256n * 4294967296n + 1000n * 256n;  // region (1000, 1000)
+    this.regionName = FAKE.region;
     this.primPositions = new Map();
+  }
+
+  /** The name a teleport destination gets, from its region handle. */
+  regionNameFor(handle) {
+    const h = BigInt(handle);
+    const gx = Number(h >> 32n) / 256;
+    const gy = Number(h & 0xffffffffn) / 256;
+    return `${FAKE.region} (${gx}, ${gy})`;
   }
 
   packet(name, obj, { reliable = false, acks = null } = {}) {
@@ -272,7 +285,7 @@ class FakeSim {
     const out = [];
     out.push(this.packet("RegionHandshake", {
       RegionInfo: {
-        SimName: toBytes(FAKE.region), SimOwner: uuidBytes(AGENT_ID), IsEstateManager: 0,
+        SimName: toBytes(this.regionName || FAKE.region), SimOwner: uuidBytes(AGENT_ID), IsEstateManager: 0,
         WaterHeight: FAKE.water, BillableFactor: 1, CacheID: uuidBytes(AGENT_ID),
         TerrainStartHeight00: 10, TerrainStartHeight01: 20, TerrainHeightRange00: 50, TerrainHeightRange01: 60,
         SimAccess: 13, RegionFlags: 0,
@@ -281,14 +294,14 @@ class FakeSim {
     }));
     out.push(this.packet("AgentMovementComplete", {
       AgentData: { AgentID: uuidBytes(AGENT_ID), SessionID: uuidBytes(SESSION_ID) },
-      Data: { Position: FAKE.agentPos, LookAt: [1, 0, 0], RegionHandle: this.regionHandle, Timestamp: performance.now() },
+      Data: { Position: this.movementPos || FAKE.agentPos, LookAt: [1, 0, 0], RegionHandle: this.regionHandle, Timestamp: performance.now() },
       SimData: { ChannelVersion: new Uint8Array(0), SimulatorVersion: toBytes("harness") },
     }));
     out.push(this.packet("SimulatorViewerTimeMessage", {
       TimeInfo: { UsecSinceStart: 0.35 * 86400 * 1e6, SecPerDay: 86400, SecPerYear: 31536000, SunDirection: [0.4, 0.3, 0.85], SunPhase: 0.35, Phase: 0.35 },
     }));
     for (const chunk of terrainPatches()) {
-      out.push(this.packet("LayerData", { LayerID: { Type: 0 }, LayerData: { Data: chunk } }));
+      out.push(this.packet("LayerData", { LayerID: { Type: LAYER_TYPE_LAND }, LayerData: { Data: chunk } }));
     }
 
     const prims = this.buildPrims();
@@ -372,6 +385,22 @@ class FakeSim {
       }));
     }
     if (def.name === "AgentUpdate") this.agentUpdates = (this.agentUpdates || 0) + 1;
+    // A teleport, done the way the real protocol does it: the request is answered
+    // on UDP with TeleportStart, and the final TeleportFinish (the destination
+    // simulator's address) arrives later on the CAPS event queue — being able to
+    // run that whole path without a real grid is the point of the harness.
+    if (def.name === "TeleportLocationRequest") {
+      const info = decodeMessage(def, packet).data.Info || {};
+      const handle = Number(info.RegionHandle) || this.regionHandle;
+      this.regionHandle = handle;
+      this.movementPos = info.Position || FAKE.agentPos;
+      this.regionName = this.regionNameFor(handle);
+      this.pendingTeleport = { RegionHandle: handle, Position: this.movementPos };
+      reply.push(this.packet("TeleportStart", { Info: { TeleportFlags: 1 } }));
+      reply.push(this.packet("TeleportProgress", {
+        Info: { TeleportFlags: 1, Message: toBytes("Preparando el destino") },
+      }));
+    }
     if (def.name === "ChatFromViewer") {
       const msg = decodeMessage(def, packet).data.ChatData || {};
       reply.push(this.packet("ChatFromSimulator", {
@@ -496,7 +525,33 @@ async function httpAnswer(url, method) {
     }
   }
   if (url.includes("EventQueueGet")) {
-    await new Promise((r) => setTimeout(r, 20000));
+    // A pending teleport is answered here, on the event queue, exactly like the
+    // grid does it: the destination simulator's IP/port and its seed capability.
+    const sim = httpAnswer._sim;
+    if (sim && sim.pendingTeleport) {
+      const t = sim.pendingTeleport;
+      sim.pendingTeleport = null;
+      return {
+        text: LLSD.toXML({
+          events: [{
+            message: "TeleportFinish",
+            body: {
+              Info: [{
+                AgentID: uuidBytes(AGENT_ID), LocationID: 1, TeleportFlags: 1,
+                SimIP: new Uint8Array([127, 0, 0, 1]), SimPort: 13007,
+                SeedCapability: FAKE.seedUrl + "/destino", RegionHandle: t.RegionHandle,
+              }],
+            },
+          }],
+          id: 1,
+        }),
+        type: "application/llsd+xml",
+      };
+    }
+    // The real queue holds the request open until something happens; the harness
+    // re-polls on a short cycle so the test does not have to wait 20 s for the
+    // next event to come down.
+    await new Promise((r) => setTimeout(r, 1500));
     return { text: LLSD.toXML({ events: [], id: 0 }), type: "application/llsd+xml" };
   }
   await new Promise((r) => setTimeout(r, 300));
@@ -547,6 +602,7 @@ export async function installFakeGrid(opts = {}) {
 
   async function respondHttp(req) {
     let answer;
+    httpAnswer._sim = sim;
     try {
       answer = await httpAnswer(String(req.url), req.method || "GET");
     } catch (e) {
@@ -581,7 +637,7 @@ export async function installFakeGrid(opts = {}) {
   window.VisorNative = {
     platform: () => JSON.stringify({
       platform: "android", sdk: 36, model: "harness", manufacturer: "Perchance",
-      appVersion: "1.4.0", appBuild: 5, nativeBridge: true, udp: true,
+      appVersion: "1.5.0", appBuild: 6, nativeBridge: true, udp: true,
     }),
     netInfo: () => JSON.stringify({ tipo: "wifi (simulada)", validada: true, sinMedir: true, udpOk: true, puertoDePrueba: 40000 }),
     log: (m) => console.log("[harness nativo]", m),
@@ -700,9 +756,34 @@ export async function installFakeGrid(opts = {}) {
 }
 
 /** Installs the harness and connects the app to it (used by ?test=grid). */
-export async function runFakeGrid(app, opts = {}) {  const sim = await installFakeGrid(opts);
+export async function runFakeGrid(app, opts = {}) {
+  const sim = await installFakeGrid(opts);
   await app.connect({ grid: "agni", name: "Tú Resident", password: "harness", status: (t) => app.ui.log("[harness] " + t) });
+  app.ui.hideModal();
   app.ui.log("⚠ MODO PRUEBA (?test=grid): simulador falso en memoria; objetos, terreno y texturas son sintéticos.");
+  // `?test=grid&tp=1004,1006` runs a real teleport through the harness once the
+  // first region has finished streaming, so the whole path (request -> UDP
+  // TeleportStart -> event-queue TeleportFinish -> new circuit) is exercised in
+  // the preview instead of for the first time on a phone.
+  const want = String(location.search).match(/[?&]tp=(-?\d+),(-?\d+)/);
+  if (want) {
+    const gx = +want[1], gy = +want[2];
+    app.ui.log(`[harness] teletransporte de prueba a (${gx}, ${gy})…`);
+    setTimeout(async () => {
+      const ok = app.session && app.session.teleportToRegion(gx, gy, [96, 96, 25]);
+      app.ui.log(`[harness] petición de teletransporte ${ok ? "enviada" : "no enviada"}.`);
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        const s = app.session;
+        if (s && s.regionName && s.regionName.includes(`(${gx}, ${gy})`)) {
+          app.ui.log(`[harness] teletransporte completado: ${s.regionName}, posición ${(s.agentPos || []).map((v) => Math.round(v)).join(", ")}.`);
+          return;
+        }
+        if (!s || s.state === "offline") { app.ui.log("[harness] la sesión se cerró durante el teletransporte."); return; }
+      }
+      app.ui.log("[harness] el teletransporte no llegó a completarse en 30 s.");
+    }, 9000);
+  }
   return sim;
 }
 

@@ -487,5 +487,10 @@ export function boot() {
     app.ui.hideModal();
     app.loadDemo();
   }
+  if (params.includes("test=sculpt")) {
+    import("./test/sculpt-test.js")
+      .then((m) => m.runSculptTest(app))
+      .catch((e) => app.ui.error("harness de esculturas: " + ((e && e.message) || e)));
+  }
   return app;
 }

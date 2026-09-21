@@ -1,6 +1,6 @@
 // HUD / panels. Plain DOM, no framework.
 import { md5Hex } from "./md5.js";
-import { prefsAll, prefsSet, storageInfo, storageStatus, requestStorage, pickFolder, saveToDownloads, cacheClear, platformInfo } from "./transport.js";
+import { prefsAll, prefsSet, storageInfo, storageStatus, requestStorage, pickFolder, saveToDownloads, cacheClear, platformInfo, httpRequest } from "./transport.js";
 import { CACHE_REV, cacheMode, setCacheMode, verifyCache, wipeCache } from "./cache.js";
 import { PROFILES, profileNames } from "./perf.js";
 import { fullReport, bootCheck } from "./diag.js";
@@ -34,6 +34,92 @@ const TEXTURES = [
   ["", "Predeterminada"], ["gen:wood", "Madera"], ["gen:brick", "Ladrillo"],
   ["gen:metal", "Metal"], ["gen:grid", "Rejilla"], ["gen:sign:Visor SL", "Cartel"],
 ];
+
+// ---------------------------------------------------------------------------
+// Lands: the region finder and the teleporter
+//
+// Nothing here is cached in the device's texture cache: the map tiles change
+// constantly and a region lookup is a small HTML page, so they live in this
+// little in-memory map for the length of the session.
+// ---------------------------------------------------------------------------
+
+const LANDS_TILE_PX = 256;      // map tiles are 256×256
+const LANDS_REGION_M = 256;     // and a region is 256×256 m
+// The map CDN answers 403 to a request with no User-Agent (the CORS-free proxy
+// sends none unless asked), so the tiles are always asked for with one.
+const LANDS_HEADERS = { "User-Agent": "Mozilla/5.0 (compatible; VisorSL)", Accept: "image/jpeg,text/html,*/*" };
+const landsNet = new Map();
+
+/** One request per URL, shared by the tiles and the region lookups. */
+function landsGet(url, timeout = 30000) {
+  let p = landsNet.get(url);
+  if (!p) {
+    p = httpRequest({ url, timeout, headers: LANDS_HEADERS });
+    p.catch(() => landsNet.delete(url));
+    landsNet.set(url, p);
+  }
+  return p;
+}
+
+function landsTile(z, gx, gy) {
+  // `gx`/`gy` are the region coordinates of the tile's south-west corner; at
+  // zoom 1 one tile is exactly one region (secondlife-maps-cdn tile scheme).
+  return `https://map.secondlife.com/map-${z}-${gx}-${gy}-objects.jpg`;
+}
+
+async function landsLoadTile(url) {
+  const key = "img:" + url;
+  let p = landsNet.get(key);
+  if (!p) {
+    p = landsGet(url).then(async (res) => {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await createImageBitmap(new Blob([res.bytes], { type: "image/jpeg" }));
+    });
+    p.catch(() => landsNet.delete(key));
+    landsNet.set(key, p);
+  }
+  return p;
+}
+
+/**
+ * Region name -> grid coordinates, through the public maps site. Its region
+ * pages carry `data-region-coords-x/y` for any region that exists (and a
+ * `data-region-coords-error` marker for the ones that do not), which is the only
+ * name→coordinate lookup that needs no key and no login.
+ */
+async function landsLookupRegion(name) {
+  const url = "https://maps.secondlife.com/secondlife/" + encodeURIComponent(name) + "/128/128/25";
+  const res = await landsGet(url);
+  const html = res.text || "";
+  if (/data-region-coords-error/.test(html)) return null;
+  const x = html.match(/data-region-coords-x="(-?\d+)"/);
+  const y = html.match(/data-region-coords-y="(-?\d+)"/);
+  if (!x || !y) return null;
+  const title = html.match(/<title>[^<]*\|\s*([^<]+)<\/title>/i);
+  const inJson = html.match(/"region":\{"name":"([^"]+)"/);
+  const display = (title && title[1].trim()) || (inJson && inJson[1]) || name;
+  return { name: display, gx: +x[1], gy: +y[1] };
+}
+
+/** Accepts a region name, a `secondlife://` or maps.secondlife.com SLURL, or "x, y". */
+async function landsResolve(query) {
+  const text = String(query || "").trim().replace(/^["']|["']$/g, "");
+  if (!text) return null;
+  let m = text.match(/^secondlife:\/\/([^/\s]+)(?:\/([\d.]+))?(?:\/([\d.]+))?(?:\/([\d.]+))?/i)
+    || text.match(/^https?:\/\/(?:www\.)?maps\.secondlife\.com\/secondlife\/([^/\s?]+)(?:\/([\d.]+))?(?:\/([\d.]+))?(?:\/([\d.]+))?/i)
+    || text.match(/^([A-Za-z0-9' ._+-]+?)[\s/]+([\d.]+)[\s/]+([\d.]+)(?:[\s/]+([\d.]+))?$/);
+  if (m) {
+    const name = decodeURIComponent(m[1]).replace(/[+_]/g, " ").trim();
+    const local = [Number(m[2]) || 128, Number(m[3]) || 128, Number(m[4]) || 25];
+    const found = await landsLookupRegion(name);
+    if (!found) return { error: `No encuentro la región «${name}» en el grid.` };
+    return Object.assign(found, { local });
+  }
+  m = text.match(/^(-?\d{1,5})\s*[,;\s]\s*(-?\d{1,5})$/);
+  if (m) return { name: `Región ${m[1]}, ${m[2]}`, gx: +m[1], gy: +m[2], local: [128, 128, 25] };
+  const found = await landsLookupRegion(text);
+  return found || { error: `No encuentro la región «${text}» en el grid.` };
+}
 
 export class UI {
   constructor(app) {    this.app = app;
@@ -74,6 +160,7 @@ export class UI {
       this.regionEl, this.fpsEl, this.trisEl, this.objEl, this.netEl,
       el("span", { class: "spacer" }),
       el("button", { class: "btn", onclick: () => this.toggleFly(), id: "flyBtn", text: "Volar (F)" }),
+      el("button", { class: "btn", onclick: () => this.showLands(), text: "Lands" }),
       el("button", { class: "btn", onclick: () => this.cycleQuality(), text: "Calidad" }),
       el("button", { class: "btn", onclick: () => this.togglePanel("inspector"), text: "Inspector" }),
       el("button", { class: "btn accent", onclick: () => this.showLogin(), text: "Conectar a SL" }),
@@ -129,6 +216,9 @@ export class UI {
       el("h3", { text: "Sesión" }),
       b("Conectar a Second Life", () => this.showLogin()),
       b("Desconectar", () => this.app.disconnect()),
+      el("h3", { text: "Mundos" }),
+      b("Buscar tierras y teletransportarse", () => this.showLands()),
+      el("div", { class: "hint", text: "Busca una región por nombre o SLURL y teletranspórtate a un punto exacto dentro de ella. Para probar el teletransporte, cualquier región pública (por ejemplo «Ahern» o «Sandbox Cordova») sirve." }),
       el("h3", { text: "Crear prim" }),
       el("div", { class: "row wrap" }, [
         b("Cubo", () => this.app.spawn({ profileCurve: 1, pathCurve: 16 })),
@@ -585,6 +675,303 @@ export class UI {
       el("div", { class: "row wrap" }, [el("button", { class: "btn", text: "Cerrar", onclick: close })]),
       el("div", { class: "hint", text: "Son los píxeles que el visor tiene en memoria, tal cual los devolvió el decodificador JPEG2000. Una captura de esta pantalla dice de un vistazo si las texturas del grid llegan bien." }),
     ]));
+  }
+
+  /**
+   * The region name and the place inside it, straight from the session. The
+   * top bar shows it, and the Lands panel uses it to answer "where am I?" and to
+   * offer a one-click teleport to the region we are already in.
+   */
+  setRegionInfo(here) {
+    this.region = here || null;
+    if (this.regionEl && here && here.region) {
+      const coords = Number.isFinite(here.gridX) && Number.isFinite(here.gridY) ? ` (${here.gridX}, ${here.gridY})` : "";
+      this.regionEl.textContent = here.region + coords;
+    }
+    if (this.landsHereEl) this.landsHereEl.textContent = this.hereText();
+  }
+
+  hereText() {
+    const s = this.app.session;
+    const here = this.region || (s && s.locationInfo ? s.locationInfo() : null);
+    if (!here || !here.region || here.region === "?") return "Sin región: conéctate para poder teletransportarte.";
+    const p = here.local || [0, 0, 0];
+    return `Estás en ${here.region} (${here.gridX}, ${here.gridY}) · posición ${p.map((v) => Math.round(v)).join(", ")}`;
+  }
+
+  /** Region search + grid map + teleport. */
+  showLands() {
+    const m = this.modalHost;
+    m.innerHTML = "";
+    m.classList.remove("hidden");
+    const close = () => { m.classList.add("hidden"); m.innerHTML = ""; this.landsHereEl = null; };
+    const sess = this.app.session;
+    const startHere = this.region || (sess && sess.locationInfo ? sess.locationInfo() : null);
+    const state = {
+      z: 2,
+      gx: startHere && Number.isFinite(startHere.gridX) ? startHere.gridX : 1000,
+      gy: startHere && Number.isFinite(startHere.gridY) ? startHere.gridY : 1000,
+      target: null,
+    };
+
+    const W = LANDS_TILE_PX * 3;
+    const view = el("canvas", { class: "landsmap", width: W, height: W });
+    const octx = view.getContext("2d");
+    const tileLayer = document.createElement("canvas");
+    tileLayer.width = W;
+    tileLayer.height = W;
+    const tctx = tileLayer.getContext("2d");
+
+    const search = el("input", { class: "num wide", placeholder: "Nombre de la región o SLURL (p. ej. Sandbox Cordova)" });
+    const status = el("div", { class: "hint", text: "Busca una región, o toca el mapa para elegir el punto exacto." });
+    const targetEl = el("div", { class: "hint", text: "Ninguna región seleccionada." });
+    const hereEl = el("div", { class: "hint", text: this.hereText() });
+    this.landsHereEl = hereEl;
+    const lx = el("input", { class: "num", type: "number", min: 0, max: 256, step: 1, value: 128 });
+    const ly = el("input", { class: "num", type: "number", min: 0, max: 256, step: 1, value: 128 });
+    const lz = el("input", { class: "num", type: "number", min: 0, max: 4096, step: 1, value: 25 });
+    const tpBtn = el("button", { class: "btn accent", text: "Teletransportar" });
+    const zoomOut = el("button", { class: "btn", text: "−" });
+    const zoomIn = el("button", { class: "btn", text: "+" });
+    const zoomLabel = el("span", { class: "hint" });
+    const hereBtn = el("button", { class: "btn", text: "Centrar en mí" });
+
+    const span = () => 1 << (state.z - 1);
+    // The map is three tiles across and three down, with the tile that holds the
+    // current region in the middle. Rows run north (top) to south (bottom): in a
+    // map tile the highest region coordinate is the top row, and y grows north.
+    const origin = () => ({ tx: Math.floor(state.gx / span()) - 1, ty: Math.floor(state.gy / span()) + 1 });
+    const box = () => {
+      const s = span(), o = origin();
+      return { s, left: o.tx * s * LANDS_REGION_M, top: (o.ty + 1) * s * LANDS_REGION_M };
+    };
+    const canvasToWorld = (cx, cy) => {
+      const { s, left, top } = box();
+      const wx = left + cx * s;
+      const wy = top - cy * s - 0.5;
+      const gx = Math.floor(wx / LANDS_REGION_M);
+      const gy = Math.floor(wy / LANDS_REGION_M);
+      return { gx, gy, x: Math.round(wx - gx * LANDS_REGION_M), y: Math.round(wy - gy * LANDS_REGION_M) };
+    };
+    const worldToCanvas = (gx, gy, x = 128, y = 128) => {
+      const { s, left, top } = box();
+      return {
+        cx: (gx * LANDS_REGION_M + x - left) / s,
+        cy: (top - (gy * LANDS_REGION_M + y)) / s,
+      };
+    };
+
+    let drawGen = 0;
+    const drawTiles = async () => {
+      const gen = ++drawGen;
+      const s = span(), o = origin();
+      tctx.fillStyle = "#0d1319";
+      tctx.fillRect(0, 0, W, W);
+      compose();
+      const jobs = [];
+      for (let j = 0; j < 3; j++) {
+        for (let i = 0; i < 3; i++) {
+          const gx = o.tx + i, gy = o.ty - j;
+          if (gx < 0 || gy < 0) continue;
+          jobs.push(landsLoadTile(landsTile(state.z, gx * s, gy * s)).then((bmp) => {
+            if (gen !== drawGen) return;
+            tctx.drawImage(bmp, i * LANDS_TILE_PX, j * LANDS_TILE_PX, LANDS_TILE_PX, LANDS_TILE_PX);
+            compose();
+          }).catch(() => { /* a tile with no image (empty region) stays dark */ }));
+        }
+      }
+      await Promise.all(jobs);
+    };
+
+    const compose = () => {
+      const s = span(), o = origin();
+      const cell = LANDS_TILE_PX / s;
+      octx.clearRect(0, 0, W, W);
+      octx.drawImage(tileLayer, 0, 0);
+      // The region grid: without it a tile of empty water looks like the end of
+      // the world, when it is really "no region here yet".
+      octx.strokeStyle = "rgba(255,255,255,.18)";
+      octx.lineWidth = 1;
+      for (let k = 0; k <= 3 * s; k++) {
+        const p = Math.round(k * cell) + 0.5;
+        octx.beginPath(); octx.moveTo(p, 0); octx.lineTo(p, W); octx.stroke();
+        octx.beginPath(); octx.moveTo(0, p); octx.lineTo(W, p); octx.stroke();
+      }
+      if (cell >= 44) {
+        octx.font = "11px system-ui, sans-serif";
+        octx.textAlign = "center";
+        octx.textBaseline = "middle";
+        for (let col = 0; col < 3 * s; col++) {
+          for (let row = 0; row < 3 * s; row++) {
+            const gx = o.tx * s + col;
+            const gy = o.ty * s + s - 1 - row;
+            if (gx < 0 || gy < 0) continue;
+            octx.fillStyle = "rgba(255,255,255,.55)";
+            octx.fillText(`${gx},${gy}`, (col + 0.5) * cell, (row + 0.5) * cell);
+          }
+        }
+      }
+      if (state.target) {
+        const t = state.target;
+        const cellCol = t.gx - o.tx * s, cellRow = (o.ty * s + s - 1) - t.gy;
+        octx.strokeStyle = "#35e39b";
+        octx.lineWidth = 3;
+        octx.strokeRect(cellCol * cell + 1, cellRow * cell + 1, cell - 2, cell - 2);
+        const p = worldToCanvas(t.gx, t.gy, Number(lx.value) || 128, Number(ly.value) || 128);
+        octx.beginPath();
+        octx.arc(p.cx, p.cy, 6, 0, Math.PI * 2);
+        octx.fillStyle = "#35e39b";
+        octx.fill();
+        octx.lineWidth = 2;
+        octx.strokeStyle = "#04130c";
+        octx.stroke();
+      }
+      const here = this.region || (this.app.session && this.app.session.locationInfo ? this.app.session.locationInfo() : null);
+      if (here && Number.isFinite(here.gridX) && here.region && here.region !== "?") {
+        const p = worldToCanvas(here.gridX, here.gridY, (here.local && here.local[0]) || 128, (here.local && here.local[1]) || 128);
+        if (p.cx >= -10 && p.cx <= W + 10 && p.cy >= -10 && p.cy <= W + 10) {
+          octx.beginPath();
+          octx.arc(p.cx, p.cy, 7, 0, Math.PI * 2);
+          octx.lineWidth = 3;
+          octx.strokeStyle = "#ffd34d";
+          octx.stroke();
+          octx.beginPath();
+          octx.arc(p.cx, p.cy, 2.5, 0, Math.PI * 2);
+          octx.fillStyle = "#ffd34d";
+          octx.fill();
+        }
+      }
+    };
+
+    const setTarget = (gx, gy, local) => {
+      state.target = { gx, gy, name: state.target && state.target.gx === gx && state.target.gy === gy ? state.target.name : null };
+      if (local) {
+        lx.value = Math.round(local[0]);
+        ly.value = Math.round(local[1]);
+        if (local[2] != null) lz.value = Math.round(local[2]);
+      }
+      refreshTarget();
+      compose();
+    };
+    const refreshTarget = () => {
+      const t = state.target;
+      if (!t) return;
+      const local = [Number(lx.value) || 0, Number(ly.value) || 0, Number(lz.value) || 0];
+      targetEl.textContent = `Destino: ${t.name || "región"} (${t.gx}, ${t.gy}) · punto ${local.map((v) => Math.round(v)).join(", ")} dentro de la región.`;
+    };
+
+    const updateZoom = () => { zoomLabel.textContent = `zoom ${state.z}`; };
+
+    const goTo = (gx, gy, local, name) => {
+      state.gx = Math.max(0, Math.round(gx));
+      state.gy = Math.max(0, Math.round(gy));
+      state.target = { gx: state.gx, gy: state.gy, name: name || null };
+      if (local) {
+        lx.value = Math.round(local[0]);
+        ly.value = Math.round(local[1]);
+        if (local[2] != null) lz.value = Math.round(local[2]);
+      } else {
+        lx.value = 128; ly.value = 128;
+        if (lz.value === "" || lz.value == null) lz.value = 25;
+      }
+      refreshTarget();
+      drawTiles();
+      compose();
+    };
+
+    const doSearch = async () => {
+      const q = search.value;
+      if (!String(q || "").trim()) return;
+      status.textContent = "Buscando…";
+      try {
+        const found = await landsResolve(q);
+        if (!found) { status.textContent = "No encuentro esa región."; return; }
+        if (found.error) { status.textContent = found.error; return; }
+        goTo(found.gx, found.gy, found.local, found.name);
+        status.textContent = `${found.name} está en (${found.gx}, ${found.gy}). Toca el mapa para afinar el punto y pulsa Teletransportar.`;
+      } catch (e) {
+        status.textContent = "La búsqueda falló: " + ((e && e.message) || e);
+      }
+    };
+
+    search.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+    view.addEventListener("click", (e) => {
+      const r = view.getBoundingClientRect();
+      const cx = (e.clientX - r.left) * (W / r.width);
+      const cy = (e.clientY - r.top) * (W / r.height);
+      const w = canvasToWorld(cx, cy);
+      if (w.gx < 0 || w.gy < 0) return;
+      setTarget(w.gx, w.gy, [w.x, w.y, Number(lz.value) || 25]);
+      status.textContent = `Punto elegido en (${w.gx}, ${w.gy}) a ${w.x}, ${w.y} m dentro de la región.`;
+    });
+    zoomOut.addEventListener("click", () => { if (state.z > 1) { state.z--; updateZoom(); drawTiles(); } });
+    zoomIn.addEventListener("click", () => { if (state.z < 5) { state.z++; updateZoom(); drawTiles(); } });
+    hereBtn.addEventListener("click", () => {
+      const here = this.region || (this.app.session && this.app.session.locationInfo ? this.app.session.locationInfo() : null);
+      if (!here || !Number.isFinite(here.gridX) || here.region === "?") { status.textContent = "Todavía no sé en qué región estás."; return; }
+      goTo(here.gridX, here.gridY, here.local, here.region);
+      status.textContent = `Centrado en ${here.region}.`;
+    });
+    for (const inp of [lx, ly, lz]) inp.addEventListener("input", refreshTarget);
+    tpBtn.addEventListener("click", () => {
+      const t = state.target;
+      if (!t) { status.textContent = "Elige primero una región en el mapa o búscala por nombre."; return; }
+      const s = this.app.session;
+      if (!s || s.state !== "online") { status.textContent = "Sin sesión activa: conéctate para teletransportarte."; return; }
+      const point = [
+        Math.max(0, Math.min(256, Number(lx.value) || 128)),
+        Math.max(0, Math.min(256, Number(ly.value) || 128)),
+        Math.max(0, Number(lz.value) || 25),
+      ];
+      if (s.teleportToRegion(t.gx, t.gy, point)) {
+        status.textContent = `Teletransportando a ${t.name || `${t.gx}, ${t.gy}`}…`;
+        this.log(`Teletransporte a ${t.name || "región"} (${t.gx}, ${t.gy}) en ${point.map((v) => Math.round(v)).join(", ")}.`);
+      } else {
+        status.textContent = "No se pudo enviar la petición de teletransporte.";
+      }
+    });
+
+    const inputs = (label, input) => el("label", { class: "slider" }, [el("span", { class: "lab", text: label }), input]);
+    // Quick picks from the generator's own config list (main.pjs), so the test
+    // regions live where the user can edit them without touching the viewer.
+    const picks = [];
+    try {
+      const list = (typeof root !== "undefined" && root && root.regionesDePrueba) ? root.regionesDePrueba.selectAll : [];
+      for (const item of list) {
+        const name = String(item.evaluateItem || "").trim();
+        if (!name) continue;
+        picks.push(el("button", {
+          class: "btn", text: name,
+          onclick: () => { search.value = name; doSearch(); },
+        }));
+      }
+    } catch (_) { /* the generator may not define the list */ }
+    m.appendChild(el("div", { class: "modal wide lands" }, [
+      el("h2", { text: "Buscar tierras y teletransportarse" }),
+      el("div", { class: "row" }, [search, el("button", { class: "btn", text: "Buscar", onclick: doSearch })]),
+      status,
+      el("div", { class: "landspicks" }, [
+        el("div", { class: "hint", text: "Regiones de prueba (se pueden editar en main.pjs):" }),
+        el("div", { class: "row wrap" }, picks),
+      ]),
+      el("div", { class: "landsbody" }, [
+        el("div", { class: "landsleft" }, [
+          hereEl,
+          el("div", { class: "row landszoom" }, [zoomOut, zoomLabel, zoomIn, el("span", { class: "spacer" }), hereBtn]),
+          view,
+        ]),
+        el("div", { class: "landsright" }, [
+          targetEl,
+          el("div", { class: "row wrap" }, [inputs("X", lx), inputs("Y", ly), inputs("Z", lz)]),
+          el("div", { class: "row" }, [tpBtn, el("button", { class: "btn", text: "Cerrar", onclick: close })]),
+          el("div", { class: "hint", text: "El mapa es el del grid (map.secondlife.com). El recuadro verde marca la región y el punto, el lugar exacto; el círculo amarillo eres tú. Tocar el mapa elige región y posición dentro de ella." }),
+        ]),
+      ]),
+    ]));
+
+    zoomLabel.textContent = "zoom " + state.z;
+    updateZoom();
+    drawTiles();
   }
 
   logText() {

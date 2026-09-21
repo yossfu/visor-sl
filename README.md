@@ -49,11 +49,20 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
 
 ## 2. Qué hace ya
 
-- **Motor de prims fiel a Lumiya**: `prims.js` es un port de `PrimProfile`,
-  `PrimPath`, `PrimVolume`, `PrimVolumeFace` (cortes, huecos, torsión, estrechamiento,
-  inclinación, revoluciones, curvas de perfil/camino, revolución completa…).
-- **Terreno SL**: decodificación DCT de las capas (`LayerData`) con
-  `decodeTerrainLayer` + mezcla de 4 texturas por altura/pendiente.
+- **Prims con forma real, esculturas incluidas**: `prims.js` es un port de
+  `PrimProfile`, `PrimPath`, `PrimVolume`, `PrimVolumeFace` (cortes, huecos,
+  torsión, estrechamiento, inclinación, revoluciones, curvas de perfil/camino,
+  revolución completa…) y, desde la ronda 10, **las esculturas**: la forma sale
+  de un *sculpt map* (R,G,B → X,Y,Z) con la resolución, las costuras y los flags
+  del visor oficial. Un prim esculpido al que todavía no le ha llegado su mapa,
+  y un objeto *mesh* (malla que este visor aún no decodifica), **no se dibujan**
+  — antes se dibujaba su forma base y eso llenaba la región de cajas.
+- **Buscador de tierras y teletransporte**: por nombre, SLURL o coordenadas de
+  rejilla, con el mapa del grid, elección del punto exacto dentro de la región y
+  `TeleportLocationRequest` → circuito nuevo en el simulador de destino.
+- **Terreno SL**: decodificación DCT de las capas (`LayerData`, tipo **76** con
+  su cabecera de 4 bytes) con `decodeTerrainLayer` + mezcla de 4 texturas por
+  altura/pendiente.
 - **TextureEntry real**: parseo del formato de red (bitfield por cara con
   continuación de 7 bits, RGBA, repeat/offset/rotation, glow, material, media).
 - **Protocolo SL completo** (`message_template.msg` de 483 mensajes):
@@ -280,10 +289,79 @@ terreno sigue plano» tiene dos causas posibles —el simulador no manda parches
 los manda con un `LayerID` que este código no esperaba— y ahora el informe las
 distingue.
 
+## 2d. Ronda 10 — que el mundo cargue de verdad, y poder teletransportarse
+
+El informe 7 (móvil, 900 prims) dejó claro el cuadro: `LayerData` **sí** llegaba
+(113 mensajes, `tipos 55×85, 76×28`) y el terreno seguía en «PLACEHOLDER PLANO»;
+en pantalla, «cubos con cuadrículas blancas y un sinfín de geometrías extrañas».
+Eso apuntaba a tres cosas distintas y se arreglaron las tres:
+
+- [x] **El terreno es el tipo 76, no el 0, y lleva cabecera.** El simulador manda
+      la tierra como `LayerID.Type = 76` (`LAYER_TYPE_LAND`) y el agua como 55;
+      leer sólo el 0 es la razón de que **nunca** llegara terreno. Además el
+      bloque empieza con 4 bytes (`stride U16`, `patchSize U8`, `type U8`) antes
+      del flujo DCT (`TerrainData.ProcessLayerData` en Lumiya). `terrain.js`
+      lee esa cabecera, `sl-session.js` acepta el 76 e ignora el 55, y el
+      simulador falso del arnés la escribe (ida y vuelta probada).
+- [x] **La máscara de caras del `TextureEntry` estaba al revés.** Los grupos de
+      7 bits van en **big-endian** (lo confirma `unpack_TEField` en
+      `llprimitive.cpp` del visor oficial: `index_flags <<= 7; index_flags |=
+      (sbit & 0x7F)`). Leerlos al revés coincide mientras el campo cabe en un
+      byte (≤ 7 caras) y a partir de ahí pone la textura **en otras caras**: es
+      exactamente «las texturas no se aplican bien». El lector además ya no se
+      cae con un `TextureEntry` truncado (lee 0 al pasarse del final).
+- [x] **Esculturas (sculpt maps) de verdad.** Un prim esculpido no se extruye:
+      su forma son los píxeles de una textura (R,G,B → X,Y,Z). Antes se dibujaba
+      su forma base, y eso es una caja con la textura por defecto — la mitad de
+      las «geometrías extrañas» de una región moderna. `prims.js` implementa
+      `sculpt_calc_mesh_resolution` y `sculptGenerateMapVertices` tal como están
+      en `llvolume.cpp` (incluidos `LL_SCULPT_TYPE_*`, los flags *invert/mirror* y
+      las reglas de costura de esfera/toro/cilindro/plano), un mapa sin relieve se
+      rechaza (igual que el visor oficial) y **un prim esculpido al que aún no le
+      ha llegado el mapa no se dibuja** en vez de dibujarse mal. El mapa viaja
+      por la misma cola de texturas; `world.setSculptMap` reparte los píxeles y
+      reconstruye todo lo que esperaba ese mapa.
+- [x] **Los objetos *mesh* no se dibujan como cajas.** Un objeto mesh (esculpido
+      con `SculptType = 5`) lleva una malla que este visor todavía no decodifica;
+      dibujar su forma base llenaba la región de cajas blancas. Ahora se
+      reconocen, se cuentan (salen en el informe) y simplemente no se dibujan,
+      como los mapas sin relieve.
+- [x] **Texturas: decodificación en paralelo y caché de píxeles.** El decodificador
+      JPEG2000 pasa a un *pool* de hasta 3 hilos (`decoderWorkers()`), y el
+      diagnóstico dice cuántos. La caché del móvil guarda el **PNG ya
+      decodificado** (antes el flujo J2C crudo, que se volvía a decodificar en
+      cada entrada), y las copias viejas se sustituyen al leerlas.
+- [x] **Buscador de tierras y teletransporte (☰ → *Buscar tierras y
+      teletransportarse*, y botón *Lands* en la barra).** Busca por nombre de
+      región, por SLURL (`secondlife://Región/x/y/z`) o por coordenadas de
+      rejilla; el nombre se resuelve con la web pública de mapas
+      (`data-region-coords-x/y`) y el mapa se pinta con los mosaicos de
+      `map.secondlife.com` (`map-<zoom>-<rx>-<ry>-objects.jpg`; un mosaico es su
+      esquina suroeste y en la imagen el norte es arriba — comprobado a nivel de
+      píxel contra regiones contiguas). Tocar el mapa elige región **y** el punto
+      exacto dentro de ella; el círculo amarillo «eres tú», el recuadro verde el
+      destino; X/Y/Z se pueden escribir a mano. Las regiones de prueba se editan
+      en `main.pjs` (`regionesDePrueba`).
+- [x] **El teletransporte, en `sl-session.js`**: `TeleportLocationRequest` (con
+      `RegionHandle` y posición local, como Lumiya) → `TeleportStart` /
+      `TeleportProgress` por UDP → `TeleportFinish` en la cola de eventos CAPS
+      (que trae `Info[0].SimIP/SimPort/SeedCapability`) → `moveToSim()` (cierra el
+      circuito viejo **sin** cerrar sesión, vacía el mundo, carga las caps del
+      destino y abre circuito allí). La cola de eventos lleva una **generación**
+      para que la del simulador viejo no siga viva tras el salto. El arnés local
+      (`?test=grid&tp=1004,1006`) ejecuta el camino entero y lo deja en el
+      registro.
+- [x] **`$meta` y `superFetch` en `main.pjs`.** El visor ya tiene título,
+      descripción y etiquetas, y el buscador de tierras funciona también en un
+      navegador normal: sin puente nativo, `httpRequest` sale por el proxy sin
+      CORS de `super-fetch-plugin` (los mosaicos del mapa exigen un `User-Agent`;
+      el CDN contesta 403 sin él).
+
 ## 3. Arquitectura (código)
 
 | fichero | papel |
 | --- | --- |
+| `src/web/js/ui.js` | HUD y paneles (registro, diagnóstico, caché, texturas, inicio de sesión) y el **buscador de tierras + teletransporte** (`showLands`) |
 | `src/web/js/app.js` | `App`: viewer + world + UI + bucle; entrada (clic, teclado), connect/disconnect |
 | `src/web/js/renderer.js` | `Viewer` (three.js, sol, cielo, agua, sombras), `CameraController`, `getCamAxes()`, escala de resolución y perfiles |
 | `src/web/js/world.js` | `World`: terreno, prims, materiales por cara, LOD, picking, avatares, `applyTexture`, cachés de geometría/material y batches |
@@ -291,7 +369,7 @@ distingue.
 | `src/web/js/batch.js` | `PrimBatcher`: funde los prims quietos en una malla por celda de 32 m y material |
 | `src/web/js/diag.js` | diagnóstico en el dispositivo (GPU, funciones, archivos, decodificador, contadores vivos) |
 | `src/web/js/cache.js` | política de la caché en disco: revisión (invalida lo guardado), modo sin caché, comprobación y autoreparación |
-| `src/web/js/prims.js` | motor de geometría de prims (port de Lumiya) |
+| `src/web/js/prims.js` | motor de geometría de prims (port de Lumiya), **incluidas las esculturas** (`buildVolume`/`sculptMeshResolution`, port de `llvolume.cpp`) |
 | `src/web/js/terrain.js` | terreno (BitBuffer, DCT, `Terrain`, malla) |
 | `src/web/js/texture-entry.js` | parseo de TextureEntry + matrices UV |
 | `src/web/js/textures.js` | texturas procedurales + `TextureLibrary` (claves `gen:*` y UUID) |
@@ -305,7 +383,8 @@ distingue.
 | `src/web/js/md5.js` | MD5 (hash de contraseña `$1$…`) |
 | `src/web/js/j2c.js` | decodificador JPEG2000 (OpenJPEG wasm vendorizado, carga perezosa, tope de tamaño) |
 | `src/web/js/j2c-worker.js` | el mismo decodificador en un hilo aparte (recibe el wasm como bytes) |
-| `src/web/js/test/fake-grid.js` | simulador falso en memoria: prueba todo el camino del grid sin cuenta (`?test=grid`) |
+| `src/web/js/test/fake-grid.js` | simulador falso en memoria: prueba todo el camino del grid sin cuenta (`?test=grid`, `?test=grid&tp=gx,gy` para el teletransporte) |
+| `src/web/js/test/sculpt-test.js` | esculturas en aislado, una por tipo (`?test=sculpt`) |
 | `src/web/js/test/stress.js` | arnés de estrés: llena la región de prims con texturas reales y mide fps/llamadas |
 | `src/web/js/avatar/assets.js` | carga los assets que van dentro de la app (`*.llm.bin`, `*.xml.bin`, `anims.bin`) |
 | `src/web/js/avatar/llm.js` | lector del formato `.llm` (mallas + morph targets) |
@@ -321,7 +400,7 @@ distingue.
 | `src/web/vendor/three.module.min.js` | three.js r169 (vendorizado) |
 | `src/web/vendor/openjpeg/` | OpenJPEG wasm (decodificador J2C/JPEG2000 real; `openjpegwasm_decode.js` + `.wasm`) |
 | `src/tools/pack.mjs` | empaqueta `visor-sl-app.zip` a partir de estas fuentes |
-| `src/tools/proto-selftest.mjs` | 70 pruebas del protocolo (ver abajo) |
+| `src/tools/proto-selftest.mjs` | 76 pruebas del protocolo (ver abajo) |
 | `src/android/**` | proyecto Gradle + WebView + `NativeBridge` (UDP/HTTP) |
 | `src/ci/build-apk.yml` | workflow de GitHub Actions |
 
@@ -367,7 +446,7 @@ que se importa antes de llamarla):
 
 ```js
 await import("./src/tools/proto-selftest.mjs");
-await window.runVisorSelfTest();   // → 70/70 correctas
+await window.runVisorSelfTest();   // → 76/76 correctas
 
 // Estrés de render (llena la región de prims con texturas y mide fps y llamadas
 // de dibujo): lo que se usa antes de tocar perf.js/batch.js.
@@ -375,7 +454,7 @@ const stress = await import("./src/web/js/test/stress.js");
 await stress.runStress(window.visor, { count: 1200, seconds: 5 });
 ```
 
-Comprueba **70 cosas** sin necesidad de cuenta: que la plantilla tiene 483
+Comprueba **76 cosas** sin necesidad de cuenta: que la plantilla tiene 483
 mensajes, que los números de mensaje son **byte a byte** los mismos que los de
 Lumiya (descubiertos en el código decompilado), que `ChatFromViewer` coincide con
 la referencia, que `AgentUpdate` mide 115 bytes, ida y vuelta de paquetes con
@@ -400,6 +479,13 @@ y el visor se conecta a un simulador en memoria que responde login XML-RPC,
 capacidades, `GetTexture` (JPEG2000 real), EventQueueGet y envía RegionHandshake,
 4× LayerData (256 parches), ~40 prims comprimidos, ObjectUpdate con TextureEntry,
 dos avatares (con nombre), KillObject y pings — más un agente que camina.
+Añadiendo **`&tp=gx,gy`** el arnés hace un **teletransporte completo** (petición →
+`TeleportStart` por UDP → `TeleportFinish` en la cola de eventos → circuito y
+región nuevos) y lo deja escrito en el registro.
+
+Y las esculturas tienen su propio arnés aislado, `?test=sculpt`: una fila con
+esfera, toro, plano ondulado, cilindro, un toro *espejo* y **dos objetos que no
+deben dibujarse** (un mesh y un mapa sin relieve).
 
 Nota: en el editor el visor se ejecuta dentro de un iframe con service worker;
 si `fetch("src/...")` falla con "Load failed" es porque el navegador no soporta
@@ -430,7 +516,7 @@ service workers (p. ej. el navegador interno de la app de Google en iOS).
   las texturas baked, así que la ropa puesta **ya se ve**; lo que falta es la
   ventana de inventario para cambiarla (caras 8–11 del aviso de apariencia y las
   texturas de cada prenda ya están en el código).
-- Sin sculpt maps, mallas, grupos, búsqueda, voz, RLV, minimapa ni dinero (ver
+- Sin mallas, grupos, búsqueda de inventario, voz, RLV, minimapa ni dinero (ver
   `LUMIYA.md`).
 - **Texturas progresivas**: cada textura se pide entera y se decodifica de una
   vez. Lumiya pedía primero la cabecera y luego los niveles de detalle por

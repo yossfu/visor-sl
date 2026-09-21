@@ -3,6 +3,63 @@
 Ordenado por impacto. Lo primero es lo que hay que hacer en cuanto se pruebe con
 una cuenta real en el grid.
 
+## Ronda 10 — lo hecho en esta revisión (informe 7)
+
+El informe 7 (móvil, 900 prims) traía la pista decisiva: `LayerData` **sí**
+llegaba (113 mensajes, `tipos 55×85, 76×28`) y el terreno seguía en
+«PLACEHOLDER PLANO»; en pantalla, «cubos con cuadrículas blancas y un sinfín de
+geometrías extrañas»; el avatar ya salía con cuerpo pero deforme y sin texturas.
+Lo crucial era el mundo, así que esta ronda ha ido a eso, más el buscador de
+tierras que pidió el usuario para probar el teletransporte:
+
+- [x] **Terreno: el tipo es el 76 y lleva cabecera de 4 bytes.** Leer sólo el
+      tipo 0 (y sin saltar `stride`/`patchSize`/`type`) es la razón exacta de que
+      nunca llegara terreno. Corregido en `terrain.js` + `sl-session.js`; el
+      arnés escribe la cabecera y hay pruebas de ida y vuelta.
+- [x] **Máscara de caras del `TextureEntry` en big-endian** (verificado contra
+      `unpack_TEField` del visor oficial). Con más de 7 caras, la textura se
+      asignaba a **otras** caras. Además el lector ya no revienta con entradas
+      truncadas.
+- [x] **Esculturas**: implementadas de verdad (`prims.js`, port de
+      `sculptGenerateMapVertices`/`sculpt_calc_mesh_resolution`); los mapas
+      viajan por la cola de texturas y `world.setSculptMap` reconstruye los prims
+      que esperaban. Mapa sin relieve o sin llegar → no se dibuja. Arnés aislado
+      `?test=sculpt` + 6 pruebas nuevas.
+- [x] **Los objetos *mesh* ya no se dibujan como cajas** (se cuentan y salen en
+      el informe). Es la otra mitad de las «geometrías extrañas».
+- [x] **Texturas**: decodificador en un *pool* de hasta 3 hilos y la caché del
+      móvil guarda el **PNG ya decodificado** (se acabó re-decodificar todo en
+      cada entrada). El diagnóstico dice cuántos hilos.
+- [x] **Buscador de tierras y teletransporte** (botón *Lands* y ☰ → *Buscar
+      tierras y teletransportarse*): búsqueda por nombre/SLURL/coordenadas, mapa
+      del grid con rejilla y etiquetas, elección del punto exacto, «estás aquí» y
+      `TeleportLocationRequest` → `TeleportStart`/`TeleportProgress` →
+      `TeleportFinish` (cola de eventos) → `moveToSim()`. Probado de punta a punta
+      con `?test=grid&tp=1004,1006`.
+- [x] **`main.pjs` con `$meta`** (título, descripción, etiquetas) y la lista
+      `regionesDePrueba` que alimenta los botones del buscador. `superFetch`
+      importado para que el buscador y el mapa funcionen también sin el APK.
+- [x] Versión **1.5.0 (build 6)**.
+
+Pendiente de comprobar en el móvil (informe 8), por orden:
+
+- [ ] Que el registro empiece por `app 1.5.0 (build 6)`.
+- [ ] La fila **terreno**: ya no debe decir «PLACEHOLDER PLANO», y la línea de
+      `LayerData` debe mostrar `cabecera stride … patch 16x16 tipo 76` y
+      **parches aplicados** (256 por capa completa).
+- [ ] ☰ → **Ver las texturas decodificadas** con muchas casillas (no 4).
+- [ ] La línea `TEXTURAS:` con `decodificadas` mucho mayor que 312 (el *pool* de
+      3 hilos) y `en cola` bajando hasta 0.
+- [ ] La parte nueva `esculturas: N dibujadas de M` en el informe de texturas: si
+      `M` es alto y `dibujadas` 0, los mapas no están llegando y hay que mirar
+      esa cola.
+- [ ] **Buscador de tierras**: buscar «Ahern» y que el mapa se pinte, y pulsar
+      Teletransportar (el registro debe decir `TeleportStart`, luego
+      `TeleportFinish: simulador de destino …` y «Región: …» del destino).
+- [ ] Si sigue habiendo «geometrías extrañas», una captura con el objeto de
+      cerca: con esculturas y mesh ya descartados, lo siguiente sería **mallas**
+      (hay que implementar el asset LLMesh) y **prims flexibles**.
+
 ## Ronda 9 — lo hecho en esta revisión (informe 6)
 
 El informe 6 (cuenta ExeQiel, región con 900 prims) traía: **los 8 archivos del

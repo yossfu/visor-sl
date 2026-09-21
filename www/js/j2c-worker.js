@@ -47,51 +47,91 @@ function loadModule(glueUrl, wasmUrl, glueText, wasmBinary) {
   return modulePromise;
 }
 
+/**
+ * The decoded buffer's real geometry (see the twin of this function in j2c.js:
+ * the reported component count and the buffer length have to agree, and a
+ * reduced frame has to be detected rather than read as if it were full size).
+ */
+function frameGeometry(decodedLength, width, height, reported) {
+  for (const k of [1, 2, 4, 8, 16]) {
+    const w = width / k, h = height / k;
+    if (!Number.isInteger(w) || !Number.isInteger(h) || w < 1 || h < 1) continue;
+    for (const c of [reported, 4, 3, 1]) {
+      if (c && w * h * c === decodedLength) return { width: w, height: h, components: c, mismatch: false };
+    }
+  }
+  return { width, height, components: reported || 4, mismatch: true };
+}
+
 function toRgba(decoded, width, height, components) {
   const rgba = new Uint8ClampedArray(width * height * 4);
   if (components === 1) {
     for (let i = 0, o = 0; i < width * height; i++, o += 4) {
-      const v = decoded[i];
+      const v = decoded[i] || 0;
       rgba[o] = v; rgba[o + 1] = v; rgba[o + 2] = v; rgba[o + 3] = 255;
     }
   } else if (components >= 4) {
     for (let i = 0, s = 0, o = 0; i < width * height; i++, s += components, o += 4) {
-      rgba[o] = decoded[s]; rgba[o + 1] = decoded[s + 1]; rgba[o + 2] = decoded[s + 2]; rgba[o + 3] = decoded[s + 3];
+      rgba[o] = decoded[s] || 0; rgba[o + 1] = decoded[s + 1] || 0;
+      rgba[o + 2] = decoded[s + 2] || 0; rgba[o + 3] = decoded[s + 3] || 0;
     }
   } else {
     for (let i = 0, s = 0, o = 0; i < width * height; i++, s += components, o += 4) {
-      rgba[o] = decoded[s]; rgba[o + 1] = decoded[s + 1]; rgba[o + 2] = decoded[s + 2]; rgba[o + 3] = 255;
+      rgba[o] = decoded[s] || 0; rgba[o + 1] = decoded[s + 1] || 0;
+      rgba[o + 2] = decoded[s + 2] || 0; rgba[o + 3] = 255;
     }
   }
   return rgba;
 }
 
-async function decode(bytes, maxSize) {
+/**
+ * Decodes a codestream and, when asked, also returns a PNG of the decoded
+ * pixels. The PNG is what goes into the on-device cache: a phone pays tens to
+ * hundreds of milliseconds to decode a J2C, and paying that again for every
+ * texture on every login is what keeps a region looking untextured. A PNG is
+ * decoded by the browser natively in a millisecond.
+ */
+async function decode(bytes, maxSize, wantPng) {
   const mod = await modulePromise;
   const decoder = new mod.J2KDecoder();
   const encoded = decoder.getEncodedBuffer(bytes.length);
   encoded.set(bytes);
   decoder.decode();
   const info = (decoder.getFrameInfo && decoder.getFrameInfo()) || {};
-  const width = info.width || 0;
-  const height = info.height || 0;
-  if (!width || !height) throw new Error("imagen vacía");
+  const rw = info.width || 0;
+  const rh = info.height || 0;
+  if (!rw || !rh) throw new Error("imagen vacía");
   const decoded = decoder.getDecodedBuffer();
-  const components = info.componentCount ||
-    (decoded.length === width * height * 3 ? 3 : decoded.length === width * height ? 1 : 4);
-  const rgba = toRgba(decoded, width, height, components);
+  const geo = frameGeometry(decoded.length, rw, rh, info.componentCount);
+  const width = geo.width, height = geo.height;
+  const rgba = toRgba(decoded, width, height, geo.components);
   const image = new ImageData(rgba, width, height);
   const limit = maxSize || 0;
   const biggest = Math.max(width, height);
+  let bitmap;
   if (limit && biggest > limit) {
     const k = limit / biggest;
-    return createImageBitmap(image, {
+    bitmap = await createImageBitmap(image, {
       resizeWidth: Math.max(1, Math.round(width * k)),
       resizeHeight: Math.max(1, Math.round(height * k)),
       resizeQuality: "medium",
     });
+  } else {
+    bitmap = await createImageBitmap(image);
   }
-  return createImageBitmap(image);
+  let png = null;
+  if (wantPng && typeof OffscreenCanvas === "function") {
+    try {
+      const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const ctx = c.getContext("2d");
+      ctx.drawImage(bitmap, 0, 0);
+      const blob = await c.convertToBlob({ type: "image/png" });
+      png = new Uint8Array(await blob.arrayBuffer());
+    } catch (e) {
+      png = null; // the cache is an optimisation: never fail a decode over it
+    }
+  }
+  return { bitmap, png, width, height, codedWidth: rw, codedHeight: rh, mismatch: geo.mismatch };
 }
 
 self.onmessage = async (ev) => {
@@ -107,8 +147,14 @@ self.onmessage = async (ev) => {
   }
   if (msg.kind !== "decode") return;
   try {
-    const bitmap = await decode(msg.bytes, msg.maxSize);
-    self.postMessage({ kind: "decode", id: msg.id, ok: true, bitmap, width: bitmap.width, height: bitmap.height }, [bitmap]);
+    const r = await decode(msg.bytes, msg.maxSize, msg.wantPng);
+    const transfer = [r.bitmap];
+    if (r.png) transfer.push(r.png.buffer);
+    self.postMessage(
+      { kind: "decode", id: msg.id, ok: true, bitmap: r.bitmap, png: r.png,
+        srcWidth: r.codedWidth, srcHeight: r.codedHeight,
+        width: r.bitmap.width, height: r.bitmap.height, mismatch: r.mismatch },
+      transfer);
   } catch (e) {
     self.postMessage({ kind: "decode", id: msg.id, ok: false, error: (e && e.message) || String(e) });
   }
