@@ -6,34 +6,13 @@ import { UI } from "./ui.js";
 import { buildDemoRegion } from "./demo.js";
 import { defaultPrimParams } from "./prims.js";
 import { TouchControls } from "./touch.js";
-import { detectProfile, AdaptiveScaler, isMobile, PROFILES, profileNames } from "./perf.js";
-import { hasNative, prefsAll, prefsSet } from "./transport.js";
 
 export class App {
   constructor(canvas) {
     this.canvas = canvas;
-    // Device profile first: the renderer, the world and the texture pipeline all
-    // read their limits from it, and it is what makes the phone usable.
-    // A profile the user picked by hand wins over the one guessed from the device.
-    this.profile = PROFILES[prefsAll()["visor.profile"]] || detectProfile();
-    this.viewer = new Viewer(canvas, {
-      profile: this.profile,
-      antialias: this.profile.antialias,
-      // The editor's own preview screenshots the canvas; a real device must not
-      // pay the per-frame copy that preserving the buffer costs.
-      preserveDrawingBuffer: !hasNative(),
-    });
+    this.viewer = new Viewer(canvas);
     this.world = new World(this.viewer);
-    this.world.applyProfile(this.profile);
-    this.scaler = new AdaptiveScaler({
-      target: isMobile() ? 30 : 60,
-      ceiling: this.profile.pixelRatioMax,
-      floor: this.profile.renderScaleMin,
-      enabled: true,
-    });
     this.world.onSelect = (rec) => this.ui.showInspector(rec);
-    this.world.onAvatarError = (msg) => this.ui.log("⚠ No se pudieron cargar los cuerpos de avatar: " + msg +
-      " (por eso se ven como cápsulas; abre ☰ → Diagnóstico completo).");
     this.ui = new UI(this);
     this.session = null;
     this.mode = "login";
@@ -44,10 +23,6 @@ export class App {
     this.touch = new TouchControls(this);
     this.bindInput();
     this.lastTime = performance.now();
-    // While a region is flooding in, the frame time is dominated by decoding and
-    // GPU uploads rather than by what the device can sustain, so the quality is
-    // not judged during that burst.
-    this.graceUntil = 0;
     this.raf = requestAnimationFrame(() => this.loop());
     this.ui.showLogin();
   }
@@ -56,7 +31,6 @@ export class App {
     this.mode = "demo";
     this.world.dispose();
     buildDemoRegion(this.world, { seed });
-    this.world.setTerrainKnown(true);
     this.ui.regionEl.textContent = `Demo Sandbox (semilla ${seed})`;
     this.viewer.controls.focus([128, 128, 28], 86);
     this.viewer.controls.yaw = 0.35;
@@ -191,7 +165,6 @@ export class App {
   enterGridMode() {
     this.mode = "grid";
     this.world.reset();
-    this.graceUntil = performance.now() + 30000;
     this.selected = null;
     if (this.ui.showInspector) this.ui.showInspector(null);
     if (this.ui.regionEl) this.ui.regionEl.textContent = "conectando…";
@@ -401,57 +374,12 @@ export class App {
     this.followAgent();
     this.world.animateAvatars(now);
     this.applyTouchInput();
+    this.world.updateLOD(this.viewer.camera.position, 2);
     this.frameCount = (this.frameCount || 0) + 1;
-    const every = this.profile.lodEvery || 4;
-    if (this.frameCount % every === 0) this.world.updateLOD(this.viewer.camera.position, 2);
-    if (this.frameCount % (this.profile.visibilityEvery || 3) === 0) {
-      this.world.updateVisibility(this.viewer.camera.position);
-    }
-    // Static batches are rebuilt here (time-boxed) and the near cells are drawn
-    // from them instead of from thousands of individual prims.
-    this.world.updateBatches(this.viewer.camera.position);
-    // Frame-rate governor: trade pixels for smoothness on a weak GPU.
-    if (this.scaler.sample(dt * 1000)) this.viewer.setRenderScale(this.scaler.scale);
-    // Starved even at the lowest render scale: what has to shrink now is the
-    // world itself, not the resolution.
-    if (this.scaler.starved >= 4 && this.profile.name !== "bajo" && now > this.graceUntil) this.stepDownProfile();
+    if (this.frameCount % 6 === 0) this.world.updateVisibility(this.viewer.camera.position);
     const s = this.viewer.stats;
     this.ui.updateStats({ fps: s.fps, tris: s.tris, objects: this.world.objectCount });
     this.raf = requestAnimationFrame(() => this.loop());
-  }
-
-  /** Switches render profile at runtime (settings panel). */
-  setProfile(name) {
-    const p = PROFILES[name];
-    if (!p) return this.profile;
-    this.profile = p;
-    this.viewer.applyProfile(p);
-    this.world.applyProfile(p);
-    this.scaler.setBounds(p.pixelRatioMax, p.renderScaleMin);
-    this.scaler.target = name === "alto" ? 60 : 30;
-    this.scaler.starved = 0;
-    this.scaler.window.length = 0;
-    this.scaler.cooldown = 90;
-    this.viewer.setRenderScale(Math.min(this.scaler.scale, p.pixelRatioMax));
-    return p;
-  }
-
-  /**
-   * The device cannot hold the frame rate even at the profile's lowest render
-   * scale, so the profile itself drops a level (and is remembered for the next
-   * start). This is what keeps a modest phone usable without the user having to
-   * find the quality setting: the viewer measures, then decides.
-   */
-  stepDownProfile() {
-    const names = profileNames();
-    const from = this.profile.name;
-    const i = names.indexOf(from);
-    this.scaler.starved = 0;
-    if (i <= 0) return;
-    const next = names[i - 1];
-    this.setProfile(next);
-    prefsSet({ "visor.profile": next });
-    this.ui.log(`Rendimiento insuficiente para «${from}»: bajo a «${next}» (${PROFILES[next].label}).`);
   }
 }
 
@@ -460,6 +388,9 @@ export function boot() {
   const app = new App(canvas);
   window.visor = app;
   const params = location.search;
+  if (params.includes("test=prims")) {
+    import("./test/prims-selftest.js").then((m) => m.runSelfTest(app)).catch(console.error);
+  }
   if (params.includes("test=grid")) {
     import("./test/fake-grid.js")
       .then((m) => m.runFakeGrid(app))

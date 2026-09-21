@@ -312,51 +312,7 @@ export class TextureLibrary {
     this.stone = stoneTexture();
     this.roof = roofTexture();
     this.uuidLoader = null;
-    // Grid textures live on the GPU. A region can install hundreds of them, and
-    // 512px RGBA with mip-maps is ~1.3 MB each, so without a ceiling a phone runs
-    // out of graphics memory and the driver starts thrashing. `onGpu` tracks which
-    // textures currently hold GPU memory; `budget` is the ceiling in bytes.
-    this.budget = 96 * 1024 * 1024;
-    this.bytes = 0;
-    this.onGpu = new Set();
-    this.evictions = 0;
   }
-
-  /** GPU memory ceiling for installed grid textures (zero disables the trim). */
-  setBudget(mb) {
-    this.budget = Math.max(0, mb | 0) * 1024 * 1024;
-    this.trim();
-  }
-
-  _size(tex) {
-    const im = tex && tex.image;
-    const w = (im && im.width) || 0;
-    const h = (im && im.height) || 0;
-    // RGBA plus roughly a third for the mip-map chain.
-    return Math.round(w * h * 4 * 1.34);
-  }
-
-  /**
-   * Frees GPU memory for the least recently used textures until the library fits
-   * its budget. The decoded image is kept, so the texture is re-uploaded the next
-   * time it is actually rendered — nothing disappears from the screen, only the
-   * copy sitting unused in graphics memory.
-   */
-  trim() {
-    if (!this.budget || this.bytes <= this.budget) return this.evictions;
-    for (const key of this.cache.keys()) {
-      if (this.bytes <= this.budget) break;
-      if (!this.installed.has(key)) continue;
-      const tex = this.cache.get(key);
-      if (!tex || !this.onGpu.has(key)) continue;
-      this.onGpu.delete(key);
-      this.bytes -= this._size(tex);
-      try { tex.dispose(); } catch (_) { /* already gone */ }
-      this.evictions++;
-    }
-    return this.evictions;
-  }
-
   /**
    * Stores a texture downloaded from the grid. The bytes arrive as an
    * ImageBitmap, and a plain `new THREE.Texture(bitmap)` has version 0, so the
@@ -376,35 +332,13 @@ export class TextureLibrary {
     tex.minFilter = THREE.LinearMipmapLinearFilter;
     tex.magFilter = THREE.LinearFilter;
     tex.anisotropy = 4;
-    const key = uuid;
-    const previous = this.cache.get(key);
-    if (previous && previous !== tex && this.onGpu.has(key)) {
-      this.bytes -= this._size(previous);
-      this.onGpu.delete(key);
-    }
-    // Re-insert so the map's own order is least-recently-used first.
-    this.cache.delete(key);
-    this.cache.set(key, tex);
-    this.installed.add(key);
-    const size = this._size(tex);
-    if (size) { this.bytes += size; this.onGpu.add(key); }
-    this.trim();
+    this.cache.set(uuid, tex);
+    this.installed.add(uuid);
     return tex;
   }
-
   get(key) {
     if (!key) return this.default;
-    const hit = this.cache.get(key);
-    if (hit) {
-      // Mark as recently used, and re-count it if its GPU copy was freed.
-      this.cache.delete(key);
-      this.cache.set(key, hit);
-      if (this.installed.has(key) && !this.onGpu.has(key)) {
-        const size = this._size(hit);
-        if (size) { this.bytes += size; this.onGpu.add(key); }
-      }
-      return hit;
-    }
+    if (this.cache.has(key)) return this.cache.get(key);
     if (UUID_KEY_RE.test(key)) {
       const ph = key.startsWith("0") ? this.default : missingTexture(key);
       this.cache.set(key, ph);

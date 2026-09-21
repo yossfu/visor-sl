@@ -40,18 +40,8 @@ class NativeBridge(private val activity: Activity) {
         var webViewRef: WebView? = null
         private const val TAG = "VisorSL"
         private const val MAX_DATAGRAM = 4096
-        private const val MAX_RX_QUEUE = 4096
+        private const val MAX_RX_QUEUE = 2048
         private const val RX_FLUSH_MS = 20L
-        /**
-         * A batch is capped by count *and* bytes. A region in motion produces a
-         * few hundred datagrams per second; handing the page one enormous JSON
-         * string makes the single evaluateJavascript call (which runs on the UI
-         * thread) longer than the frame it interrupts, and the frame rate is what
-         * the user sees. Small, frequent batches keep the UI thread responsive.
-         */
-        private const val RX_BATCH_MAX = 40
-        private const val RX_BATCH_BYTES = 32 * 1024
-        private const val CACHE_LIMIT_BYTES = 512L * 1024 * 1024
     }
 
     private val httpPool = Executors.newFixedThreadPool(4)
@@ -129,10 +119,6 @@ class NativeBridge(private val activity: Activity) {
     private val cacheDir: java.io.File
         get() = java.io.File(activity.cacheDir, "vcache").apply { if (!exists()) mkdirs() }
 
-    /** The shell activity; the storage permission and the SAF picker live there. */
-    private val main: MainActivity
-        get() = activity as MainActivity
-
     private fun safeName(key: String): String =
         key.replace(Regex("[^A-Za-z0-9._-]"), "_").take(96)
 
@@ -147,58 +133,16 @@ class NativeBridge(private val activity: Activity) {
             o.put("kind", "storage")
             o.put("cacheDir", dir.absolutePath)
             o.put("filesDir", activity.filesDir.absolutePath)
-            val ext = activity.getExternalFilesDir(null)
-            if (ext != null) o.put("externalDir", ext.absolutePath)
             o.put("cacheFiles", files)
             o.put("cacheBytes", bytes)
-            o.put("cacheLimit", CACHE_LIMIT_BYTES)
             o.put("freeBytes", activity.filesDir.usableSpace)
             o.put("external", android.os.Environment.getExternalStorageState())
             o.put("needsPermission", false)
             o.put("canExport", android.os.Build.VERSION.SDK_INT >= 29)
-            o.put("sdk", android.os.Build.VERSION.SDK_INT)
-            o.put("folder", folderName())
-            o.put("permission", permissionState())
         } catch (t: Throwable) {
             o.put("error", describe(t))
         }
         return o.toString()
-    }
-
-    /** Storage permission state, SAF folder and where the data actually lives. */
-    @JavascriptInterface
-    fun storageStatus(): String = main.storageStatus()
-
-    /** Asks Android for the storage permission (a real dialog on Android <= 9). */
-    @JavascriptInterface
-    fun requestStorage(requestJson: String): String {
-        val id = JSONObject(requestJson).optString("id")
-        main.requestStoragePermission(id)
-        return ack(id)
-    }
-
-    /** Lets the user choose a folder on the phone for the cache and exports. */
-    @JavascriptInterface
-    fun pickFolder(requestJson: String): String {
-        val id = JSONObject(requestJson).optString("id")
-        main.pickFolder(id)
-        return ack(id)
-    }
-
-    fun folderName(): String = main.folderName()
-
-    fun permissionState(): String = main.permissionState()
-
-    /** Pushes an arbitrary result to the page (permission/folder callbacks). */
-    fun pushResult(kind: String, id: String, extra: JSONObject? = null) {
-        val o = JSONObject()
-        o.put("id", id)
-        o.put("kind", kind)
-        if (extra != null) {
-            val it = extra.keys()
-            while (it.hasNext()) { val k = it.next(); o.put(k, extra.get(k)) }
-        }
-        push(o)
     }
 
     @JavascriptInterface
@@ -217,7 +161,6 @@ class NativeBridge(private val activity: Activity) {
                 } else {
                     java.io.FileOutputStream(f).use { it.write(data) }
                     out.put("ok", true); out.put("bytes", data.size)
-                    trimCache()
                 }
             } catch (t: Throwable) {
                 out.put("ok", false); out.put("error", describe(t))
@@ -249,29 +192,6 @@ class NativeBridge(private val activity: Activity) {
             push(out)
         }
         return ack(id)
-    }
-
-    /**
-     * Keeps the texture cache under a size limit by dropping the oldest files.
-     * Textures are immutable and always re-downloadable, so eviction is safe and
-     * a phone with a small data partition never fills up.
-     */
-    private fun trimCache() {
-        try {
-            val files = cacheDir.listFiles() ?: return
-            var total = 0L
-            for (f in files) total += f.length()
-            if (total <= CACHE_LIMIT_BYTES) return
-            val oldest = files.sortedBy { it.lastModified() }
-            for (f in oldest) {
-                if (total <= CACHE_LIMIT_BYTES * 3 / 4) break
-                val n = f.length()
-                if (f.delete()) total -= n
-            }
-            Log.i(TAG, "caché recortada a ${total / 1048576} MB")
-        } catch (t: Throwable) {
-            Log.w(TAG, "trimCache: $t")
-        }
     }
 
     @JavascriptInterface
@@ -519,11 +439,6 @@ class NativeBridge(private val activity: Activity) {
         val dataB64 = req.optString("data", "")
         val host = if (req.has("host")) req.getString("host") else null
         val port = if (req.has("port")) req.getInt("port") else 0
-        // The page sends several datagrams per second; a reply per send would be
-        // an evaluateJavascript call per send, competing with the render loop for
-        // the UI thread. `noReply` skips the success push (errors are still
-        // reported) — the synchronous ack already told the caller it was queued.
-        val noReply = req.optBoolean("noReply", false)
         udpPool.execute {
             val out = JSONObject()
             out.put("id", id); out.put("chan", chan); out.put("kind", "udpSend")
@@ -542,7 +457,6 @@ class NativeBridge(private val activity: Activity) {
                 ch.socket.send(DatagramPacket(data, data.size, peer))
                 ch.sent++
                 ch.sentBytes += data.size
-                if (noReply) return@execute
                 out.put("ok", true); out.put("sent", data.size)
             } catch (t: Throwable) {
                 out.put("ok", false); out.put("error", describe(t))
@@ -688,10 +602,8 @@ class NativeBridge(private val activity: Activity) {
     private fun flushRx() {
         if (rxQueue.isEmpty() && rxDropped == 0) return
         val arr = JSONArray()
-        var bytes = 0
-        while (arr.length() < RX_BATCH_MAX && bytes < RX_BATCH_BYTES) {
+        while (arr.length() < 96) {
             val o = rxQueue.poll() ?: break
-            bytes += o.optString("data").length
             arr.put(o)
         }
         val dropped = rxDropped
@@ -701,7 +613,7 @@ class NativeBridge(private val activity: Activity) {
         msg.put("id", "rx"); msg.put("kind", "udpBatch")
         msg.put("batch", arr)
         if (dropped > 0) msg.put("dropped", dropped)
-        pushRaw(msg.toString())
+        push(msg)
     }
 
     private fun closeChannel(id: String) {
@@ -746,24 +658,8 @@ class NativeBridge(private val activity: Activity) {
     }
 
     private fun push(obj: JSONObject) {
-        pushRaw(obj.toString())
-    }
-
-    /**
-     * Hands a ready-made JSON string to the page. The payloads built here only
-     * contain base64, numbers, fixed keys and IP addresses — no quotes or
-     * backslashes — so wrapping in single quotes is safe and avoids quoting
-     * every character of a multi-kilobyte datagram batch.
-     */
-    private fun pushRaw(json: String) {
-        val js = "window.visornative && window.visornative(" + if (quoteSafe(json)) "'" + json + "'" else JSONObject.quote(json) + ")"
+        val js = "window.visornative && window.visornative(" + JSONObject.quote(obj.toString()) + ")"
         runOnUi { evalJs(js) }
-    }
-
-    /** True when a JSON string can go to JS inside single quotes as-is. */
-    private fun quoteSafe(json: String): Boolean {
-        for (c in json) if (c == '\'' || c == '\\' || c < ' ' || c == '\u2028' || c == '\u2029') return false
-        return true
     }
 
     private fun runOnUi(block: () -> Unit) {

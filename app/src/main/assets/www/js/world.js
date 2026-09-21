@@ -8,7 +8,6 @@ import { createAvatar, disposeAvatar, applyShape, applyPose, applyBakedTextures,
   from "./avatar/builder.js";
 import { AvatarAnimations } from "./avatar/animation.js";
 import { DEFAULT_ANIMS } from "./avatar/anim-data.js";
-import { PrimBatcher } from "./batch.js";
 
 export const QUALITY = { low: 2, medium: 3, high: 4, ultra: 5 };
 
@@ -18,76 +17,23 @@ export class World {
     this.root = new THREE.Group();
     viewer.slRoot.add(this.root);
     this.texlib = new TextureLibrary();
-    // Static batching (see batch.js): without it a region of a thousand prims is
-    // thousands of draw calls and no phone can keep up.
-    this.batcher = new PrimBatcher(this.root);
     this.terrain = new Terrain();
     this.terrainMesh = null;
-    this.terrainKnown = false;  // true once the region has sent real terrain
     this.objects = new Map();   // uuid -> object record
     this.avatars = new Map();   // uuid -> other residents
-    this.avatarsWithBody = 0;   // how many of them have the real SL body meshes
-    this.avatarError = null;    // why they are still capsules, if they are
     this.avatarAppearances = new Map(); // uuid -> appearance (may arrive first)
     this.pendingAvatarAnimations = new Map(); // uuid -> animation list
     // Residents with nothing else playing stand (the grid's default stand asset).
     this.defaultAnimation = DEFAULT_ANIMS.stand;
     this.pickables = [];
-    this._pickSet = new Set();
-    this._pickDirty = false;
     this.quality = this._qualityFromDevice();
     this.selection = null;
     this.onSelect = null;
     this.drawDistance = 260;
-    this.maxObjects = 4000;
-    this.terrainSkip = 2;
-    // Sharing one geometry/material between prims that look identical is what
-    // keeps a whole region affordable on a phone: a region is mostly a handful
-    // of shapes repeated with a handful of textures. The caches are bounded —
-    // past the limit a prim simply gets its own copy, which the mesh owns and
-    // disposes, so nothing leaks and nothing is disposed while still in use.
-    this._geoCache = new Map();
-    this._matCache = new Map();
-    this._matByTex = new Map(); // texture key -> Set(material) waiting for it
-    this._visList = [];
-    this._visFar = false;
-    this._visTick = 0;
     this._lodQueue = [];
     // The session registers a texture requester here; the avatar code needs it
     // because baked textures arrive through the same GetTexture queue.
     this.onTextureNeeded = null;
-  }
-
-  /**
-   * Applies a device profile (see perf.js): how far to draw, how many objects to
-   * keep meshed, how coarse the terrain grid is and how much detail the prims
-   * get. Called with a whole profile object, so switching quality is one call.
-   */
-  applyProfile(p) {
-    if (!p) return;
-    this.profile = p;
-    this.drawDistance = p.drawDistance || this.drawDistance;
-    this.maxObjects = p.maxObjects || this.maxObjects;
-    this.terrainSkip = p.terrainSkip || 1;
-    this.quality = p.name === "bajo" ? 2 : p.name === "medio" ? 3 : 4;
-    this.shadows = !!p.shadows;
-    if (this.batcher) {
-      this.batcher.drawDistance = this.drawDistance;
-      this.batcher.enabled = p.batching !== false;
-      this.batcher.shadows = this.shadows;
-    }
-    if (p.textureBudgetMB) this.texlib.setBudget(p.textureBudgetMB);
-    // The decoded texture size is the other half of the texture cost: a 1024px
-    // texture is four times the memory and upload time of a 512px one.
-    if (typeof p.texMax === "number") {
-      import("./j2c.js").then((m) => m.setTextureMaxSize(p.texMax)).catch(() => {});
-    }
-    if (this.terrainMesh) this.rebuildTerrain();
-    // Water follows the terrain's existence (see setTerrainKnown) as well as the
-    // profile: on the lowest profile the plane is skipped entirely.
-    this.applyWaterVisibility();
-    // A quality change re-LODs gradually; the per-frame budget keeps it smooth.
-    this._lodQueue = [];
   }
 
   _qualityFromDevice() {
@@ -116,7 +62,7 @@ export class World {
       this.terrainMesh.geometry.dispose();
       this.terrainMesh = null;
     }
-    const skip = this.terrainSkip || (this.quality >= 4 ? 1 : 2);
+    const skip = this.quality >= 4 ? 1 : 2;
     const mesh = buildTerrainMesh(this.terrain, { skip });
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(mesh.positions, 3));
@@ -161,7 +107,7 @@ export class World {
         `);
     };
     this.terrainMesh = new THREE.Mesh(geo, mat);
-    this.terrainMesh.receiveShadow = !!this.shadows;
+    this.terrainMesh.receiveShadow = true;
     this.terrainMesh.name = "terrain";
     this.root.add(this.terrainMesh);
     this.terrainMesh.userData.isTerrain = true;
@@ -194,28 +140,6 @@ export class World {
 
   heightAt(x, y) { return this.terrain.bilinear(x, y); }
 
-  /**
-   * Marks that real terrain has arrived from the region. Until it does, the
-   * region is a flat placeholder at 0 m and the water plane (which sits at the
-   * region's sea level, typically 20 m) would cover the whole view like a dark
-   * transparent sea with everything drowned under it — which reads exactly like
-   * "no hay terreno y se ven cuadros negros". Keeping the water out of the way
-   * until there is terrain to flood is both honest and much easier to look at.
-   */
-  setTerrainKnown(on) {
-    const next = !!on;
-    if (next === this.terrainKnown) return;
-    this.terrainKnown = next;
-    this.applyWaterVisibility();
-  }
-
-  applyWaterVisibility() {
-    const w = this.viewer.water;
-    if (!w || !w.mesh) return;
-    const allowed = !this.profile || this.profile.water !== false;
-    w.mesh.visible = allowed && this.terrainKnown === true;
-  }
-
   // --- prims --------------------------------------------------------------
   resolveTexture(key) {
     return this.texlib.get(key);
@@ -240,27 +164,15 @@ export class World {
     if (!rec) return;
     if (rec.group) {
       this.root.remove(rec.group);
-      rec.group.traverse((o) => { if (o.isMesh) this._releaseMesh(o); });
+      rec.group.traverse((o) => {
+        if (o.isMesh) {
+          o.geometry.dispose();
+          this.pickables = this.pickables.filter((p) => p !== o);
+        }
+      });
     }
-    this.batcher.remove(rec);
     this.objects.delete(id);
     if (!silent && this.selection === rec) this.select(null);
-  }
-
-  /** Drops a mesh from the picking set and frees only what the mesh owns. */
-  _releaseMesh(o) {
-    this._pickSet.delete(o);
-    this._pickDirty = true;
-    if (!o.userData.sharedGeo && o.geometry) o.geometry.dispose();
-  }
-
-  /** The scene-graph objects the pointer can hit (rebuilt only when it changed). */
-  pickList() {
-    if (this._pickDirty) {
-      this.pickables = [...this._pickSet];
-      this._pickDirty = false;
-    }
-    return this.pickables;
   }
 
   updatePrim(id, patch) {
@@ -269,28 +181,13 @@ export class World {
     if (patch.params) rec.params = Object.assign({}, rec.params, patch.params);
     for (const k of ["position", "rotation", "scale", "texture", "textureEntry", "name"])
       if (patch[k] !== undefined) rec[k] = patch[k];
-    if (patch.params) rec._shapeSig = null;
-    this.rebuildPrim(rec);
-  }
-
-  /**
-   * A prim the simulator moved. Prims that move repeatedly are kept out of the
-   * static batches: a moving prim would force a rebuild of its whole cell every
-   * frame, which costs more than drawing it on its own.
-   */
-  movePrim(rec, position, rotation) {
-    if (!rec) return;
-    if (position) rec.position = position;
-    if (rotation) rec.rotation = rotation;
-    rec.moves = (rec.moves || 0) + 1;
-    if (rec.moves === 3) this.batcher.setExcluded(rec, true);
     this.rebuildPrim(rec);
   }
 
   rebuildPrim(rec) {
     if (rec.group) {
       this.root.remove(rec.group);
-      rec.group.traverse((o) => { if (o.isMesh) this._releaseMesh(o); });
+      rec.group.traverse((o) => { if (o.isMesh) { o.geometry.dispose(); this.pickables = this.pickables.filter((p) => p !== o); } });
     }
     const group = new THREE.Group();
     rec.group = group;
@@ -298,23 +195,49 @@ export class World {
     const vol = this.buildPrimGeometry(rec.params, rec.detail);
     rec.vol = vol;
     if (vol) {
-      const shapeSig = rec._shapeSig || (rec._shapeSig = stableKey(rec.params));
-      const shadows = !!this.shadows;
+      const scale = rec.scale || [1, 1, 1];
       for (const face of vol.faces) {
-        const geo = this._faceGeometry(rec, shapeSig, face);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.BufferAttribute(face.positions, 3));
+        geo.setAttribute("normal", new THREE.BufferAttribute(face.normals, 3));
+        const uvs = bakeFaceUV(face, rec, vol);
+        geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+        geo.setIndex(new THREE.BufferAttribute(
+          face.indices instanceof Uint32Array ? face.indices : new Uint32Array(face.indices), 1));
+        geo.computeBoundingSphere();
         const f = this.faceProps(rec, face.id);
         const key = f.texture || (rec.texture ? (rec.texture[face.id] ?? rec.texture.all) : null);
-        const mat = this._faceMaterial(f, key);
+        const map = key ? this.resolveTexture(key) : this.texlib.default;
+        const params = {
+          map, color: new THREE.Color(f.rgba[0], f.rgba[1], f.rgba[2]),
+          side: THREE.FrontSide,
+        };
+        const alpha = f.rgba[3] < 0.999;
+        let mat;
+        if (alpha) {
+          mat = new THREE.MeshLambertMaterial(Object.assign({}, params));
+          mat.transparent = true; mat.depthWrite = false;
+        } else if (f.fullbright) {
+          mat = new THREE.MeshBasicMaterial({ map, color: new THREE.Color(f.rgba[0], f.rgba[1], f.rgba[2]) });
+          if (f.glow > 0.02) mat.color.multiplyScalar(1 + f.glow * 0.35);
+        } else if (f.specular > 0.2) {
+          mat = new THREE.MeshPhongMaterial(Object.assign({}, params, {
+            emissive: new THREE.Color(f.rgba[0], f.rgba[1], f.rgba[2]).multiplyScalar(f.glow * 0.28),
+            specular: new THREE.Color(0.6, 0.6, 0.62), shininess: 40 + f.specular * 120,
+          }));
+        } else {
+          mat = new THREE.MeshLambertMaterial(Object.assign({}, params, {
+            emissive: new THREE.Color(f.rgba[0], f.rgba[1], f.rgba[2]).multiplyScalar(f.glow * 0.28),
+          }));
+        }
         const mesh = new THREE.Mesh(geo, mat);
-        mesh.castShadow = shadows && f.rgba[3] >= 0.999;
-        mesh.receiveShadow = shadows;
+        mesh.castShadow = !alpha;
+        mesh.receiveShadow = !alpha;
         mesh.userData.objectId = rec.id;
         mesh.userData.faceId = face.id;
         mesh.userData.texKey = key;
-        mesh.userData.sharedGeo = !!geo.userData.shared;
-        this._pickSet.add(mesh);
-        this._pickDirty = true;
         group.add(mesh);
+        this.pickables.push(mesh);
       }
     }
     const pos = rec.position || [128, 128, 30];
@@ -325,90 +248,6 @@ export class World {
     group.scale.set(sc[0], sc[1], sc[2]);
     group.name = rec.name || rec.id;
     this.root.add(group);
-    // Hand it to the static batcher; if it is batched its own meshes are hidden
-    // and the merged cell mesh draws it instead.
-    this.batcher.add(rec);
-    if (rec.batched || rec.overBudget) group.visible = false;
-  }
-
-  /** Rebuilds the static batches that changed, nearest to the camera first. */
-  updateBatches(cameraPos, budget) {
-    this.batcher.update(cameraPos, budget || this.maxObjects);
-  }
-
-  /**
-   * Geometry for one face, shared between every prim with the same shape, LOD
-   * and texture repeat/offset. UVs are baked per prim, so the transform is part
-   * of the key — prims with an untouched texture entry (the vast majority) hit.
-   */
-  _faceGeometry(rec, shapeSig, face) {
-    const f = rec.textureEntry && rec.textureEntry.getFace ? rec.textureEntry.getFace(face.id) : defaultFace();
-    const rep = rec.repeat ? `${rec.repeat[0]}x${rec.repeat[1]}` : "";
-    const uvSig = `${f.repeatU},${f.repeatV},${f.offsetU},${f.offsetV},${f.rotation}`;
-    const key = `${shapeSig}|${rec.detail}|${face.id}|${uvSig}|${rep}`;
-    const hit = this._geoCache.get(key);
-    if (hit) return hit;
-
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(face.positions, 3));
-    geo.setAttribute("normal", new THREE.BufferAttribute(face.normals, 3));
-    geo.setAttribute("uv", new THREE.BufferAttribute(bakeFaceUV(face, rec), 2));
-    geo.setIndex(new THREE.BufferAttribute(
-      face.indices instanceof Uint32Array ? face.indices : new Uint32Array(face.indices), 1));
-    geo.computeBoundingSphere();
-    if (this._geoCache.size < GEO_CACHE_MAX) {
-      geo.userData.shared = true;
-      this._geoCache.set(key, geo);
-    }
-    return geo;
-  }
-
-  /**
-   * Material for one face, shared by every prim whose face looks the same
-   * (same texture, same tint, same transparency/fullbright/specular). Sharing
-   * is what lets three.js sort and batch the draw calls instead of switching
-   * state for every face of every prim.
-   */
-  _faceMaterial(f, key) {
-    const rgba = f.rgba;
-    const alpha = rgba[3] < 0.999;
-    const kind = alpha ? "a" : f.fullbright ? "f" : f.specular > 0.2 ? "s" : "d";
-    const matKey = `${key || ""}|${rgba[0].toFixed(3)},${rgba[1].toFixed(3)},${rgba[2].toFixed(3)},${rgba[3].toFixed(3)}|${kind}|${(f.glow || 0).toFixed(2)}|${f.specular}`;
-    const hit = this._matCache.get(matKey);
-    if (hit) return hit;
-
-    const map = key ? this.resolveTexture(key) : this.texlib.default;
-    let mat;
-    if (alpha) {
-      mat = new THREE.MeshLambertMaterial({ map, color: new THREE.Color(rgba[0], rgba[1], rgba[2]) });
-      mat.transparent = true;
-      mat.depthWrite = false;
-    } else if (f.fullbright) {
-      mat = new THREE.MeshBasicMaterial({ map, color: new THREE.Color(rgba[0], rgba[1], rgba[2]) });
-      if (f.glow > 0.02) mat.color.multiplyScalar(1 + f.glow * 0.35);
-    } else if (f.specular > 0.2) {
-      mat = new THREE.MeshPhongMaterial({
-        map, color: new THREE.Color(rgba[0], rgba[1], rgba[2]),
-        emissive: new THREE.Color(rgba[0], rgba[1], rgba[2]).multiplyScalar(f.glow * 0.28),
-        specular: new THREE.Color(0.6, 0.6, 0.62), shininess: 40 + f.specular * 120,
-      });
-    } else {
-      mat = new THREE.MeshLambertMaterial({
-        map, color: new THREE.Color(rgba[0], rgba[1], rgba[2]),
-        emissive: new THREE.Color(rgba[0], rgba[1], rgba[2]).multiplyScalar(f.glow * 0.28),
-      });
-    }
-    if (key) this.registerMaterial(key, mat);
-    if (this._matCache.size < MAT_CACHE_MAX) this._matCache.set(matKey, mat);
-    return mat;
-  }
-
-  /** Keeps a material on the list that gets its map when the texture arrives. */
-  registerMaterial(key, mat) {
-    if (!key) return;
-    let set = this._matByTex.get(key);
-    if (!set) { set = new Set(); this._matByTex.set(key, set); }
-    set.add(mat);
   }
 
   faceProps(rec, faceIndex) {
@@ -444,16 +283,9 @@ export class World {
     let done = 0;
     for (const rec of this.objects.values()) {
       if (done >= budget) break;
-      // The visibility pass already measured this; no vector allocation here.
-      let d2 = rec._d2;
-      if (d2 === undefined) {
-        const p = rec.position;
-        if (!p) continue;
-        const dx = p[0] - cameraPos.x, dz = p[1] + cameraPos.z;
-        d2 = rec._d2 = dx * dx + dz * dz;
-      }
-      if (rec.group && rec.group.visible === false) continue;
-      const dist = Math.sqrt(d2);
+      const p = rec.position || [128, 128, 30];
+      const wp = new THREE.Vector3(p[0], p[2], -p[1]);
+      const dist = wp.distanceTo(cameraPos);
       const sc = rec.scale || [1, 1, 1];
       const radius = Math.max(sc[0], sc[1], sc[2]) * 0.5;
       const ratio = (radius * this.viewer.canvas.clientHeight) / Math.max(dist, 0.001);
@@ -465,85 +297,41 @@ export class World {
 
   setDrawDistance(d) { this.drawDistance = d; }
 
-  /**
-   * Distance test for every object, plus a hard cap on how many are meshed at
-   * once. Regions routinely hold several thousand prims; a phone cannot draw
-   * them all, so past `maxObjects` the farthest ones are dropped even when they
-   * are inside the draw distance. The expensive nearest-N pass runs rarely —
-   * the cheap distance test runs every pass and is allocation-free.
-   */
   updateVisibility(cameraPos) {
     const cx = cameraPos.x, cz = -cameraPos.z;
-    const maxD2 = this.drawDistance * this.drawDistance;
-    const list = this._visList;
-    list.length = 0;
     for (const rec of this.objects.values()) {
       const p = rec.position;
       if (!p) continue;
-      const dx = p[0] - cx, dz = p[1] - cz;
-      const d2 = dx * dx + dz * dz;
-      rec._d2 = d2;
-      if (d2 < maxD2) list.push(rec);
+      const d = Math.hypot(p[0] - cx, p[1] - cz);
+      const vis = d < this.drawDistance;
+      if (rec.group && rec.group.visible !== vis) rec.group.visible = vis;
     }
-    this._visTick++;
-    if (list.length > this.maxObjects && (this._visTick % 8 === 0 || this._visFar !== true)) {
-      list.sort((a, b) => a._d2 - b._d2);
-      this._visFar = true;
-    } else if (list.length <= this.maxObjects) {
-      this._visFar = false;
-    }
-    const keep = this._visFar ? Math.min(list.length, this.maxObjects) : list.length;
-    const keepSet = this._keepSet || (this._keepSet = new Set());
-    if (this._visFar) {
-      keepSet.clear();
-      for (let i = 0; i < keep; i++) keepSet.add(list[i]);
-    }
-    for (const rec of this.objects.values()) {
-      if (!rec.group || rec.batched) continue; // batched cells are the batcher's job
-      const d2 = rec._d2;
-      const vis = !rec.overBudget && d2 !== undefined && d2 < maxD2 && (!this._visFar || keepSet.has(rec));
-      if (rec.group.visible !== vis) rec.group.visible = vis;
-    }
-    this.visibleObjects = keep;
   }
 
   // --- picking ------------------------------------------------------------
   raycast(ndc) {
     const ray = new THREE.Raycaster();
     ray.setFromCamera(ndc, this.viewer.camera);
-    return ray.intersectObjects(this.pickList(), false);
+    const hits = ray.intersectObjects(this.pickables, false);
+    return hits;
   }
 
   select(rec) {
     if (this.selection && this.selection.group) this.setHighlight(this.selection, false);
-    // The selected prim comes out of the static batch so it can be highlighted
-    // and edited; the merged mesh would swallow any per-object change.
-    if (this.selection && this.selection !== rec) this.batcher.setExcluded(this.selection, false);
     this.selection = rec;
     if (rec && rec.group) this.setHighlight(rec, true);
-    if (rec) this.batcher.setExcluded(rec, true);
     if (this.onSelect) this.onSelect(rec);
   }
 
-  /**
-   * Highlights one prim. Materials are shared between prims now, so the
-   * selection clones the ones it touches — otherwise selecting a single box
-   * would light up every identical box in the region.
-   */
   setHighlight(rec, on) {
-    if (!rec.group) return;
     rec.group.traverse((o) => {
-      if (!o.isMesh || !o.material || !o.material.emissive) return;
-      if (on) {
-        if (!o.userData._cloned) {
-          o.material = o.material.clone();
-          o.userData._cloned = true;
-          this.registerMaterial(o.userData.texKey, o.material);
+      if (o.isMesh && o.material && o.material.emissive) {
+        if (on) {
+          o.userData._em = o.material.emissive.clone();
+          o.material.emissive.setRGB(0.25, 0.35, 0.6);
+        } else if (o.userData._em) {
+          o.material.emissive.copy(o.userData._em);
         }
-        o.userData._em = o.material.emissive.clone();
-        o.material.emissive.setRGB(0.25, 0.35, 0.6);
-      } else if (o.userData._em) {
-        o.material.emissive.copy(o.userData._em);
       }
     });
   }
@@ -552,16 +340,17 @@ export class World {
   applyTexture(uuid, source) {
     this.texlib.install(uuid, source.isTexture ? source : new THREE.Texture(source));
     let touched = 0;
-    // Every prim that wants this texture shares one material, so the swap is a
-    // single pass over the materials built for that key — not over the region.
-    const tex = this.texlib.get(uuid);
-    const mats = this._matByTex.get(uuid);
-    if (tex && mats) {
-      for (const mat of mats) {
-        mat.map = tex;
-        mat.needsUpdate = true;
-        touched++;
-      }
+    for (const rec of this.objects.values()) {
+      if (!rec.group) continue;
+      rec.group.traverse((o) => {
+        if (!o.isMesh || o.userData.texKey !== uuid) return;
+        const tex = this.texlib.get(uuid);
+        if (tex) {
+          o.material.map = tex;
+          o.material.needsUpdate = true;
+          touched++;
+        }
+      });
     }
     // Terrain textures are announced in the RegionHandshake and arrive through
     // the same GetTexture queue.
@@ -668,23 +457,9 @@ export class World {
       })
       .catch((e) => {
         av.bodyPromise = null;
-        av.bodyTries = (av.bodyTries || 0) + 1;
         this.avatarError = (e && e.message) || String(e);
-        console.warn("[visor] no se pudo construir el avatar: " + this.avatarError);
-        // One delayed retry per avatar: if the asset server was still warming up,
-        // this is what turns a capsule back into a body without a reload.
-        if (av.bodyTries < 2 && !av.removed) {
-          setTimeout(() => { if (!av.removed) this.provideAvatarBody(av); }, 2500);
-          return null;
-        }
-        // The capsule is supposed to be a placeholder for a second, not the
-        // permanent look of every resident: if the bundled body meshes cannot be
-        // read, the user must be told why instead of only seeing capsules and a
-        // line in a console they cannot open. Reported once per session.
-        if (!this._avatarErrorReported) {
-          this._avatarErrorReported = true;
-          if (this.onAvatarError) this.onAvatarError(this.avatarError);
-        }
+        console.warn("[visor] no se pudo construir el avatar: " + this.avatarError, e);
+        this.onAvatarBuiltError?.(av, e);
         return null;
       });
     return av.bodyPromise;
@@ -810,11 +585,7 @@ export class World {
       if (o.isMesh) o.geometry.dispose();
       if (o.isSprite && o.material.map) o.material.map.dispose();
     });
-    if (av.bodyGroup) {
-      disposeAvatar(av.bodyGroup);
-      av.body = null;
-      this.avatarsWithBody = Math.max(0, (this.avatarsWithBody || 0) - 1);
-    }
+    if (av.bodyGroup) { disposeAvatar(av.bodyGroup); av.body = null; }
     if (this.avatars) this.avatars.delete(av.id);
   }
 
@@ -828,13 +599,8 @@ export class World {
   reset(terrain) {
     for (const id of [...this.objects.keys()]) this.removePrim(id, true);
     for (const av of [...this.avatars.values()]) this.removeAvatar(av);
-    if (this.batcher) this.batcher.clear();
     this.objects.clear();
     this.avatars.clear();
-    this.terrainKnown = false;
-    this.avatarsWithBody = 0;
-    this.avatarError = null;
-    this._avatarErrorReported = false;
     this.resident = this.resident || new Map();
     this.resident.clear();
     if (this.avatarAppearances) this.avatarAppearances.clear();
@@ -843,36 +609,13 @@ export class World {
     const t = terrain || new Terrain();
     for (let i = 0; i < t.samples.length; i++) t.samples[i] = 0;
     this.setTerrain(t);
-    this.applyWaterVisibility();
   }
 
   dispose() {
     for (const id of [...this.objects.keys()]) this.removePrim(id, true);
     if (this.avatars) for (const av of [...this.avatars.values()]) this.removeAvatar(av);
-    if (this.batcher) this.batcher.dispose();
     if (this.terrainMesh) { this.root.remove(this.terrainMesh); this.terrainMesh.geometry.dispose(); }
   }
-}
-
-// Geometry/material caches are bounded on purpose: past these counts a prim
-// gets its own copy, which keeps a pathological region from growing without
-// limit while still covering every normal one.
-const GEO_CACHE_MAX = 3000;
-const MAT_CACHE_MAX = 1200;
-
-/**
- * Deterministic key for a prim's shape parameters. Key order in the object is
- * whatever the decoder produced, so it cannot be trusted: sorting the keys is
- * what makes two identical prims share one geometry.
- */
-function stableKey(value) {
-  if (value === null || value === undefined) return "";
-  if (typeof value !== "object") return String(value);
-  if (Array.isArray(value)) return "[" + value.map(stableKey).join(",") + "]";
-  const keys = Object.keys(value).sort();
-  let out = "{";
-  for (const k of keys) out += k + "=" + stableKey(value[k]) + ";";
-  return out + "}";
 }
 
 function nameTexture(text) {

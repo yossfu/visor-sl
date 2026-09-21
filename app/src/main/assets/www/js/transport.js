@@ -195,23 +195,6 @@ export class UdpChannel {
     if (this.closed) return;
     this.stats.out++;
     this.stats.bytesOut += bytes.length;
-    // Fast path: hand the datagram straight to the bridge and do not wait for a
-    // reply. Sends happen several times a second (agent updates, pings, acks);
-    // a promise, a JSON parse and a pushed reply for each one is pure overhead
-    // on the UI thread — and any late reply is a frame the world does not get.
-    const bridge = nativeBridge();
-    if (bridge && typeof bridge.udpSend === "function") {
-      try {
-        const ack = bridge.udpSend(JSON.stringify({ chan: this.id, data: b64encode(bytes), noReply: true }));
-        const parsed = typeof ack === "string" ? JSON.parse(ack) : ack;
-        if (parsed && parsed.ok === false) {
-          if (this.handlers.error) this.handlers.error(new Error("envío UDP: " + (parsed.error || "error nativo")));
-        }
-      } catch (e) {
-        if (this.handlers.error) this.handlers.error(e);
-      }
-      return;
-    }
     nativeCall("udpSend", { chan: this.id, data: b64encode(bytes) }).catch((e) => {
       if (this.handlers.error) this.handlers.error(e);
     });
@@ -292,39 +275,6 @@ export function storageInfo() {
   } catch (e) {
     return { error: String(e && e.message ? e.message : e) };
   }
-}
-
-/** Storage permission + chosen folder (Android shell only; null in a browser). */
-export function storageStatus() {
-  const bridge = nativeBridge();
-  if (!bridge || typeof bridge.storageStatus !== "function") return null;
-  try {
-    return JSON.parse(bridge.storageStatus());
-  } catch (e) {
-    return null;
-  }
-}
-
-/**
- * Asks Android for the storage permission. On Android 9 and older this is a
- * real system dialog; on 10+ the permission no longer exists and the app says
- * where its data lives instead. Resolves with `{granted}`.
- */
-export function requestStorage(timeout = 60000) {
-  const bridge = nativeBridge();
-  if (!bridge || typeof bridge.requestStorage !== "function") {
-    return Promise.resolve({ granted: false, unsupported: true });
-  }
-  return nativeCall("requestStorage", { timeout });
-}
-
-/** Opens the system folder picker; resolves with `{ok, folder}`. */
-export function pickFolder(timeout = 120000) {
-  const bridge = nativeBridge();
-  if (!bridge || typeof bridge.pickFolder !== "function") {
-    return Promise.resolve({ ok: false, unsupported: true });
-  }
-  return nativeCall("pickFolder", { timeout });
 }
 
 /** Texture/asset cache in the app's own storage (no permission needed). */

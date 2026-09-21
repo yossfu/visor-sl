@@ -19,8 +19,9 @@
 //        [F32 x N   skin weights]         if hasWeights
 //        U16        numFaces
 //        U16 x3 x numFaces  (vertex indices)
-//        U16        numSkinJoints
-//        char[64] x numSkinJoints joint names
+//        if (hasWeights)
+//          U16        numSkinJoints
+//          char[64] x numSkinJoints joint names
 //        morphs until the 64-byte name "End Morphs":
 //          char[64] morphName
 //          S32      numMorphVertices
@@ -89,12 +90,23 @@ export function parseLLM(bytes) {
   for (let i = 0; i < numFaces * 3; i++) faces[i] = view.getUint16(p + i * 2, true);
   p += numFaces * 6;
 
-  const numSkinJoints = view.getUint16(p, true);
-  p += 2;
+  // Skin metadata exists only for weighted meshes.  The eye mesh shipped by
+  // SL hasWeights=0 and goes directly from faces to the morph terminator.
+  // Reading numSkinJoints unconditionally consumes the first two bytes of
+  // "End Morphs" and makes the parser walk off the end of the file.
+  let numSkinJoints = 0;
   const jointNames = [];
-  for (let i = 0; i < numSkinJoints; i++) {
-    jointNames.push(cString(bytes, p, 64));
-    p += 64;
+  if (hasWeights) {
+    if (p + 2 > len) throw new Error("LLM truncado antes de numSkinJoints");
+    numSkinJoints = view.getUint16(p, true);
+    p += 2;
+    if (p + numSkinJoints * 64 > len) {
+      throw new Error(`LLM truncado: ${numSkinJoints} nombres de joints`);
+    }
+    for (let i = 0; i < numSkinJoints; i++) {
+      jointNames.push(cString(bytes, p, 64));
+      p += 64;
+    }
   }
 
   const morphs = new Map();

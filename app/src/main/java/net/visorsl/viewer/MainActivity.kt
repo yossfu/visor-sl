@@ -1,13 +1,10 @@
 package net.visorsl.viewer
 
 import android.app.Activity
-import android.content.Intent
-import android.content.pm.PackageManager
 import android.content.res.AssetManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.util.Log
 import android.view.View
 import android.view.WindowManager
@@ -38,16 +35,12 @@ import java.io.IOException
 class MainActivity : Activity() {
     private lateinit var webView: WebView
     private lateinit var bridge: NativeBridge
-    private var pendingStorageRequest: String? = null
-    private var pendingFolderRequest: String? = null
 
     private companion object {
         const val TAG = "VisorSL"
         const val ASSET_ROOT = "www"
         const val HOST = "https://appassets.androidplatform.net"
         const val START_URL = "$HOST/$ASSET_ROOT/index.html"
-        const val REQUEST_STORAGE = 1002
-        const val REQUEST_FOLDER = 1003
 
         val MIME_TYPES = mapOf(
             "html" to "text/html", "htm" to "text/html",
@@ -99,19 +92,11 @@ class MainActivity : Activity() {
         // GPU: let the WebView run WebGL2 with the device's real GL driver.
         settings.loadsImagesAutomatically = true
         settings.blockNetworkImage = false
-        // Second Life serves textures over plain http; the WebView would drop
-        // those requests from an https origin as mixed content.
-        settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-        // Keep the renderer (and therefore the WebGL context and the page's
-        // timers) alive while the screen is off, so the background session does
-        // not come back to a blank canvas.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
         }
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         webView.setBackgroundColor(0xFF0B0E13.toInt())
-        webView.isScrollbarFadingEnabled = true
-        webView.overScrollMode = View.OVER_SCROLL_NEVER
 
         if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
 
@@ -192,132 +177,7 @@ class MainActivity : Activity() {
     }
 
     private fun cacheHeaders(): Map<String, String> =
-        mapOf("Cache-Control" to "public, max-age=31536000", "Access-Control-Allow-Origin" to "*")
-
-    // -----------------------------------------------------------------------
-    // Storage: where the data lives, the permission dialog, and the folder
-    // picker. The viewer works fine without any of this — its cache is in the
-    // app's own folder — but a user who wants to see and choose the location
-    // gets a real dialog instead of a shrug.
-    // -----------------------------------------------------------------------
-
-    private val prefs by lazy { getSharedPreferences("visor", MODE_PRIVATE) }
-
-    fun folderName(): String = prefs.getString("visor.folder", "") ?: ""
-
-    fun permissionState(): String {
-        if (Build.VERSION.SDK_INT > 28) {
-            // Android 10+ has no general storage permission for apps any more:
-            // app folders, MediaStore exports and the folder picker cover it.
-            return "not_needed"
-        }
-        return if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
-            "granted"
-        } else "denied"
-    }
-
-    /** JSON string the page shows in the storage panel. */
-    fun storageStatus(): String {
-        val o = org.json.JSONObject()
-        try {
-            o.put("sdk", Build.VERSION.SDK_INT)
-            o.put("permission", permissionState())
-            o.put("legacyPermission", Build.VERSION.SDK_INT <= 28)
-            o.put("folder", folderName())
-            o.put("appDir", filesDir.absolutePath)
-            o.put("cacheDir", java.io.File(cacheDir, "vcache").absolutePath)
-            val ext = getExternalFilesDir(null)
-            if (ext != null) o.put("externalDir", ext.absolutePath)
-            o.put("state", Environment.getExternalStorageState())
-            o.put("freeBytes", filesDir.usableSpace)
-        } catch (t: Throwable) {
-            o.put("error", t.toString())
-        }
-        return o.toString()
-    }
-
-    /**
-     * Asks for the storage permission. On Android 9 and older this is a real
-     * system dialog; on 10+ the permission no longer exists, so the user is told
-     * where the data is kept and offered the folder picker instead.
-     */
-    fun requestStoragePermission(requestId: String) {
-        if (Build.VERSION.SDK_INT <= 28) {
-            if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
-                nativeBridge()?.pushResult("storagePermission", requestId, org.json.JSONObject().put("granted", true))
-                return
-            }
-            pendingStorageRequest = requestId
-            requestPermissions(
-                arrayOf(
-                    android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
-                    android.Manifest.permission.READ_EXTERNAL_STORAGE,
-                ), REQUEST_STORAGE)
-            return
-        }
-        val extra = org.json.JSONObject()
-        extra.put("granted", true)
-        extra.put("notNeeded", true)
-        nativeBridge()?.pushResult("storagePermission", requestId, extra)
-    }
-
-    /** Opens the system folder picker so the user can choose where data goes. */
-    fun pickFolder(requestId: String) {
-        pendingFolderRequest = requestId
-        try {
-            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
-            intent.addFlags(
-                Intent.FLAG_GRANT_READ_URI_PERMISSION
-                        or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                        or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
-            )
-            startActivityForResult(intent, REQUEST_FOLDER)
-        } catch (t: Throwable) {
-            val extra = org.json.JSONObject()
-            extra.put("ok", false)
-            extra.put("error", t.toString())
-            nativeBridge()?.pushResult("folder", requestId, extra)
-        }
-    }
-
-    private fun nativeBridge(): NativeBridge? = if (::bridge.isInitialized) bridge else null
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != REQUEST_STORAGE) return
-        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-        val id = pendingStorageRequest
-        pendingStorageRequest = null
-        if (id != null) {
-            val extra = org.json.JSONObject()
-            extra.put("granted", granted)
-            nativeBridge()?.pushResult("storagePermission", id, extra)
-        }
-    }
-
-    @Deprecated("startActivityForResult keeps this shell free of androidx dependencies")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != REQUEST_FOLDER) return
-        val id = pendingFolderRequest
-        pendingFolderRequest = null
-        val extra = org.json.JSONObject()
-        val uri = data?.data
-        if (resultCode == RESULT_OK && uri != null) {
-            try {
-                contentResolver.takePersistableUriPermission(
-                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            } catch (_: Throwable) {}
-            val name = uri.lastPathSegment ?: uri.toString()
-            prefs.edit().putString("visor.folder", name).apply()
-            extra.put("ok", true)
-            extra.put("folder", name)
-        } else {
-            extra.put("ok", false)
-            extra.put("cancelled", true)
-        }
-        nativeBridge()?.pushResult("folder", id, extra)
-    }
+        mapOf("Cache-Control" to "no-store", "Access-Control-Allow-Origin" to "*")
 
     private fun showErrorPage(code: String, detail: String) {
         val html = """
