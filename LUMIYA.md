@@ -25,8 +25,17 @@ Todo esto se comprobó leyendo ficheros concretos y se usa en
 | Contraseña: `"$1$" + md5(password.trim().substring(0,16))` | `slproto/auth/SLAuth.getPasswordHash` | |
 | Posición "terse" (16/32/48 bytes): `pos, vel, accel, rot` (cuantizados U8 o U16) y luego velocidad angular | `slproto/objects/SLObjectInfo.ParseObjectData` | en 60 bytes es flotante: `pos,vel,accel,rot(+angVel)`; la variante de 76 lleva 16 bytes de prefijo |
 
-### Divergencias conscientes
+### LLSD (capacidades y EventQueue) — verificado en `llsdserialize*.cpp`
 
+- El XML de LLSD (respuesta de la capability semilla, EventQueueGet) escribe los
+  mapas **planos**: `<llsd><map><key>k</key><string>v</string>…</map></llsd>`,
+  **sin** `<member>` (eso es XML-RPC, que sí lo usa `login.cgi`).
+- La notación LLSD (`application/llsd+notation`) escribe las cadenas entre
+  comillas simples (`'texto'`), los mapas como `{'clave':valor}`, las fechas
+  como `d"..."`, las URI como `l"..."`, las UUID como `u<36>` y los enteros
+  como `i<n>`. El parser acepta además `s<len>:texto` y `b64"..."`.
+
+### Divergencias conscientes
 - **ImprovedInstantMessage**: Lumiya empaqueta sólo hasta `BinaryBucket` (sin
   `EstateBlock` ni `MetaData`), mientras que la `message_template.msg` actual (y
   libomv) incluyen esos bloques. Este visor sigue **la plantilla** (más seguro:
@@ -38,7 +47,34 @@ Todo esto se comprobó leyendo ficheros concretos y se usa en
   objetos aparecen desplazados, están todos los rangos en un solo sitio:
   `POS_XY`, `POS_Z`, `VEL_XY`, `VEL_Z` en `object-update.js`.
 
-## 2. Inventario de funciones de Lumiya y estado
+## 2. Login: lo que envía el visor oficial (verificado en Firestorm)
+
+Fuente: `indra/newview/lllogininstance.cpp` (`LLLoginInstance::constructAuthParams`
+y `connect`), `indra/newview/llxmlrpclistener.cpp` (`Poller`),
+`indra/newview/llxmlrpctransaction.cpp` (construcción del XML-RPC) e
+`indra/newview/fspanellogin.cpp` (`getFields`, nombres de usuario).
+
+- La petición es **XML-RPC** (`<methodCall><methodName>login_to_simulator</methodName>`)
+  con **un único `<param>` que es una struct plana**: cada parámetro es un
+  `<member>` hermano; `options` va como array dentro. Los booleanos se convierten
+  a **enteros** (`agree_to_tos`, `read_critical`, `extended_errors` → `<int>1</int>`).
+- Parámetros que manda el visor: `first`, `last`, `passwd` (`$1$`+md5),
+  `start`, `agree_to_tos`, `read_critical`, `mac`, `version`, `channel`,
+  `platform`, `address_size`, `platform_version`, `platform_string`, `id0`,
+  `host_id`, `extended_errors`, `token`, `mfa_hash`, `options`. (`viewer_digest`
+  no lo manda; aquí se envía a ceros por compatibilidad con Lumiya.)
+- **Usuario de una sola palabra**: en las grids de Linden, si no hay separador se
+  envía `first=<usuario>`, `last="Resident"`; también se aceptan
+  `nombre.apellido` y `nombre_apellido`.
+- **MFA**: si la cuenta tiene verificación en dos pasos, el login falla con
+  `reason == "mfa_challenge"` y un `mfa_hash` en la respuesta; el visor guarda ese
+  hash y reintenta con `token` = código de 6 dígitos (sin espacios). Si el
+  `mfa_hash` se recuerda, los siguientes logins no piden código. Es lo que hace
+  `visor.mfa.<grid>.<usuario>` en `localStorage`.
+- `extended_errors: 1` hace que la respuesta traiga `message_id` y
+  `message_args`, que es lo que se enseña cuando el login falla.
+
+## 3. Inventario de funciones de Lumiya y estado
 
 | Área de Lumiya (ficheros) | Estado en Visor SL |
 | --- | --- |
@@ -62,7 +98,7 @@ Todo esto se comprobó leyendo ficheros concretos y se usa en
 | `render/*` (GLES, shaders de prims/terreno/avatares, culling, LOD) | **equivalente web** en `renderer.js`/`world.js` (LOD por distancia y teselado) |
 | `ui/*` (HUD, inventario, chat, cámara, RLV…) | **propio**: HUD web con inspector, panel, chat, login |
 
-## 3. Siguientes pasos por orden de impacto
+## 4. Siguientes pasos por orden de impacto
 
 1. Probar el login real y arreglar lo que falle (ver `TODO.md`).
 2. Decodificador JPEG2000 (texturas) y texturas del terreno desde la región.

@@ -30,11 +30,14 @@ export const CONTROL = {
   NUDGE_UP_POS: 0x800000, NUDGE_UP_NEG: 0x1000000, TURN_LEFT: 0x2000000, TURN_RIGHT: 0x4000000,
 };
 
+// Names taken from the login params the official/Firestorm viewer requests
+// (indra/newview/lllogininstance.cpp). We skip the inventory* ones on purpose:
+// the viewer does not use inventory yet and they are the bulk of the reply.
 const LOGIN_OPTIONS = [
-  "inventory-root", "inventory-skeleton", "inventory-lib-root", "inventory-lib-owner",
-  "initial-outfit", "gestures", "event_categories", "event_notifications",
-  "classified_categories", "buddy-list", "ui-config", "tutorial", "login-flags",
-  "global-textures",
+  "display_names", "adult_compliant", "login-flags", "global-textures",
+  "event_categories", "event_notifications", "classified_categories",
+  "buddy-list", "ui-config", "newuser-config", "tutorial_setting",
+  "max-agent-groups", "map-server-url", "advanced-mode",
 ];
 
 const AGENT_UPDATE_HZ = 10;
@@ -50,8 +53,30 @@ function randomMac() {
   return s;
 }
 
-function asUuid(value) {
-  if (!value) return null;
+// Mirrors FSPanelLogin::getFields (indra/newview/fspanellogin.cpp): on a Linden
+// grid a single-word name is sent as first=<name>, last="Resident", and legacy
+// "firstname.lastname" / "firstname_lastname" spellings are accepted too.
+export function splitLoginName(raw) {
+  let name = String(raw == null ? "" : raw).trim();
+  const at = name.indexOf("@");
+  if (at > 0) name = name.slice(0, at).trim();
+  if (!name) return null;
+  const sep = name.search(/[ ._]/);
+  if (sep < 0) return { first: name, last: "Resident", full: name };
+  const first = name.slice(0, sep).trim();
+  let last = name.slice(sep + 1).trim();
+  if (!first) return null;
+  if (!last) last = "Resident";
+  return { first, last, full: first + " " + last };
+}
+
+function loginIp(value) {
+  if (typeof value === "string") return value;
+  if (value instanceof Uint8Array && value.length >= 4) return [...value.slice(0, 4)].join(".");
+  return String(value || "");
+}
+
+function asUuid(value) {  if (!value) return null;
   if (value instanceof Uint8Array) return value.length >= 16 ? uuidString(value) : null;
   const s = String(value).trim();
   if (/^[0-9a-fA-F-]{32,36}$/.test(s)) return s.length === 32 ? uuidString(Uint8Array.from(s.match(/../g).map((h) => parseInt(h, 16)))) : s;
@@ -62,6 +87,7 @@ export class SLSession {
   constructor(app, opts = {}) {
     this.app = app;
     this.onStatus = opts.onStatus || null;
+    this.http = opts.http || httpRequest;
     this.state = "offline";
     this.template = null;
     this.defs = null;
@@ -107,62 +133,90 @@ export class SLSession {
 
   async login(opts = {}) {
     const grid = GRIDS[opts.grid] || GRIDS.agni;
-    const parts = String(opts.name || "").trim().split(/\s+/);
-    if (parts.length < 2 || !opts.password) {
-      throw new Error("Escribe el nombre completo (Nombre Apellido) y la contraseña.");
+    const who = splitLoginName(opts.name);
+    if (!who || !opts.password) {
+      throw new Error("Escribe tu usuario (o Nombre Apellido) y la contraseña.");
     }
-    this.agentName = parts.join(" ");
-    this.status(`Iniciando sesión en ${grid.label}…`);
+    this.agentName = who.full;
+    this.status(`Iniciando sesión en ${grid.label} como ${who.first} ${who.last}…`);
 
-    const loginReply = await this.sendLogin(grid.login, parts[0], parts.slice(1).join(" "), opts.password);
+    const loginReply = await this.sendLogin(grid.login, who, opts.password, {
+      token: opts.token,
+      mfaHash: opts.mfaHash,
+    });
     if (!loginReply || loginReply.login === false || loginReply.login === "false") {
-      const reason = loginReply ? loginReply.message || loginReply.reason || "login rechazado" : "respuesta vacía";
-      throw new Error("Login fallido: " + reason);
+      throw new Error("Login fallido: " + ((loginReply && loginReply.message) || "respuesta rechazada"));
     }
     this.agentID = asUuid(loginReply.agent_id);
     this.sessionID = asUuid(loginReply.session_id);
     this.circuitCode = Number(loginReply.circuit_code) || 0;
     this.seedCap = loginReply.seed_capability || null;
+    this.mfaHash = loginReply.mfa_hash || this.mfaHash || "";
     this.regionName = `${loginReply["region_x"] || "?"}, ${loginReply["region_y"] || "?"}`;
     this.status(`Sesión iniciada como ${this.agentName} (circuito ${this.circuitCode}).`);
+    if (loginReply.message) this.log("SL: " + String(loginReply.message).split("\n")[0]);
 
     if (this.seedCap) await this.loadCapabilities(this.seedCap).catch((e) => this.log("Caps: " + e.message));
-    await this.openCircuit(loginReply.sim_ip, Number(loginReply.sim_port) || 0);
+    await this.openCircuit(loginIp(loginReply.sim_ip), Number(loginReply.sim_port) || 0);
     this.state = "online";
     this.startLoops();
     this.startEventQueue();
     return loginReply;
   }
 
-  async sendLogin(url, first, last, password) {
+  async sendLogin(url, who, password, opts = {}) {
+    const info = platformInfo();
     const passHash = "$1$" + md5Hex(password.trim().slice(0, 16));
     const body = LLSD.xmlRpcCall("login_to_simulator", [{
-      first, last,
+      first: who.first,
+      last: who.last,
       passwd: passHash,
       start: "last",
       channel: "Visor SL",
       version: "1.0.0",
-      platform: platformInfo().platform === "android" ? "Android" : "Web",
+      platform: info.platform === "android" ? "Android" : "Web",
+      platform_string: typeof navigator !== "undefined" ? navigator.userAgent : "unknown",
+      platform_version: info.platform === "android" ? `Android ${info.sdk || ""}` : "web",
+      address_size: 64,
       mac: randomMac(),
-      id0: md5Hex(this.agentName),
-      agree_to_tos: true,
-      read_critical: false,
+      host_id: md5Hex("visor-sl"),
+      id0: md5Hex(who.full),
+      agree_to_tos: 1,
+      read_critical: 1,
       viewer_digest: "00000000000000000000000000000000",
+      extended_errors: 1,
+      token: opts.token || "",
+      mfa_hash: opts.mfaHash || "",
       options: LOGIN_OPTIONS,
     }]);
-    const res = await httpRequest({
+    const res = await this.http({
       url, method: "POST", body,
       headers: { "Content-Type": "text/xml", "Accept": "text/xml" },
     });
     const parsed = LLSD.parse(res.text);
-    if (parsed && parsed.message && parsed.login !== true && parsed.login !== "true") {
-      this.log("Login: " + parsed.message + (parsed.reason ? ` (${parsed.reason})` : ""));
+    const ok = !!parsed && (parsed.login === true || parsed.login === "true");
+    if (!ok) {
+      const reason = (parsed && parsed.reason) || "";
+      const message = (parsed && parsed.message) || "el servidor rechazó el login";
+      this.log("Login: " + String(message).split("\n")[0] + (reason ? ` [reason: ${reason}]` : ""));
+      if (parsed && parsed.message_id) {
+        this.log(`message_id: ${parsed.message_id} ${JSON.stringify(parsed.message_args || {})}`);
+      }
+      if (!parsed) this.log("Respuesta del servidor: " + String(res.text || "").slice(0, 400));
+      const err = new Error("Login fallido: " + message);
+      err.reason = reason;
+      err.messageId = (parsed && parsed.message_id) || "";
+      err.messageArgs = (parsed && parsed.message_args) || null;
+      err.mfaHash = (parsed && parsed.mfa_hash) || opts.mfaHash || "";
+      err.mfaChallenge = reason === "mfa_challenge";
+      throw err;
     }
+    if (parsed.mfa_hash) this.mfaHash = parsed.mfa_hash;
     return parsed;
   }
 
   async loadCapabilities(seedUrl) {
-    const res = await httpRequest({ url: seedUrl, headers: { Accept: "application/llsd+xml" } });
+    const res = await this.http({ url: seedUrl, headers: { Accept: "application/llsd+xml" } });
     this.caps = LLSD.parse(res.text) || {};
     const names = Object.keys(this.caps).filter((k) => k !== "seed_capability");
     this.log(`Capacidades: ${names.length} (${names.slice(0, 6).join(", ")}…)`);
@@ -261,7 +315,7 @@ export class SLSession {
     const poll = async () => {
       while (this.state === "online") {
         try {
-          const res = await httpRequest({
+          const res = await this.http({
             url: url + "?ack=" + ack + "&done=false", method: "POST",
             body: LLSD.toXML({ ack, done: false }),
             headers: { "Content-Type": "application/llsd+xml", Accept: "application/llsd+xml" },
@@ -514,7 +568,7 @@ export class SLSession {
     const base = this.caps.GetTexture || this.caps["GetTexture"];
     if (!base) return;
     const url = base + (base.includes("?") ? "&" : "?") + "texture_id=" + uuid;
-    const res = await httpRequest({ url, timeout: 60000 });
+    const res = await this.http({ url, timeout: 60000 });
     if (!res.ok || !res.bytes.length) throw new Error("textura " + uuid);
     this.pendingTextures.delete(uuid);
     const decoded = await this.decodeImage(res.bytes, res.headers["content-type"] || "");

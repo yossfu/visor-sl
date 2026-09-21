@@ -122,10 +122,18 @@ export class App {
     const mod = await import("./sl-session.js");
     this.CONTROL = mod.CONTROL;
     this.session = new mod.SLSession(this, { onStatus: opts.status });
-    await this.session.login(opts);
+    let reply;
+    try {
+      reply = await this.session.login(opts);
+    } catch (e) {
+      try { await this.session.disconnect(); } catch (_) {}
+      this.session = null;
+      throw e;
+    }
     this.viewer.controls.focus(this.session.agentPos, 14);
     this.bindControls();
     this.ui.log("Controles: W/A/S/D moverse, Q/E subir-bajar, Espacio volar, Shift correr (en la app Android).");
+    return reply;
   }
 
   async disconnect() {

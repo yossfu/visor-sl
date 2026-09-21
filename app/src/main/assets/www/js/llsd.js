@@ -31,12 +31,23 @@ export function parseLLSDXML(text) {
 function fromXmlNode(node) {
   switch (node.nodeName) {
     case "map": {
+      // Linden's LLSD XML writes maps flat — <map><key>k</key><string>v</string>…</map>
+      // — (see LLSDXMLFormatter in llsdserialize_xml.cpp). The XML-RPC style
+      // <member><name>…</name>…</member> is tolerated too.
       const out = {};
-      for (const member of node.children) {
-        if (member.nodeName !== "member") continue;
-        const k = member.querySelector(":scope > key");
-        const v = [...member.children].find(c => c.nodeName !== "key");
-        if (k) out[k.textContent] = v ? fromXmlNode(v) : null;
+      const kids = [...node.children];
+      for (let i = 0; i < kids.length; i++) {
+        const child = kids[i];
+        if (child.nodeName === "key") {
+          const next = kids[i + 1];
+          const hasValue = next && next.nodeName !== "key";
+          out[child.textContent] = hasValue ? fromXmlNode(next) : null;
+          if (hasValue) i++;
+        } else if (child.nodeName === "member") {
+          const k = child.querySelector(":scope > key") || child.querySelector(":scope > name");
+          const v = [...child.children].find(c => c.nodeName !== "key" && c.nodeName !== "name");
+          if (k) out[k.textContent] = v ? fromXmlNode(v) : null;
+        }
       }
       return out;
     }
@@ -175,49 +186,154 @@ export function buildXmlRpcCall(method, params) {
 // ---------------------------------------------------------------------------
 
 export function parseLLSDNotation(text) {
+  const src = String(text == null ? "" : text);
   let i = 0;
-  const skipWs = () => { while (i < text.length && /\s/.test(text[i])) i++; };
+  const skipWs = () => { while (i < src.length && /\s/.test(src[i])) i++; };
+  const isDigit = (ch) => ch >= "0" && ch <= "9";
+
+  // '<str>' / "<str>" — matches deserialize_string_delim in llsdserialize.cpp
+  function quoted(q) {
+    i++;
+    let out = "";
+    while (i < src.length) {
+      const ch = src[i];
+      if (ch === "\\") {
+        const n = src[i + 1];
+        if (n === "x") {
+          out += String.fromCharCode(parseInt(src.substr(i + 2, 2), 16) || 0);
+          i += 4;
+          continue;
+        }
+        out += n === "n" ? "\n" : n === "t" ? "\t" : n === "r" ? "\r" : n;
+        i += 2;
+        continue;
+      }
+      if (ch === q) { i++; break; }
+      out += ch;
+      i++;
+    }
+    return out;
+  }
+
+  // <len>:<raw>  /  <len>"<raw>"  /  <len>\n<raw>  — the `s` form
+  function counted() {
+    i++;
+    if (src[i] === "(") {
+      const close = src.indexOf(")", i);
+      const len = parseInt(src.slice(i + 1, close), 10);
+      i = close + 1;
+      if (src[i] === '"') i++;
+      const s = src.substr(i, len);
+      i += len;
+      if (src[i] === '"') i++;
+      return s;
+    }
+    let len = 0;
+    while (isDigit(src[i])) len = len * 10 + (+src[i++]);
+    if (src[i] === ":" || src[i] === "\n") i++;
+    if (src[i] === '"') i++;
+    const s = src.substr(i, len);
+    i += len;
+    return s;
+  }
+
   function parse() {
     skipWs();
-    const c = text[i];
-    switch (c) {
-      case "!": i++; return null;
-      case "1": i++; return true;
-      case "0": i++; return false;
-      case "i": { i++; const s = i; while (i < text.length && /[-+0-9]/.test(text[i])) i++; return parseInt(text.slice(s, i), 10); }
-      case "r": { i++; const s = i; while (i < text.length && /[-+.eE0-9]/.test(text[i])) i++; return parseFloat(text.slice(s, i)); }
-      case "u": { i++; const s = text.slice(i, i + 36); i += 36; return s; }
-      case "d": { i++; const s = i; while (i < text.length && text[i] !== "\n") i++; return text.slice(s, i); }
-      case "l": case "s": {
-        i++;
-        let len = 0;
-        while (i < text.length && /[0-9]/.test(text[i])) len = len * 10 + (+text[i++]);
-        if (text[i] === ":") i++;
-        else if (text[i] === "\n") i++;
-        if (text[i] === '"') i++;
-        const s = text.substr(i, len);
-        i += len;
-        return s;
+    const c = src[i];
+    if (c === undefined) return null;
+    if (c === "!") { i++; return null; }
+    if (c === "1") { i++; return true; }
+    if (c === "0") { i++; return false; }
+    if (c === "'" || c === '"') return quoted(c);
+    if (c === "[") {
+      i++;
+      const arr = [];
+      for (;;) {
+        skipWs();
+        if (src[i] === "]") { i++; break; }
+        if (i >= src.length) break;
+        arr.push(parse());
+        skipWs();
+        if (src[i] === ",") i++;
       }
-      case "[": {
-        i++; const arr = [];
-        for (;;) { skipWs(); if (text[i] === "]") { i++; break; } if (i >= text.length) break; arr.push(parse()); skipWs(); if (text[i] === ",") i++; }
-        return arr;
-      }
-      case "{": {
-        i++; const map = {};
-        for (;;) {
-          skipWs(); if (text[i] === "}") { i++; break; } if (i >= text.length) break;
-          const k = parse(); skipWs(); if (text[i] === ":") i++;
-          map[String(k)] = parse();
-          skipWs(); if (text[i] === ",") i++;
-        }
-        return map;
-      }
-      default: i++; return null;
+      return arr;
     }
+    if (c === "{") {
+      i++;
+      const map = {};
+      for (;;) {
+        skipWs();
+        if (src[i] === "}") { i++; break; }
+        if (i >= src.length) break;
+        const k = parse();
+        skipWs();
+        if (src[i] === ":") i++;
+        map[String(k)] = parse();
+        skipWs();
+        if (src[i] === ",") i++;
+      }
+      return map;
+    }
+    if (c === "i" && /[-+0-9]/.test(src[i + 1] || "")) {
+      i++;
+      const s = i;
+      while (i < src.length && /[-+0-9]/.test(src[i])) i++;
+      return parseInt(src.slice(s, i), 10);
+    }
+    if (c === "r" && /[-+.eE0-9]/.test(src[i + 1] || "")) {
+      i++;
+      const s = i;
+      while (i < src.length && /[-+.eE0-9]/.test(src[i])) i++;
+      return parseFloat(src.slice(s, i));
+    }
+    if (c === "u" && /^[0-9a-fA-F-]{36}$/.test(src.substr(i + 1, 36))) {
+      i++;
+      const s = src.substr(i, 36);
+      i += 36;
+      return s;
+    }
+    if (c === "d" || c === "l") {
+      i++;
+      if (src[i] === '"' || src[i] === "'") return quoted(src[i]);
+      const s = i;
+      while (i < src.length && !/["',}\]\s]/.test(src[i])) i++;
+      return src.slice(s, i);
+    }
+    if (c === "s" && (isDigit(src[i + 1] || "") || src[i + 1] === "(")) return counted();
+    if (c === "b") {
+      if (src.substr(i + 1, 3) === "64" ) {
+        i += 3;
+        if (src[i] === '"') i++;
+        const s = i;
+        while (i < src.length && src[i] !== '"') i++;
+        const b64 = src.slice(s, i);
+        i++;
+        const bin = atob(b64.replace(/\s+/g, ""));
+        const out = new Uint8Array(bin.length);
+        for (let j = 0; j < bin.length; j++) out[j] = bin.charCodeAt(j);
+        return out;
+      }
+      const raw = counted();
+      const out = new Uint8Array(raw.length);
+      for (let j = 0; j < raw.length; j++) out[j] = raw.charCodeAt(j) & 0xff;
+      return out;
+    }
+    // Not standard notation, but some tools emit bare words; treat as a string.
+    const s = i;
+    while (i < src.length && /[^\s,:\]}]/.test(src[i])) i++;
+    if (i === s) { i++; return null; }
+    return src.slice(s, i);
   }
   return parse();
+}
+
+function notationString(s) {
+  let out = "";
+  for (const ch of String(s)) {
+    if (ch === "\\" || ch === "'") out += "\\" + ch;
+    else out += ch;
+  }
+  return out;
 }
 
 export function serializeLLSDNotation(v) {
@@ -226,13 +342,18 @@ export function serializeLLSDNotation(v) {
   if (typeof v === "number") return Number.isInteger(v) ? `i${v}` : `r${v}`;
   if (typeof v === "string") {
     const hint = detectHint(v);
-    const tag = hint === "uuid" ? "u" : hint === "date" ? "d" : hint === "uri" ? "l" : "s";
-    if (tag === "u" || tag === "d" && hint === "date") return tag + v;
-    return `${tag}${v.length}:${v}`;
+    if (hint === "uuid") return "u" + v;
+    if (hint === "date") return `d"${notationString(v)}"`;
+    if (hint === "uri") return `l"${notationString(v)}"`;
+    return `'${notationString(v)}'`;
   }
-  if (v instanceof Uint8Array) return `b${v.length}:${String.fromCharCode(...v)}`;
+  if (v instanceof Uint8Array) {
+    let bin = "";
+    for (const b of v) bin += String.fromCharCode(b);
+    return `b64"${btoa(bin)}"`;
+  }
   if (Array.isArray(v)) return `[${v.map(serializeLLSDNotation).join(",")}]`;
-  return `{${Object.keys(v).map(k => `s${k.length}:${k}:${serializeLLSDNotation(v[k])}`).join(",")}}`;
+  return `{${Object.keys(v).map(k => `'${notationString(k)}':${serializeLLSDNotation(v[k])}`).join(",")}}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +440,15 @@ export function serializeLLSDBinary(v) {
   return new Uint8Array([0x4c, 0x4c, 0x53, 0x44, 0x01, ...out]);
 }
 
+function parseText(raw) {
+  const text = String(raw == null ? "" : raw).trim();
+  if (text.startsWith("<")) {
+    if (/<methodResponse|<methodCall/.test(text.slice(0, 400))) return parseXmlRpc(text);
+    return parseLLSDXML(text);
+  }
+  return parseLLSDNotation(text);
+}
+
 export const LLSD = {
   parseXML: parseLLSDXML,
   parseNotation: parseLLSDNotation,
@@ -329,14 +459,14 @@ export const LLSD = {
   toNotation: serializeLLSDNotation,
   toBinary: serializeLLSDBinary,
   toXmlRpcValue: xmlRpcValue,
-  parse(bytes) {
-    const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  // Accepts a string (XML / LLSD notation) as well as bytes. Passing a string
+  // used to fall through `new Uint8Array(string)`, which silently produced an
+  // empty buffer — i.e. every XML-RPC login reply and every capability reply
+  // parsed as null.
+  parse(input) {
+    if (typeof input === "string") return parseText(input);
+    const b = input instanceof Uint8Array ? input : new Uint8Array(input);
     if (b[0] === 0x4c && b[1] === 0x4c && b[2] === 0x53 && b[3] === 0x44) return parseLLSDBinary(b);
-    const text = new TextDecoder().decode(b).trim();
-    if (text.startsWith("<")) {
-      if (/<methodResponse|<methodCall/.test(text.slice(0, 400))) return parseXmlRpc(text);
-      return parseLLSDXML(text);
-    }
-    return parseLLSDNotation(text);
+    return parseText(new TextDecoder().decode(b));
   },
 };

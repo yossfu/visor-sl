@@ -5,9 +5,17 @@ una cuenta real en el grid.
 
 ## 0. Primera conexión real (comprobaciones)
 
-- [ ] **Login XML-RPC**: confirmar que `login.agni.lindenlab.com/cgi-bin/login.cgi`
-      acepta el struct enviado (canal/versión/mac/options) y que la respuesta se
-      lee bien. Si el login falla, el mensaje del servidor se muestra en el chat.
+Ya cubierto y probado sin red (31/31 en `runVisorSelfTest`): struct XML-RPC del
+login idéntico al del visor oficial (Firestorm), usuario de una sola palabra →
+`last="Resident"`, reto MFA con `token`+`mfa_hash`, lectura de las respuestas
+LLSD (XML plano y notación), capacidades, plantilla de mensajes, ObjectUpdate.
+
+- [ ] **Login XML-RPC**: confirmar en el grid real que
+      `login.agni.lindenlab.com/cgi-bin/login.cgi` acepta el struct enviado
+      (canal/versión/mac/options). El motivo exacto del servidor se muestra en el
+      registro del HUD (botón ⧉ para copiarlo).
+- [ ] **MFA**: si la cuenta tiene verificación en dos pasos, comprobar el flujo
+      `mfa_challenge` → código de 6 dígitos → `mfa_hash` recordado.
 - [ ] **`sim_ip`/`sim_port`**: comprobar que `openCircuit` conecta y que el
       RegionHandshake llega (si no, el circuito no está bien: revisar
       `UseCircuitCode`).

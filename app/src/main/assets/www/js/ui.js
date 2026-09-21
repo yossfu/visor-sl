@@ -73,7 +73,13 @@ export class UI {
         chatInput.value = "";
       }
     });
-    const bottom = el("div", { class: "bar bottom" }, [this.logEl, chatInput]);
+    const bottom = el("div", { class: "bar bottom" }, [
+      this.logEl,
+      el("div", { class: "row" }, [
+        chatInput,
+        el("button", { class: "btn", title: "Copiar el registro al portapapeles", onclick: () => this.copyLog(), text: "⧉" }),
+      ]),
+    ]);
     r.appendChild(bottom);
 
     // --- login modal ---
@@ -227,6 +233,23 @@ export class UI {
     this.logEl.scrollTop = this.logEl.scrollHeight;
   }
 
+  copyLog() {
+    const text = (this.logEl ? this.logEl.textContent : "").trim();
+    const done = (ok) => this.log(ok ? "Registro copiado. Pégalo en el chat si algo falla." : "No se pudo copiar el registro.");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
+      return;
+    }
+    const ta = el("textarea", {});
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+    document.body.removeChild(ta);
+    done(ok);
+  }
+
   updateStats(s) {
     this.fpsEl.textContent = `${s.fps.toFixed(0)} fps`;
     this.trisEl.textContent = `${(s.tris / 1000).toFixed(1)}k tris`;
@@ -241,26 +264,61 @@ export class UI {
       el("option", { value: "agni", text: "Second Life (agni)" }),
       el("option", { value: "aditi", text: "Beta grid (aditi)" }),
     ]);
-    const user = el("input", { class: "num wide", placeholder: "Nombre Apellido" });
+    const user = el("input", { class: "num wide", placeholder: "Usuario o Nombre Apellido" });
     const pass = el("input", { class: "num wide", type: "password", placeholder: "Contraseña" });
+    const token = el("input", { class: "num wide", placeholder: "Código MFA de 6 dígitos (si lo pide)", autocomplete: "one-time-code" });
     const status = el("div", { class: "hint", text: "" });
+    const deviceHint = el("div", { class: "hint", text: "" });
     const close = () => { m.classList.add("hidden"); m.innerHTML = ""; };
+    const mfaKey = (name) => "visor.mfa." + grid.value + "." + String(name || "").trim().toLowerCase();
+    let mfaHash = "";
+    const reloadDevice = () => {
+      try { mfaHash = localStorage.getItem(mfaKey(user.value)) || ""; } catch (_) { mfaHash = ""; }
+      deviceHint.textContent = mfaHash
+        ? "Este móvil ya está verificado (MFA recordado): no necesitas código."
+        : "Si tu cuenta tiene verificación en dos pasos, escribe aquí el código de 6 dígitos.";
+    };
+    user.addEventListener("input", reloadDevice);
+    reloadDevice();
     const go = async () => {
       status.textContent = "Conectando…";
+      const code = token.value.replace(/\s+/g, "");
       try {
-        await this.app.connect({ grid: grid.value, name: user.value, password: pass.value, status: (t) => status.textContent = t });
+        const reply = await this.app.connect({
+          grid: grid.value,
+          name: user.value,
+          password: pass.value,
+          token: code,
+          mfaHash,
+          status: (t) => status.textContent = t,
+        });
+        const returned = (reply && reply.mfa_hash) || "";
+        if (returned) {
+          mfaHash = returned;
+          try { localStorage.setItem(mfaKey(user.value), mfaHash); } catch (_) {}
+        }
+        close();
+        return;
       } catch (e) {
-        status.textContent = "Error: " + e.message;
+        if (e && e.mfaHash) mfaHash = e.mfaHash;
+        if (e && e.mfaChallenge) {
+          status.textContent = "Escribe el código de verificación MFA y vuelve a pulsar Entrar.";
+          token.value = "";
+          token.focus();
+        } else {
+          status.textContent = "Error: " + ((e && e.message) || e);
+        }
       }
     };
     m.appendChild(el("div", { class: "modal" }, [
       el("h2", { text: "Conectar a Second Life" }),
-      el("div", { class: "hint", text: "Tu contraseña sólo se envía al servidor de login de Linden Lab." }),
-      grid, user, pass, status,
+      el("div", { class: "hint", text: "Tu contraseña sólo se envía al servidor de login de Linden Lab (como hash $1$ + md5, igual que cualquier visor)." }),
+      grid, user, pass, token, deviceHint, status,
       el("div", { class: "row" }, [
         el("button", { class: "btn accent", onclick: go, text: "Entrar" }),
         el("button", { class: "btn", onclick: close, text: "Cancelar" }),
       ]),
+      el("div", { class: "hint", text: "Sirve tanto el usuario de una sola palabra (cuentas nuevas) como «Nombre Apellido». Si el login falla, el motivo exacto que devuelve el servidor queda en el registro de abajo." }),
     ]));
   }
 

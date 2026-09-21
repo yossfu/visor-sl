@@ -114,13 +114,16 @@ En el editor de Perchance (o en la consola del visor web):
 await window.runVisorSelfTest();
 ```
 
-Comprueba 24 cosas sin necesidad de cuenta: que la plantilla tiene 483 mensajes,
-que los números de mensaje son **byte a byte** los mismos que los de Lumiya
-(descubiertos en el código decompilado), que `ChatFromViewer` coincide con la
-referencia, que `AgentUpdate` mide 115 bytes, ida y vuelta de paquetes con
+Comprueba **31 cosas** sin necesidad de cuenta: que la plantilla tiene 483
+mensajes, que los números de mensaje son **byte a byte** los mismos que los de
+Lumiya (descubiertos en el código decompilado), que `ChatFromViewer` coincide con
+la referencia, que `AgentUpdate` mide 115 bytes, ida y vuelta de paquetes con
 zerocode y ACKs, decodificación de posición/rotación "terse", ExtraParams,
-XML-RPC de login, LLSD notation/binary y un **ObjectUpdate completo byte a byte**
-más su decodificación.
+**la petición de login completa comparada con la del visor oficial** (struct
+XML-RPC plano, `first`/`last` con usuario de una palabra, `$1$`+md5,
+`agree_to_tos`/`read_critical`/`extended_errors` como enteros, `token`/`mfa_hash`)
+y su reto MFA, lectura de respuestas LLSD (XML plano del simulador y notación),
+LLSD binary y un **ObjectUpdate completo byte a byte** más su decodificación.
 
 Nota: en el editor el visor se ejecuta dentro de un iframe con service worker;
 si `fetch("src/...")` falla con "Load failed" es porque el navegador no soporta

@@ -139,6 +139,9 @@ body.flying #view { cursor: crosshair; }
   border-radius: 9px; padding: 8px 10px; outline: none;
 }
 .chatinput:focus { border-color: var(--accent); }
+.bar.bottom .row { align-items: stretch; }
+.bar.bottom .chatinput { flex: 1 1 auto; min-width: 0; }
+.bar.bottom .btn { flex: 0 0 auto; }
 
 /* ---------- modal ---------- */
 .modal-host {
