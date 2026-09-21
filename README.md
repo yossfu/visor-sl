@@ -25,3 +25,6 @@ El login y la sesión Second Life todavía no se han "simulado" dentro de esta f
 6. UI nativa: chat, inventario, amigos, teleport, cámara y controles.
 
 La versión del renderer y del build no debe mezclar responsabilidades: el protocolo no dependerá de Filament.
+
+
+Build 2 fixes: Filament Android UiHelper RendererCallback now implements onResized(), Renderer.beginFrame() uses the frame timestamp required by current Filament, UiHelper is detached before Engine destruction, and CI is pinned to Ubuntu 24.04 with separate Kotlin/NDK diagnostics.

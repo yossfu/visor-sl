@@ -39,9 +39,12 @@ class NativeFilamentView(context: Context) : FrameLayout(context) {
     private var running = true
     private var frameQueued = false
 
-    private val frameCallback = Choreographer.FrameCallback {
+    private val frameCallback = Choreographer.FrameCallback { frameTimeNanos ->
         frameQueued = false
-        if (running) { renderFrame(); queueFrame() }
+        if (running) {
+            renderFrame(frameTimeNanos)
+            queueFrame()
+        }
     }
 
     init {
@@ -72,7 +75,17 @@ class NativeFilamentView(context: Context) : FrameLayout(context) {
             scene = this@NativeFilamentView.scene
             camera = this@NativeFilamentView.camera
             viewport = Viewport(0, 0, 1, 1)
-            renderQuality.hdrColorBuffer = View.RenderQuality.HDRColorBuffer.FP16
+            renderQuality = renderQuality.apply {
+                hdrColorBuffer = View.QualityLevel.MEDIUM
+            }
+            dynamicResolutionOptions = dynamicResolutionOptions.apply {
+                enabled = true
+                quality = View.QualityLevel.LOW
+                minScale = 0.60f
+                maxScale = 1.00f
+                sharpness = 0.5f
+            }
+            antiAliasing = View.AntiAliasing.NONE
         }
         configureCamera()
 
@@ -101,25 +114,40 @@ class NativeFilamentView(context: Context) : FrameLayout(context) {
                 swapChain?.let { e.destroySwapChain(it) }
                 swapChain = e.createSwapChain(surface)
             }
+
             override fun onDetachedFromSurface() {
-                swapChain?.let { e.destroySwapChain(it) }
+                swapChain?.let {
+                    e.destroySwapChain(it)
+                    e.flushAndWait()
+                }
                 swapChain = null
+            }
+
+            override fun onResized(width: Int, height: Int) {
+                if (height > 0) {
+                    val aspect = width.toDouble() / height.toDouble()
+                    camera?.setProjection(45.0, aspect, 0.1, 100.0, Camera.Fov.VERTICAL)
+                }
+                view?.viewport = Viewport(0, 0, width.coerceAtLeast(1), height.coerceAtLeast(1))
             }
         }
         uiHelper.attachTo(surface)
     }
 
-    private fun configureCamera() {
+    private fun configureCamera(width: Int = this.width, height: Int = this.height) {
         val v = view ?: return
         val c = camera ?: return
-        c.setProjection(45.0, 0.1, 100.0, Camera.Fov.VERTICAL)
+        val safeWidth = width.coerceAtLeast(1)
+        val safeHeight = height.coerceAtLeast(1)
+        val aspect = safeWidth.toDouble() / safeHeight.toDouble()
+        c.setProjection(45.0, aspect, 0.1, 100.0, Camera.Fov.VERTICAL)
         c.lookAt(0.0, 1.0, 4.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0)
-        v.viewport = Viewport(0, 0, width.coerceAtLeast(1), height.coerceAtLeast(1))
+        v.viewport = Viewport(0, 0, safeWidth, safeHeight)
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        view?.viewport = Viewport(0, 0, w.coerceAtLeast(1), h.coerceAtLeast(1))
+        configureCamera(w, h)
     }
 
     private fun loadAvatar() {
@@ -197,15 +225,19 @@ class NativeFilamentView(context: Context) : FrameLayout(context) {
     private fun queueFrame() {
         if (running && !frameQueued) { frameQueued = true; choreographer.postFrameCallback(frameCallback) }
     }
-    private fun renderFrame() {
+    private fun renderFrame(frameTimeNanos: Long) {
         val r = renderer ?: return
         val sc = swapChain ?: return
         val v = view ?: return
-        if (r.beginFrame(sc)) { r.render(v); r.endFrame() }
+        if (r.beginFrame(sc, frameTimeNanos)) {
+            r.render(v)
+            r.endFrame()
+        }
     }
     fun destroy() {
         pause()
         val e = engine ?: return
+        uiHelper.detach()
         entities.forEach { entity -> scene?.remove(entity); EntityManager.get().destroy(entity) }
         entities.clear()
         material?.let(e::destroyMaterial)

@@ -8,9 +8,12 @@ on:
 permissions:
   contents: read
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -29,13 +32,45 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.31.6"
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
+      - name: Show source tree
+        run: |
+          echo "== settings =="
+          test -f settings.gradle.kts && sed -n '1,200p' settings.gradle.kts
+          echo "== app build =="
+          sed -n '1,240p' app/build.gradle.kts
+          echo "== NativeFilamentView =="
+          sed -n '1,320p' app/src/main/java/net/visorsl/viewer/NativeFilamentView.kt
+          echo "== CMake =="
+          sed -n '1,200p' app/src/main/cpp/CMakeLists.txt
 
-      - name: Build APKs
-        run: ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
+      - name: Make Gradle wrapper executable
+        run: |
+          chmod +x ./gradlew
+          ls -l ./gradlew
+          ./gradlew --version
+
+      - name: Compile Kotlin (diagnóstico)
+        run: |
+          set -o pipefail
+          ./gradlew :app:compileDebugKotlin --no-daemon --stacktrace --console=plain 2>&1 | tee kotlin-build.log
+
+      - name: Compile C++ / NDK (diagnóstico)
+        run: |
+          set -o pipefail
+          ./gradlew :app:externalNativeBuildDebug --no-daemon --stacktrace --console=plain 2>&1 | tee native-build.log
+
+      - name: Assemble Debug APK
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee assemble-debug.log
+
+      - name: Assemble Release APK
+        run: |
+          set -o pipefail
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee assemble-release.log
 
       - name: Upload APK artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: visor-sl-native-apks
@@ -43,3 +78,15 @@ jobs:
             app/build/outputs/apk/debug/*.apk
             app/build/outputs/apk/release/*.apk
           if-no-files-found: error
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visor-sl-native-build-logs
+          path: |
+            kotlin-build.log
+            native-build.log
+            assemble-debug.log
+            assemble-release.log
+          if-no-files-found: ignore
