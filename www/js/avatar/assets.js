@@ -21,16 +21,32 @@ async function gunzip(buffer) {
 function get(name) {
   const hit = cache.get(name);
   if (hit) return hit;
-  const p = (async () => {
-    const url = name instanceof URL ? name.href : new URL(name, DIR).href;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
-    return gunzip(await res.arrayBuffer());
-  })();
+  const p = load(name);
   // A failed download must not be cached: the next avatar build should retry.
   p.catch(() => cache.delete(name));
   cache.set(name, p);
   return p;
+}
+
+async function load(name) {
+  const url = name instanceof URL ? name.href : new URL(name, DIR).href;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`${url} → HTTP ${res.status}`);
+      return await gunzip(await res.arrayBuffer());
+    } catch (e) {
+      lastErr = e;
+      // A single failed read is not proof the asset is broken: the WebView's
+      // asset server can hiccup while the app is still warming up, and one
+      // retry turns "every resident is a capsule" into a non-event. The retries
+      // live inside this shared promise, so twenty avatars arriving at once
+      // still produce one fetch chain per file, not twenty.
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 300 * attempt));
+    }
+  }
+  throw lastErr;
 }
 
 /** Raw (gunzipped) bytes of an asset that lives next to this module. */

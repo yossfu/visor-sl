@@ -9,12 +9,24 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Older Android versions still have the storage permission, so the app
+         asks for it and can write outside its own folder. From Android 10 it
+         no longer exists; there the app uses its own folders, the system folder
+         picker and MediaStore instead. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
-    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+    <!-- WebGL2 needs OpenGL ES 3.0. -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
 
     <application
         android:label="@string/app_name"
         android:hardwareAccelerated="true"
+        android:largeHeap="true"
         android:usesCleartextTraffic="true"
         android:allowBackup="true"
         android:icon="@drawable/ic_launcher"

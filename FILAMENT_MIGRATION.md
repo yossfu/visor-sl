@@ -179,3 +179,27 @@ El siguiente APK debe probar primero estas tres cosas, sin migrar el renderer to
 Sólo cuando esas tres rutas estén confirmadas conviene portar el backend gráfico a Filament.
 De lo contrario se corre el riesgo de convertir un problema de protocolo/asset decoding en
 un problema de renderer y perder la capacidad de diagnosticarlo.
+
+
+---
+
+## Nota de la ronda 8 (estado actual)
+
+Este documento nace de la duda del usuario sobre pasar a un motor nativo. La
+decisión de la ronda 8 está razonada en `LUMIYA.md` §7 y es coherente con lo que
+dice aquí: **no se sustituye el render sin separar las capas primero**.
+
+- Se mantiene **WebGL2 dentro del WebView**, porque el cuello de botella medido no
+  era el motor sino el número de llamadas de dibujo (3259 → 187 con batches
+  estáticos) y porque todo el protocolo ya está probado contra el simulador falso
+  (70/70), algo que un port nativo perdería.
+- Lo que **sí** se ha hecho en esa dirección: perfiles de calidad con gobernador
+  de fps, batches estáticos por celda, tope de memoria de GPU con recorte LRU,
+  decodificación JPEG2000 en un hilo aparte y diagnóstico en el propio móvil.
+- El camino a un render nativo (Filament o GLES directo) queda abierto y sólo se
+  recorrerá si el diagnóstico del dispositivo demuestra que el WebView no da más
+  de sí; la pieza a sustituir es `renderer.js`/`world.js`, no el protocolo.
+- De los arreglos listados arriba, los tres del avatar se han integrado en el
+  código de la ronda 8: `llm.js` (leer `numSkinJoints` sólo si `hasWeights`, con
+  comprobaciones de longitud), `Accept: image/x-j2c` en `GetTexture` y errores de
+  `AvatarAppearance`/construcción de avatar que ya no se silencian.

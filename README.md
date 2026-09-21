@@ -103,13 +103,132 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
   nuestro paquete». Además se ejecuta solo cada vez que falla una conexión, y todo
   queda en el registro copiable (el modal no se puede copiar).
 
+## 2b. Rendimiento y diagnóstico (ronda 8)
+
+Un visor de Second Life sin esto no es usable en un teléfono: la primera prueba
+en el móvil fue «todo lentísimo» y «no se ve nada», que en un visor significa
+cosas muy distintas. Las dos se atacan por separado.
+
+### Perfiles de render (`perf.js`)
+
+Tres perfiles —`bajo`, `medio`, `alto`— que fijan de una vez la resolución máxima,
+la distancia de dibujo, el presupuesto de objetos, el teselado del terreno, el
+tamaño máximo de textura, el presupuesto de memoria de GPU y cada cuántos
+fotogramas se recalcula el LOD y la visibilidad. Al arrancar se elige uno según lo
+que el dispositivo dice de sí mismo (modelo y SDK por el puente nativo, núcleos,
+RAM) y en ☰ → *Perfil de render* se puede forzar.
+
+Encima va el **gobernador de fps**: la escala de resolución baja sola hasta el
+mínimo del perfil cuando los fotogramas se alargan, y **si aun así el aparato no
+llega** (medido, no supuesto), el visor baja un perfil entero, lo avisa en el
+registro y lo recuerda para el próximo arranque. Nunca se queda tiritando en
+«calidad alta» por haber acertado mal al adivinar el hardware.
+
+### Batches estáticos (`batch.js`)
+
+El coste real de una región no está en los polígonos sino en las llamadas de
+dibujo: cada prim son hasta seis caras, así que 1200 prims son ~3500 llamadas y
+la GPU de un móvil se ahoga. Los prims que no se mueven se funden en **una sola
+malla por celda de 32 m y material** (con las matrices ya cocidas en los
+vértices) y las llamadas caen a un par de centenares. Los prims que se mueven,
+los seleccionados y los que están fuera del presupuesto de objetos conservan sus
+mallas propias: el *picking* sigue funcionando (three.js también hace *raycast*
+contra mallas invisibles, cosa que se verificó) y mover un prim lo saca de la
+celda. La reconstrucción va limitada por tiempo (4 ms por fotograma) y de la
+celda más cercana a la más lejana.
+
+Medido con el arnés de estrés (`test/stress.js`, 1200 prims con texturas reales,
+GPU Intel HD 500 del equipo de pruebas): **3259 → 187** llamadas en `medio` y
+**82** en `bajo`; de **~15 fps a 38 fps de media** (`medio`) y **55 fps** (`bajo`).
+La geometría y los materiales se comparten entre prims iguales: 4800 mallas →
+44 geometrías y 8 materiales, y reconstruir un batch cuesta 0,3-0,8 ms.
+
+### Texturas
+
+- El tamaño de decodificación se limita por perfil (256/512/1024 px): una textura
+  de 1024 es cuatro veces la memoria y el tiempo de subida de una de 512, y en
+  una pantalla de móvil no se distingue.
+- La biblioteca de texturas tiene un **tope de memoria de GPU** (48/96/256 MB) con
+  recorte LRU: la imagen decodificada se conserva y sólo se libera la copia que
+  estaba sin usar en la GPU, así que nada desaparece de la pantalla.
+- La decodificación JPEG2000 corre **en un hilo aparte** (`j2c-worker.js`): son
+  decenas o cientos de milisegundos por textura y en el hilo principal eso es el
+  bucle de render parado. El wasm viaja al worker como bytes (no como URL), así
+  que funciona igual sirviendo los archivos desde el propio APK que desde otro
+  origen, y si el worker no arranca el mismo decodificador sigue en el hilo
+  principal: una textura siempre acaba en pantalla.
+
+### Avatares (arreglo del «sigue siendo una cápsula»)
+
+El lector de mallas `.llm` (`avatar/llm.js`) leía `numSkinJoints` y la lista de
+huesos **siempre**, pero esa sección sólo existe si el mesh trae pesos
+(`hasWeights`). El mesh de los ojos (`avatar_eye.llm.gz`) no los trae: el lector
+se comía los dos primeros bytes de la marca de fin de morphs y a partir de ahí
+recorría el fichero a ciegas (reproducido: `145` vértices y **31045** huesos
+inexistentes). Ahora esa sección sólo se lee si `hasWeights`, con comprobaciones
+de longitud, así que un fichero truncado da un error claro en vez de datos
+absurdos.
+
+Y en la misma línea de «lo que falla tiene que decirlo»: `AvatarAppearance` ya no
+se traga sus errores (es donde se aplican la forma y las texturas baked), el
+error de construcción de un avatar se registra con su excepción y, si los cuerpos
+no se pueden leer, el aviso sale en el registro del visor en vez de dejar
+cápsulas sin explicación (con un reintento por avatar por si fue un fallo
+transitorio del servidor de assets). `GetTexture` pide además su tipo explícito
+(`Accept: image/x-j2c`), que es lo que hace el visor oficial.
+
+### El mundo mientras llega el terreno
+
+Hasta que el sim manda el primer parche de terreno, la región es un suelo plano a
+0 m y **el agua no se dibuja**: el plano de agua está a la altura del mar (20 m en
+la mayoría de regiones) y, sin terreno real, tapaba toda la vista como un mar
+oscuro y semitransparente con los prims hundidos debajo — que en pantalla se ve
+igual que «cuadros negros y espacios transparentes» y que «no hay terreno». En
+cuanto llega el primer `LayerData` el agua aparece en su sitio, y el diagnóstico
+dice en qué estado está el terreno (`PLACEHOLDER PLANO` o `malla real`).
+
+### Diagnóstico en el propio móvil (☰ → *Diagnóstico completo*)
+
+GPU real y si el WebView ha caído a software, las funciones del navegador que
+existen (WebGL2, DecompressionStream, Worker, WebAssembly…), los 8 archivos del
+avatar (descarga **y** descompresión), el decodificador JPEG2000 con una
+decodificación de prueba cuyos píxeles se comparan con los colores esperados, y
+los contadores vivos de la sesión: texturas pedidas/decodificadas/fallidas, estado
+del terreno, prims dibujados, cuerpos de avatar construidos y animaciones en
+reproducción. Se copia con un toque o se guarda en *Descargas*.
+
+Existe porque «no se ven texturas» tiene media docena de causas muy distintas —no
+llegaron, llegaron y no se pudieron decodificar, la GPU es software, los cuerpos
+de avatar no se pudieron leer— y en la pantalla todas se ven iguales. Por el mismo
+motivo, al arrancar se escribe en el registro una línea `GPU:`, otra `Calidad:`
+(con el perfil elegido y sus límites) y, si los cuerpos de avatar no se pueden
+cargar, un aviso explícito en vez de dejar cápsulas sin explicación.
+
+Y para separar «fallo del móvil» de «fallo de la conexión» sin sacar la app del
+teléfono, ☰ → **Prueba de vista con simulador local** conecta el visor a un
+simulador en memoria que ya viene dentro del APK (el mismo que usa
+`?test=grid`): si el mundo se ve bien ahí, el motor y el dispositivo están bien y
+el problema está en el grid; si también se ve mal, el problema es el dispositivo.
+Es reversible (el mismo botón vuelve a la pantalla de inicio y devuelve el puente
+nativo), y avisa en el registro de que lo que se ve es sintético.
+
+### Almacenamiento (☰ → *Permiso y carpeta de almacenamiento*)
+
+Dónde vive la caché, cuánto ocupa, cuánto queda libre y los dos gestos que
+Android ofrece: el permiso clásico (sólo en Android ≤9) y el selector de carpeta
+del sistema. En Android 10+ la carpeta propia de la app no necesita permiso
+alguno, y el panel lo explica en vez de dejar al usuario pensando que falta algo.
+
 ## 3. Arquitectura (código)
 
 | fichero | papel |
 | --- | --- |
 | `src/web/js/app.js` | `App`: viewer + world + UI + bucle; entrada (clic, teclado), connect/disconnect |
-| `src/web/js/renderer.js` | `Viewer` (three.js, sol, cielo, agua, sombras), `CameraController`, `getCamAxes()` |
-| `src/web/js/world.js` | `World`: terreno, prims, materiales por cara, LOD, picking, avatares, `applyTexture` |
+| `src/web/js/renderer.js` | `Viewer` (three.js, sol, cielo, agua, sombras), `CameraController`, `getCamAxes()`, escala de resolución y perfiles |
+| `src/web/js/world.js` | `World`: terreno, prims, materiales por cara, LOD, picking, avatares, `applyTexture`, cachés de geometría/material y batches |
+| `src/web/js/perf.js` | perfiles de render (`bajo`/`medio`/`alto`), detección de dispositivo y gobernador de fps |
+| `src/web/js/batch.js` | `PrimBatcher`: funde los prims quietos en una malla por celda de 32 m y material |
+| `src/web/js/diag.js` | diagnóstico en el dispositivo (GPU, funciones, archivos, decodificador, contadores vivos) |
 | `src/web/js/prims.js` | motor de geometría de prims (port de Lumiya) |
 | `src/web/js/terrain.js` | terreno (BitBuffer, DCT, `Terrain`, malla) |
 | `src/web/js/texture-entry.js` | parseo de TextureEntry + matrices UV |
@@ -122,9 +241,10 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
 | `src/web/js/object-update.js` | datos "terse" (16/32/48/60/76 bytes), ExtraParams, formas |
 | `src/web/js/llsd.js` | LLSD XML / Notation / Binary + XML-RPC (login) |
 | `src/web/js/md5.js` | MD5 (hash de contraseña `$1$…`) |
-| `src/web/js/j2c.js` | decodificador JPEG2000 (OpenJPEG wasm vendorizado, carga perezosa) |
-| `src/web/js/test/prims-selftest.js` | pruebas visuales de geometría de prims (`?test=prims`) |
+| `src/web/js/j2c.js` | decodificador JPEG2000 (OpenJPEG wasm vendorizado, carga perezosa, tope de tamaño) |
+| `src/web/js/j2c-worker.js` | el mismo decodificador en un hilo aparte (recibe el wasm como bytes) |
 | `src/web/js/test/fake-grid.js` | simulador falso en memoria: prueba todo el camino del grid sin cuenta (`?test=grid`) |
+| `src/web/js/test/stress.js` | arnés de estrés: llena la región de prims con texturas reales y mide fps/llamadas |
 | `src/web/js/avatar/assets.js` | carga los assets que van dentro de la app (`.llm.gz`, `.xml.gz`, `anims.gz`) |
 | `src/web/js/avatar/llm.js` | lector del formato `.llm` (mallas + morph targets) |
 | `src/web/js/avatar/skeleton.js` | esqueleto de `avatar_skeleton.xml` (133 huesos, posiciones de reposo acumuladas) |
@@ -139,14 +259,14 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
 | `src/web/vendor/three.module.min.js` | three.js r169 (vendorizado) |
 | `src/web/vendor/openjpeg/` | OpenJPEG wasm (decodificador J2C/JPEG2000 real; `openjpegwasm_decode.js` + `.wasm`) |
 | `src/tools/pack.mjs` | empaqueta `visor-sl-app.zip` a partir de estas fuentes |
-| `src/tools/proto-selftest.mjs` | 54 pruebas del protocolo (ver abajo) |
+| `src/tools/proto-selftest.mjs` | 70 pruebas del protocolo (ver abajo) |
 | `src/android/**` | proyecto Gradle + WebView + `NativeBridge` (UDP/HTTP) |
 | `src/ci/build-apk.yml` | workflow de GitHub Actions |
 
 Las rutas de esa tabla son las de la **carpeta de trabajo** (el `src/web/` del
 editor). En el zip y en el repositorio el visor vive en
 `app/src/main/assets/www/` (y una copia igual en `www/`), y los documentos
-`README.md`/`SPEC.md`/`TODO.md`/`LUMIYA.md` van en la raíz.
+`README.md`/`SPEC.md`/`TODO.md`/`LUMIYA.md`/`FILAMENT_MIGRATION.md` van en la raíz.
 
 ### Protocolo del puente nativo (JS ↔ `NativeBridge.kt`)
 
@@ -167,10 +287,17 @@ con …» y después «Desconectado.»). No volver a pasar `id` desde el llamado
 
 ## 4. Pruebas
 
-En el editor de Perchance (o en la consola del visor web):
+En el editor de Perchance (`src/tools/proto-selftest.mjs` vive fuera del visor, así
+que se importa antes de llamarla):
 
 ```js
-await window.runVisorSelfTest();
+await import("./src/tools/proto-selftest.mjs");
+await window.runVisorSelfTest();   // → 70/70 correctas
+
+// Estrés de render (llena la región de prims con texturas y mide fps y llamadas
+// de dibujo): lo que se usa antes de tocar perf.js/batch.js.
+const stress = await import("./src/web/js/test/stress.js");
+await stress.runStress(window.visor, { count: 1200, seconds: 5 });
 ```
 
 Comprueba **70 cosas** sin necesidad de cuenta: que la plantilla tiene 483
@@ -230,6 +357,13 @@ service workers (p. ej. el navegador interno de la app de Google en iOS).
   texturas de cada prenda ya están en el código).
 - Sin sculpt maps, mallas, grupos, búsqueda, voz, RLV, minimapa ni dinero (ver
   `LUMIYA.md`).
+- **Texturas progresivas**: cada textura se pide entera y se decodifica de una
+  vez. Lumiya pedía primero la cabecera y luego los niveles de detalle por
+  `Range`, de modo que la textura se veía borrosa y se iba afinando; es el
+  siguiente ahorro de tráfico (y de tiempo hasta que algo se ve bien).
+- **Motor de render**: WebGL2 dentro del WebView. Por qué no un motor nativo
+  (Filament/GLES) está razonado en `LUMIYA.md` §7, junto con lo que haría falta
+  para dar ese paso sin romper lo que ya funciona.
 - La app Android sirve el visor desde `assets/www` con un interceptor propio
   (`MainActivity.serveAsset`), con MIME correctos (`text/javascript` para los
   módulos ES), `Cache-Control: no-store` y página de error legible si algo

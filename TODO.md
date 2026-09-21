@@ -3,6 +3,71 @@
 Ordenado por impacto. Lo primero es lo que hay que hacer en cuanto se pruebe con
 una cuenta real en el grid.
 
+## Ronda 8 — lo hecho en esta revisión (tras la prueba en el móvil)
+
+El usuario probó el APK y reportó: «todo se ve mal, no carga texturas ni nada de
+terreno, el avatar sigue siendo una cápsula, va lentísimo, cuadros negros y
+espacios transparentes, la app no pidió permiso de almacenamiento», y preguntó si
+conviene pasar a un motor nativo (Filament). Hecho en esta ronda:
+
+- [x] **Perfiles de render** (`perf.js`): `bajo`/`medio`/`alto` con resolución
+      máxima, alcance, presupuesto de objetos, teselado, tamaño máximo de textura
+      y memoria de GPU. Se eligen por dispositivo y se pueden forzar en el menú.
+- [x] **Gobernador de fps** con **bajada automática de perfil** si el aparato no
+      llega ni al mínimo de resolución (con 30 s de gracia tras conectar, para no
+      juzgar la carga inicial), avisando en el registro y recordándolo.
+- [x] **Batches estáticos** (`batch.js`): una malla por celda de 32 m y material;
+      medido con 1200 prims: 3259 → 187 llamadas (medio) y 82 (bajo); ~15 → 38-55 fps.
+- [x] **Geometría y materiales compartidos** (4800 mallas → 44 geometrías y 8
+      materiales) y `pickList()` sin coste cuadrático.
+- [x] **Texturas**: tope de decodificación por perfil (256/512/1024 px), presupuesto
+      de memoria de GPU con recorte LRU (48/96/256 MB) y decodificación **en un
+      worker** para no parar el bucle de render.
+- [x] **Diagnóstico completo** en el propio móvil: GPU y software, funciones del
+      navegador, los 8 archivos de avatar (descarga **y** gzip), decodificación de
+      prueba comparada píxel a píxel, y contadores vivos de texturas, terreno,
+      prims, cuerpos de avatar y animaciones.
+- [x] **Prueba de vista con simulador local** (☰): conecta el visor al simulador
+      en memoria que ya va dentro del APK para separar «fallo del móvil» de
+      «fallo de la conexión», y se deshace con el mismo botón.
+- [x] **Aviso explícito si los cuerpos de avatar no cargan** (antes: cápsulas y
+      ninguna explicación) y reintento de los assets (3 intentos por archivo,
+      compartidos entre todos los avatares que lleguen a la vez).
+- [x] **Bug real del lector de mallas `.llm`**: `numSkinJoints` se leía siempre,
+      pero sólo existe si el mesh trae pesos; el mesh de los ojos lo incumple, así
+      que el lector se desviaba y devolvía 31045 huesos inexistentes. Ahora se lee
+      sólo cuando `hasWeights`, con comprobaciones de longitud. `AvatarAppearance`
+      ya no silencia sus errores y el error de construcción del avatar se registra
+      con la excepción.
+- [x] **`Accept: image/x-j2c`** al pedir texturas (lo que pide el visor oficial).
+- [x] **Diagnóstico de compilación en el workflow**: el APK se compila dos veces
+      (segundo intento con el estado limpio) y, si falla, el registro del error
+      queda en el resumen de la ejecución **y** en `build-error.log` del
+      repositorio, legible sin sesión.
+- [x] **Panel de almacenamiento**: rutas, tamaño de la caché, espacio libre,
+      permiso clásico donde existe (Android ≤9) y selector de carpeta del sistema.
+- [x] **Cielo negro arreglado**: el plano lejano de la cámara cortaba la cúpula del
+      cielo y aparecía un polígono negro grande.
+- [x] Versión **1.3.0 (build 4)** — el registro debe decirlo.
+
+Pendiente de comprobar en el móvil (informe 5):
+
+- [ ] Que el registro empiece por `app 1.3.0 (build 4)` (si pone 1.2.0, el APK no
+      es de esta ronda).
+- [ ] La línea `Calidad:` (qué perfil eligió solo) y si más tarde aparece
+      «Rendimiento insuficiente…» (bajada automática).
+- [ ] La línea `GPU:` que **no** diga «SOFTWARE (sin GPU)».
+- [ ] ☰ → **Diagnóstico completo**: los 8 archivos de avatar en `OK`, la
+      decodificación de prueba con «colores correctos», y las filas de texturas,
+      terreno, prims y **cuerpos de avatar** (`N de M con cuerpo real`).
+- [ ] Que el mundo salga con texturas y terreno y sin cuadros negros.
+- [ ] ☰ → **Permiso y carpeta de almacenamiento**: qué dice de la carpeta y del
+      permiso en su versión de Android, y probar el selector de carpeta.
+- [ ] Que los avatares se vean **con cuerpo** (no cápsula) a los pocos segundos.
+- [ ] ☰ → **Prueba de vista con simulador local**: si el mundo se ve bien aquí (es
+      sintético, a propósito) el móvil y el motor están bien y el problema está en
+      el grid; si también se ve mal, mandar el diagnóstico completo.
+
 ## Ronda 6 — lo hecho en esta revisión (informe 4)
 
 El informe 4 (cuenta ExeQiel, en el grid) traía: `LayerData`, `ObjectUpdate`,
@@ -45,9 +110,9 @@ viendo **estructuras cuadriculadas blancas**. Diagnosticado y arreglado:
 - [x] 70/70 pruebas del protocolo (incluye las de animación y las de KillObject
       truncado).
 
-Pendiente de comprobar en el grid real (5ª prueba):
+Pendiente de comprobar en el grid real (5ª prueba, ver la lista de la ronda 8):
 
-- [ ] **5ª prueba real** con el APK 1.2.0: el mundo debe salir **con texturas y
+- [ ] **5ª prueba real** con el APK 1.3.0: el mundo debe salir **con texturas y
       formas distintas** (no la rejilla blanca), con avatares reales que se
       mueven, y en el registro deben verse las líneas nuevas de `TEXTURAS:`
       (prims/texturas/comprimidos), `animaciones:` (mensajes, avatares

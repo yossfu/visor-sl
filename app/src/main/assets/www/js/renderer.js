@@ -31,22 +31,38 @@ export function gpuInfo(renderer) {
 }
 
 export class Viewer {
-  constructor(canvas) {
+  constructor(canvas, opts = {}) {
     this.canvas = canvas;
+    // preserveDrawingBuffer costs a full-frame copy on every present. It is only
+    // needed so a screenshot (the editor's own preview, or the diagnostics
+    // button) can read the canvas back — never for a normal frame on a phone.
+    const keepBuffer = opts.preserveDrawingBuffer === true;
     this.renderer = new THREE.WebGLRenderer({
-      canvas, antialias: true, alpha: false, preserveDrawingBuffer: true,
+      canvas,
+      antialias: opts.antialias !== false,
+      alpha: false,
+      preserveDrawingBuffer: keepBuffer,
       powerPreference: "high-performance",
     });
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+    this.renderScale = 1;
+    this.profile = opts.profile || null;
+    this.maxPixelRatio = (this.profile && this.profile.pixelRatioMax) || Math.min(devicePixelRatio || 1, 2);
+    this.renderer.setPixelRatio(this.maxPixelRatio);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.shadowMap.enabled = true;
+    const shadowsOn = !!(this.profile && this.profile.shadows);
+    this.renderer.shadowMap.enabled = shadowsOn;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.gpu = gpuInfo(this.renderer);
 
+    const p = this.profile || {};
+    const fogFar = p.fogFar || 420;
+    const drawDistance = p.drawDistance || 200;
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.Fog(0xbfd8ee, 120, 420);
+    this.scene.fog = new THREE.Fog(0xbfd8ee, Math.min(120, drawDistance * 0.6), fogFar);
 
-    this.camera = new THREE.PerspectiveCamera(60, 1, 0.05, 6000);
+    // The far plane must clear the sky dome (radius 3000 in sky.js), or the sky
+    // is sliced off and the world shows a black polygon above the horizon.
+    this.camera = new THREE.PerspectiveCamera(60, 1, 0.08, Math.max(6000, fogFar * 3));
     this.camera.position.set(30, 24, -44);
 
     // SL space (Z up, right handed) lives under this root
@@ -73,8 +89,10 @@ export class Viewer {
 
   setupLights() {
     this.sun = new THREE.DirectionalLight(0xfff3e0, 2.1);
-    this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(2048, 2048);
+    const shadowsOn = !!(this.profile && this.profile.shadows);
+    this.sun.castShadow = shadowsOn;
+    const mapSize = (this.profile && this.profile.shadowMap) || 1024;
+    this.sun.shadow.mapSize.set(mapSize, mapSize);
     const d = 90;
     this.sun.shadow.camera.left = -d; this.sun.shadow.camera.right = d;
     this.sun.shadow.camera.top = d; this.sun.shadow.camera.bottom = -d;
@@ -98,7 +116,8 @@ export class Viewer {
     const y = Math.cos(elevation) * Math.sin(azimuth) * r;
     const z = Math.sin(elevation) * r;
     // SL -> three
-    this.sun.position.set(x, z, -y);
+    this.sunOrientation = new THREE.Vector3(x, z, -y);
+    this.sun.position.copy(this.sunOrientation);
     this.sun.target.position.set(0, 0, 0);
     this.sky.update(elevation, azimuth);
     this.sun.intensity = Math.max(0.05, Math.sin(elevation)) * 2.4;
@@ -133,16 +152,53 @@ export class Viewer {
     this.camera.updateProjectionMatrix();
   }
 
+  /**
+   * Effective device-pixel multiplier. The governor moves it between
+   * `profile.renderScaleMin` and the profile ceiling; on a phone that is the
+   * single biggest lever on frame rate (halving it quarters the pixels drawn).
+   */
+  setRenderScale(scale) {
+    const next = Math.max(0.4, Math.min(this.maxPixelRatio, scale));
+    if (Math.abs(next - this.renderScale) < 0.02) return false;
+    this.renderScale = next;
+    this.renderer.setPixelRatio(next);
+    this.updateSize();
+    return true;
+  }
+
+  /** Applies a profile produced by perf.js at runtime (no reload needed). */
+  applyProfile(profile) {
+    this.profile = profile;
+    this.maxPixelRatio = profile.pixelRatioMax;
+    this.renderer.shadowMap.enabled = !!profile.shadows;
+    if (this.sun) {
+      this.sun.castShadow = !!profile.shadows;
+      const m = profile.shadowMap || 1024;
+      if (this.sun.shadow.mapSize.x !== m) {
+        this.sun.shadow.mapSize.set(m, m);
+        if (this.sun.shadow.map) { this.sun.shadow.map.dispose(); this.sun.shadow.map = null; }
+      }
+    }
+    if (this.scene.fog) {
+      this.scene.fog.near = Math.min(120, profile.drawDistance * 0.6);
+      this.scene.fog.far = profile.fogFar;
+    }
+    if (this.water) this.water.mesh.visible = profile.water !== false;
+    this.setRenderScale(Math.min(this.renderScale, this.maxPixelRatio));
+  }
+
   frame(dt) {
     this.stats.time += dt;
     const t = this.stats.time;
     this.controls.update(dt);
-    this.water.update(t);
+    if (this.water && this.water.mesh.visible !== false) this.water.update(t);
     this.sky.follow(this.camera);
-    // keep shadow volume around the camera
-    const c = this.camera.position;
-    this.sun.target.position.set(c.x, 0, c.z);
-    this.sun.position.set(c.x + this.sun.position.x * 0.4, this.sun.position.y, c.z + this.sun.position.z * 0.4);
+    if (this.renderer.shadowMap.enabled) {
+      // keep shadow volume around the camera
+      const c = this.camera.position;
+      this.sun.target.position.set(c.x, 0, c.z);
+      this.sun.position.set(c.x + this.sunOrientation.x * 0.4, this.sunOrientation.y, c.z + this.sunOrientation.z * 0.4);
+    }
     this.renderer.render(this.scene, this.camera);
     this.stats.frames++;
     if (t - this.stats.lastFpsTime > 0.5) {
@@ -151,6 +207,9 @@ export class Viewer {
       this.stats.frames = 0;
       this.stats.drawCalls = this.renderer.info.render.calls;
       this.stats.tris = this.renderer.info.render.triangles;
+      this.stats.geometries = this.renderer.info.memory.geometries;
+      this.stats.textures = this.renderer.info.memory.textures;
+      this.stats.programs = this.renderer.info.programs ? this.renderer.info.programs.length : 0;
     }
   }
 }
