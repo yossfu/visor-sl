@@ -12,6 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-
-rootProject.name = "VisorSL"
+rootProject.name = "VisorSL-Native"
 include(":app")

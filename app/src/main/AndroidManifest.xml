@@ -1,59 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- Keeps the session alive (and the UDP socket open) when the app is in the
-         background. WorkManager is deliberately NOT used. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Older Android versions still have the storage permission, so the app
-         asks for it and can write outside its own folder. From Android 10 it
-         no longer exists; there the app uses its own folders, the system folder
-         picker and MediaStore instead. -->
-    <uses-permission
-        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
-    <uses-permission
-        android:name="android.permission.READ_EXTERNAL_STORAGE"
-        android:maxSdkVersion="28" />
-
-    <!-- WebGL2 needs OpenGL ES 3.0. -->
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
-
     <application
         android:label="@string/app_name"
-        android:hardwareAccelerated="true"
-        android:largeHeap="true"
-        android:usesCleartextTraffic="true"
         android:allowBackup="true"
+        android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="true"
         android:icon="@drawable/ic_launcher"
         android:theme="@style/VisorTheme">
-
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
-            android:launchMode="singleTask"
-            android:theme="@style/VisorTheme">
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <!-- "specialUse" (not dataSync, which Android 14 caps and rejects without
-             a declared type): this service exists to keep the viewer's own socket
-             session running while the app is backgrounded. -->
-        <service
-            android:name=".SessionService"
-            android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keeps the Second Life viewer session (WebGL world + UDP circuit) alive while the app is in the background." />
-        </service>
     </application>
 </manifest>
