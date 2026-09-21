@@ -56,14 +56,15 @@ function installSink() {
       deliverDatagram(msg);
       return;
     }
-    if (msg.kind === "udpSend") {
-      if (msg.ok === false) channelError(msg.id, "envío UDP: " + (msg.error || "error nativo"));
-      return;
-    }
     if (msg.kind === "udpError") {
-      channelError(msg.id, msg.error || "error de recepción UDP");
-      return;
+      channelError(msg.chan || msg.id, msg.error || "error de recepción UDP");
+    } else if (msg.kind === "udpSend" && msg.ok === false) {
+      channelError(msg.chan || msg.id, "envío UDP: " + (msg.error || "error nativo"));
     }
+    // Everything else (udpOpen/udpSend/udpProbe/http) resolves the call that is
+    // waiting for it. A push that never resolves its caller leaves a promise
+    // pending until its timeout — that alone once produced a wall of bogus
+    // "el puente nativo no respondió a udpSend en 25s" lines on a healthy link.
     const resolve = pending.get(msg.id);
     if (!resolve) return;
     pending.delete(msg.id);

@@ -122,6 +122,7 @@ export class Circuit {
 
   buildPacket(payload, reliable) {
     const seq = this.nextSequence();
+    this.lastSeq = seq;
     const acks = this.takeAcks();
     const packet = buildPacket({ sequence: seq, reliable, payload, acks });
     if (reliable) this.unacked.set(seq, { payload, sent: Date.now(), retries: 0 });
@@ -143,6 +144,16 @@ export class Circuit {
     if (packet.reliable) this.pendingAcks.add(packet.sequence);
     for (const a of packet.acks) this.unacked.delete(a);
     return packet;
+  }
+
+  /**
+   * A standalone PacketAck message (0xFFFFFFFB) also acknowledges our reliable
+   * packets — the simulator mostly uses those instead of the appended-ack
+   * trailer, so ignoring them makes the resend loop retry forever.
+   */
+  ack(sequence) {
+    const seq = sequence >>> 0;
+    if (this.unacked.delete(seq)) this.stats.acksIn++;
   }
 
   pendingResends(now = Date.now()) {

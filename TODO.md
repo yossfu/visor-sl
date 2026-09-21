@@ -5,37 +5,42 @@ una cuenta real en el grid.
 
 ## 0. Primera conexión real (comprobaciones)
 
-**Última prueba real (cuenta ExeQiel, APK `app-release.apk`):** el login XML-RPC
-funcionó (sesión iniciada, circuito 712942918) y el fallo estaba justo después:
-el visor se quedaba en «Abriendo circuito UDP con 54.190.153.220:13005…» y
-terminaba en «Desconectado.».
+**Estado tras la 2ª prueba real (cuenta ExeQiel, circuito 712948182, Xiaomi API 36):**
+el login funciona y el **circuito UDP vive** (el simulador manda `PacketAck` y
+`StartPingCheck`, y contesta a nuestros pings). No llegaba el mundo, y ya se sabe
+por qué.
 
-Causas ya corregidas en esta revisión:
+Corregido en esta revisión:
 
-- **`udpOpen` colgado (la causa del fallo).** `nativeCall()` mandaba al puente
-  nativo un `id` que el llamador usaba a la vez como clave del socket, de modo que
-  la respuesta de `udpOpen` volvía con otro identificador y **nunca** se
-  emparejaba: 15-18 s de espera y desconexión. Ahora `id` (identifica la llamada)
-  y `chan` (identifica el socket UDP) son campos distintos en los dos lados.
-- **Capacidades ilegibles** («Capacidades: 6 (0, 1, 2, 3, 4, 5…)»): la respuesta
-  del seed capability se parseaba como texto. Ahora se le pasan los bytes a
-  `LLSD.parse` (detecta XML, notación o LLSD binario, ignora el BOM) y, si aun así
-  no sale un mapa, el registro muestra el estado HTTP y el principio del cuerpo.
-- **Los errores no quedaban en el registro**: el motivo sólo se veía en el modal
-  (no copiable). Ahora todo error va al registro con ⚠ y el botón ⧉ copia el
-  texto con saltos de línea reales.
+- **`CompleteAgentMovement` no se enviaba nunca.** Lo mandábamos dentro del
+  manejador del `RegionHandshake`, pero el visor oficial (`llstartup.cpp`) lo envía
+  en cuanto llega el **acuse del `UseCircuitCode`** (`STATE_AGENT_SEND`), sin
+  esperar al handshake; y el simulador no mete al avatar en la región (ni manda
+  `RegionHandshake`, `LayerData` ni `ObjectUpdate`) hasta recibirlo. Se detecta el
+  acuse por secuencia (`Circuit.lastSeq`), con temporizador de respaldo y 3
+  reintentos si no llega `AgentMovementComplete`.
+- **Los `PacketAck` sueltos se ignoraban.** El simulador acusa casi siempre con
+  un mensaje `PacketAck` (16 B), no con el trailer de acks adjuntos; sin leerlos,
+  `unacked` no se vaciaba nunca y cada paquete fiable se reenviaba una y otra vez.
+  Ahora `handle("PacketAck")` limpia la cola (`Circuit.ack`).
+- **Capacidades: HTTP 405 "Method Not Allowed".** El seed capability es un
+  **POST** con un array LLSD de nombres (un GET recibe 405, que es el valor por
+  defecto del nodo en `LLHTTPNode`). Ahora se piden 55 capacidades y se registra
+  cuántas llegan. Esto devuelve `EventQueueGet` (teletransporte/IM en vivo),
+  `GetTexture` (texturas reales) y `GetDisplayNames`.
+- **Falsos «el puente nativo no respondió a udpSend en 25s».** Era un fallo
+  nuestro en `transport.js`: la respuesta `udpSend` se emparejaba pero no se
+  resolvía la promesa, así que cada envío dejaba un aviso falso a los 25 s (y la
+  clave del canal en los errores era la de la llamada, no la del socket).
+- **`SimulatorViewerTimeMessage`** ahora ajusta el sol de la escena con la hora
+  real de la región.
 
 Pendiente de comprobar en el grid real:
 
-- [ ] **Login XML-RPC**: confirmar que `login.agni.lindenlife…` (ver `GRIDS` en
-      `sl-session.js`) acepta el struct enviado (canal/versión/mac/options). El
-      motivo exacto del servidor ya aparece en el registro del HUD.
-- [ ] **MFA**: si la cuenta tiene verificación en dos pasos, comprobar el flujo
-      `mfa_challenge` → código de 6 dígitos → `mfa_hash` recordado.
-- [ ] **`sim_ip`/`sim_port`**: comprobar que `openCircuit` abre el socket y que
-      llega el RegionHandshake. Si el socket abre pero no contesta nadie, el
-      diagnóstico automático dirá si el problema es la red (STUN tampoco
-      responde → probar datos móviles u otra wifi) o nuestro paquete.
+- [ ] Que llegue el `RegionHandshake` y que el mundo empiece a cargar
+      (LayerData/ObjectUpdate) tras `CompleteAgentMovement`.
+- [ ] **MFA** (código de 6 dígitos) si la cuenta lo pide.
+- [ ] Texturas reales (`GetTexture` + JPEG2000, ver §1).
 - [ ] **Posiciones "terse"**: si los objetos salen desplazados, ajustar
       `POS_XY`/`POS_Z`/`VEL_XY`/`VEL_Z` en `object-update.js` (los valores se
       eligieron desde el código decompilado y son la única incógnita grande).

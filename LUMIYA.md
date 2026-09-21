@@ -34,6 +34,15 @@ Todo esto se comprobó leyendo ficheros concretos y se usa en
   comillas simples (`'texto'`), los mapas como `{'clave':valor}`, las fechas
   como `d"..."`, las URI como `l"..."`, las UUID como `u<36>` y los enteros
   como `i<n>`. El parser acepta además `s<len>:texto` y `b64"..."`.
+- **El seed capability se pide con POST** y un cuerpo que es un **array LLSD de
+  nombres** (`<llsd><array><string>EventQueueGet</string>…`), con
+  `Accept: application/llsd+xml, application/llsd+binary`; la respuesta es el mapa
+  de nombres a URLs. Un GET devuelve `405 Method Not Allowed` (es el valor por
+  defecto de `LLHTTPNode::get()` en Linden), que es justo lo que vimos en la
+  segunda prueba real. Referencia cruzada: `CapabilityManager.requestCapabilities`
+  del cliente Kotlin de Linkpoint.
+- Las respuestas pueden llegar en XML o en **LLSD binario** (magia `LLSD\x01`), así
+  que `loadCapabilities` le pasa los bytes a `LLSD.parse`, que detecta el formato.
 
 ### Divergencias conscientes
 - **ImprovedInstantMessage**: Lumiya empaqueta sólo hasta `BinaryBucket` (sin
@@ -107,7 +116,32 @@ y `connect`), `indra/newview/llxmlrpclistener.cpp` (`Poller`),
 5. Inventario y transferencias (Xfer) para wearables y objetos.
 6. UI de conversaciones (IM por residente, historial), grupos, minimapa.
 
-## 5. Puente nativo Android: dos identificadores, no uno
+## 5. Arranque del agente y acuses (lo que faltaba en la 2ª prueba real)
+
+Secuencia real, tal como la hace el visor oficial (`indra/newview/llstartup.cpp`,
+comprobado en el código de Linden) y como la implementa ahora `sl-session.js`:
+
+1. `UseCircuitCode` (fiable) → el simulador contesta con **`PacketAck`**.
+2. **`CompleteAgentMovement`** en cuanto llega ese acuse (`STATE_AGENT_SEND`), sin
+   esperar al `RegionHandshake`; junto con `AgentThrottle` y
+   `AgentDataUpdateRequest`.
+3. El simulador manda `RegionHandshake` (se responde con `RegionHandshakeReply`),
+   `AgentMovementComplete` y, ya sí, el mundo: `LayerData`, `ObjectUpdate`,
+   `ObjectUpdateCached/Compressed`, `ImprovedTerseObjectUpdate`, `KillObject`,
+   `SimulatorViewerTimeMessage`…
+
+Dos detalles que nos costaron una prueba entera contra el grid:
+
+- **Esperar el `RegionHandshake` antes de `CompleteAgentMovement` bloquea todo**:
+  el simulador acusa y hace ping (el circuito vive) pero no manda nada de la
+  región, porque el avatar no ha "entrado". Ese era exactamente el registro de la
+  segunda prueba real.
+- **Los acuses llegan como mensaje `PacketAck`** (número 0xFFFFFFFB, con un bloque
+  `Packets` variable de U32), no sólo como trailer de acks adjuntos. `udp.js`
+  entiende ahora las dos formas: sin la de mensaje, la cola de fiables no se vacía
+  y el bucle de reenvíos reintenta eternamente paquetes ya confirmados.
+
+## 6. Puente nativo Android: dos identificadores, no uno
 
 Lumiya hablaba UDP directamente porque era una app Java. Aquí el motor vive en un
 WebView y el socket lo abre `NativeBridge.kt`, así que cada datagrama cruza la

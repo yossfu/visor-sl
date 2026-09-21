@@ -57,9 +57,12 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
 - **TextureEntry real**: parseo del formato de red (bitfield por cara con
   continuación de 7 bits, RGBA, repeat/offset/rotation, glow, material, media).
 - **Protocolo SL completo** (`message_template.msg` de 483 mensajes):
-  login XML-RPC, capacidades (seed), EventQueueGet, circuito UDP con secuencia,
-  ACKs adjuntos, zerocoding y reenvíos, RegionHandshake/Reply,
-  CompleteAgentMovement, AgentThrottle, AgentUpdate (10 Hz), chat
+  login XML-RPC, seed capability por **POST con array LLSD de nombres**,
+  EventQueueGet, circuito UDP con secuencia, ACKs (mensaje `PacketAck` y trailer
+  adjunto), zerocoding y reenvíos, arranque de agente
+  (`UseCircuitCode` → acuse → `CompleteAgentMovement` → `AgentMovementComplete`),
+  RegionHandshake/Reply, AgentThrottle, AgentUpdate (10 Hz),
+  `SimulatorViewerTimeMessage` (sol/hora de la región), chat
   (ChatFromViewer/ChatFromSimulator), IM, ObjectUpdate,
   ObjectUpdateCached/Compressed, ImprovedTerseObjectUpdate, KillObject,
   CoarseLocationUpdate, UUIDNameRequest/Reply.
@@ -104,7 +107,7 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
 | `src/web/data/message_template.msg` | plantilla de mensajes oficial de SL (241 KB) |
 | `src/web/vendor/three.module.min.js` | three.js r169 (vendorizado) |
 | `src/tools/pack.mjs` | empaqueta `visor-sl-app.zip` a partir de estas fuentes |
-| `src/tools/proto-selftest.mjs` | 42 pruebas del protocolo (ver abajo) |
+| `src/tools/proto-selftest.mjs` | 45 pruebas del protocolo (ver abajo) |
 | `src/android/**` | proyecto Gradle + WebView + `NativeBridge` (UDP/HTTP) |
 | `src/ci/build-apk.yml` | workflow de GitHub Actions |
 
@@ -138,7 +141,7 @@ En el editor de Perchance (o en la consola del visor web):
 await window.runVisorSelfTest();
 ```
 
-Comprueba **42 cosas** sin necesidad de cuenta: que la plantilla tiene 483
+Comprueba **45 cosas** sin necesidad de cuenta: que la plantilla tiene 483
 mensajes, que los números de mensaje son **byte a byte** los mismos que los de
 Lumiya (descubiertos en el código decompilado), que `ChatFromViewer` coincide con
 la referencia, que `AgentUpdate` mide 115 bytes, ida y vuelta de paquetes con

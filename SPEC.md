@@ -70,6 +70,13 @@ android.net.ConnectivityManager$TooManyRequestsException
   respuesta) y, en UDP, `chan` (identifica el socket). Son campos distintos
   porque mezclarlos dejaba todas las llamadas UDP esperando al timeout; ver
   `README.md` § «Protocolo del puente nativo».
+- **Secuencia de arranque verificada contra el visor oficial** (no adivinada):
+  `UseCircuitCode` → acuse → `CompleteAgentMovement` (+`AgentThrottle`) →
+  `AgentMovementComplete`, y el `RegionHandshake` se responde cuando llega, sin
+  bloquear nada. Igual que en `indra/newview/llstartup.cpp`: esperar el handshake
+  antes de `CompleteAgentMovement` deja al visor con el circuito vivo pero sin
+  mundo. El seed capability se pide por POST con un array LLSD de nombres, como
+  en `CapabilityManager` del cliente Kotlin de Linkpoint. Detalle en `LUMIYA.md`.
 
 ## Requisitos de entrega
 

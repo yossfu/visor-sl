@@ -40,7 +40,30 @@ const LOGIN_OPTIONS = [
   "max-agent-groups", "map-server-url", "advanced-mode",
 ];
 
+// Capabilities requested from the seed capability. The seed endpoint is a POST
+// that takes an LLSD *array* of names and answers with the subset this region
+// provides: https://wiki.secondlife.com/wiki/SeedCapability
+const CAPABILITY_NAMES = [
+  "EventQueueGet", "GetTexture", "GetMesh", "GetMesh2", "GetDisplayNames",
+  "GetAgentProfile", "GetObjectPhysicsData", "GetSurfaceInfo", "GetTerrainImage",
+  "GetScriptRunning", "GetScriptTaskInfo", "GetGroups", "GetGroupMemberData",
+  "GetGroupRoleData", "AgentState", "UpdateAgentLanguage", "AvatarPickerSearch",
+  "ChatSessionRequest", "CopyInventoryFromNotecard", "CreateInventoryCategory",
+  "DispatchRegionInfo", "Environment", "ExtEnvironment", "EstateChangeInfo",
+  "FetchInventoryDescendents2", "FetchLibDescendents2", "FetchBulkInventory",
+  "InventoryAPIv3", "LibraryAPIv3", "RequestInventoryAsset", "RemoveInventoryFolder",
+  "RemoveInventoryObjects", "MoveInventoryFolder", "UpdateAvatarAppearance",
+  "UpdateNotecardAgentInventory", "UpdateScriptAgentInventory",
+  "UpdateSettingsAgentInventory", "RequestObjectPropertiesFamily", "ObjectMedia",
+  "ObjectMediaNavigate", "ModifyMaterialParams", "ParcelPropertiesUpdate",
+  "RemoteParcelRequest", "RegionInfo", "SimulatorFeatures", "MapLayer", "MapLayerGod",
+  "HomeLocation", "SearchStatRequest", "ReadOfflineMsgs", "ViewerAsset",
+  "ViewerMetrics", "ViewerStartAuction", "VoiceSignalingRequest", "SendPostcard",
+];
+
 const AGENT_UPDATE_HZ = 10;
+const MAX_TEXTURE_INFLIGHT = 6;
+const QUIET_IN = /^(PacketAck|StartPingCheck|CompletePingCheck|ObjectUpdate|ObjectUpdateCached|ImprovedTerseObjectUpdate|CoarseLocationUpdate|SimStats|ViewerStats|ParcelOverlay|ChatFromSimulator|ObjectProperties|AvatarAnimation)$/;
 const PING_INTERVAL = 5000;
 const RESEND_INTERVAL = 300;
 const PRIM_BUDGET = 900;
@@ -119,8 +142,10 @@ export class SLSession {
     this.nameRequests = new Set();
     this.pendingTextures = new Set();
     this.textureCache = new Map();
+    this.textureQueue = [];
+    this.textureInFlight = 0;
     this.pingID = 0;
-    this.stats = { objects: 0, skipped: 0, messages: 0, bytesIn: 0 };
+    this.stats = { objects: 0, skipped: 0, messages: 0, bytesIn: 0, textures: 0 };
     this.traceIn = 0;
     this.traceOut = 0;
     this.timers = [];
@@ -224,8 +249,20 @@ export class SLSession {
     return parsed;
   }
 
+  /**
+   * The seed capability is a **POST** carrying an LLSD array of capability names
+   * (Linden's `LLHTTPNode::get()` default answers 405 "Method Not Allowed", which
+   * is exactly what a GET gets you); the reply is an LLSD map name -> URL.
+   * https://wiki.secondlife.com/wiki/SeedCapability
+   */
   async loadCapabilities(seedUrl) {
-    const res = await this.http({ url: seedUrl, headers: { Accept: "application/llsd+xml" } });
+    const url = String(seedUrl);
+    const safe = url.replace(/[0-9a-f-]{16,}/gi, "<uuid>");
+    const body = LLSD.toXML(CAPABILITY_NAMES);
+    const res = await this.http({
+      url, method: "POST", body,
+      headers: { "Content-Type": "application/llsd+xml", Accept: "application/llsd+xml, application/llsd+binary" },
+    });
     const raw = res.text || "";
     let caps = null;
     try {
@@ -235,15 +272,14 @@ export class SLSession {
     }
     if (!caps || typeof caps !== "object" || Array.isArray(caps) || caps instanceof Uint8Array) {
       const head = String(raw).replace(/\s+/g, " ").slice(0, 140);
-      this.log(`⚠ Capacidades ilegibles (HTTP ${res.status}, ${raw.length} B): ${head}`);
+      this.log(`⚠ Capacidades ilegibles (POST ${safe} → HTTP ${res.status}, ${raw.length} B): ${head}`);
       this.caps = {};
       return this.caps;
     }
     this.caps = caps;
     const names = Object.keys(caps).filter((k) => k !== "seed_capability");
-    const key = ["EventQueueGet", "GetTexture", "FetchInventoryDescendents2", "GetDisplayNames"]
-      .filter((k) => caps[k]);
-    this.log(`Capacidades: ${names.length}${key.length ? " · " + key.join(", ") : ""}`);
+    const key = ["EventQueueGet", "GetTexture", "GetMesh", "GetDisplayNames"].filter((k) => caps[k]);
+    this.log(`Capacidades: ${names.length}/${CAPABILITY_NAMES.length}${key.length ? " · " + key.join(", ") : ""}`);
     return this.caps;
   }
 
@@ -295,16 +331,69 @@ export class SLSession {
     this.udp.onError((e) => this.log("UDP: " + e.message));
     this.udp.onClose(() => this.log("Circuito UDP cerrado."));
     if (this.app.world) {
-      this.app.world.texlib.uuidLoader = (uuid) => {
-        if (this.textureCache.has(uuid) || this.pendingTextures.has(uuid)) return;
-        this.pendingTextures.add(uuid);
-        this.fetchTexture(uuid).catch(() => this.pendingTextures.delete(uuid));
-      };
+      this.app.world.texlib.uuidLoader = (uuid) => this.requestTexture(uuid);
     }
     this.send("UseCircuitCode", {
       CircuitCode: { Code: this.circuitCode, SessionID: this.sessionID, ID: this.agentID },
     });
+    this.useCircuitSeq = this.circuit.lastSeq;
+    this.movementSent = false;
+    this.movementComplete = false;
+    this.inCounts = new Map();
     this.startHandshakeWatchdog();
+    this.startMovementWatchdog();
+  }
+
+  /**
+   * CompleteAgentMovement is what actually puts the avatar inside the region —
+   * the official viewer sends it as soon as the UseCircuitCode *ack* arrives and
+   * only then does the simulator start the region stream (RegionHandshake,
+   * AgentMovementComplete, LayerData, ObjectUpdate…). Waiting for the handshake
+   * first (as this viewer used to) means the simulator never gets it and the
+   * world never arrives: the circuit answers pings and acks but stays empty.
+   */
+  sendCompleteAgentMovement(reason = "") {
+    if (this.movementSent) return;
+    this.movementSent = true;
+    this.send("CompleteAgentMovement", {
+      AgentData: { AgentID: this.agentID, SessionID: this.sessionID, CircuitCode: this.circuitCode },
+    });
+    this.sendThrottle();
+    this.send("AgentDataUpdateRequest", { AgentData: { AgentID: this.agentID, SessionID: this.sessionID } });
+    this.log("CompleteAgentMovement enviado" + (reason ? ` (${reason})` : "") + ": el simulador ya puede meterte en la región.");
+  }
+
+  startMovementWatchdog() {
+    let retries = 0;
+    const timer = setInterval(() => {
+      if (this.state === "offline") {
+        clearInterval(timer);
+        return;
+      }
+      if (this.movementComplete) {
+        clearInterval(timer);
+        return;
+      }
+      if (!this.movementSent) {
+        // No ack matched the UseCircuitCode (or it never came): as soon as the
+        // circuit proves it is alive, go ahead anyway.
+        if (this.circuit && this.circuit.stats.received > 0) {
+          this.sendCompleteAgentMovement("el circuito responde pero no llegó el acuse");
+        }
+        return;
+      }
+      retries++;
+      if (retries > 3) {
+        this.log("El simulador no confirma AgentMovementComplete (4 intentos). La región puede haber rechazado la entrada.");
+        clearInterval(timer);
+        return;
+      }
+      this.log(`Reintento ${retries}/3 de CompleteAgentMovement…`);
+      this.send("CompleteAgentMovement", {
+        AgentData: { AgentID: this.agentID, SessionID: this.sessionID, CircuitCode: this.circuitCode },
+      });
+    }, 4000);
+    this.timers.push(timer);
   }
 
   // Retries the first handshake message while nothing has come back from the
@@ -431,15 +520,27 @@ export class SLSession {
     return packet;
   }
 
+  // PacketAck / pings / the per-frame object stream would flood the log; one
+  // line for those, a few for everything else, with a running count.
+  countInbound(name) {
+    if (!this.inCounts) this.inCounts = new Map();
+    const n = (this.inCounts.get(name) || 0) + 1;
+    this.inCounts.set(name, n);
+    const quiet = QUIET_IN.test(name);
+    if (n <= (quiet ? 1 : 3) || n % 200 === 0) {
+      this.log(`← ${name}${n > 1 ? ` (×${n})` : ""}`);
+    }
+  }
+
   onDatagram(bytes) {
     try {
       const packet = this.circuit.handlePacket(bytes);
       const def = this.index.get(packet.messageNumber);
       this.stats.messages++;
       this.stats.bytesIn += bytes.length;
-      if (this.traceIn < 12) {
-        this.traceIn++;
-        this.log(`← ${bytes.length} B #${packet.messageNumber}${def ? " " + def.name : " (desconocido)"}`);
+      this.countInbound(def ? def.name : "#" + packet.messageNumber);
+      if (!this.movementSent && this.useCircuitSeq && packet.acks.includes(this.useCircuitSeq)) {
+        this.sendCompleteAgentMovement("el simulador confirmó UseCircuitCode");
       }
       if (!def) return;
       let decoded;
@@ -495,20 +596,26 @@ export class SLSession {
       return;
     }
     let ack = 0;
+    let failures = 0;
     const poll = async () => {
       while (this.state === "online") {
         try {
           const res = await this.http({
-            url: url + "?ack=" + ack + "&done=false", method: "POST",
+            url, method: "POST",
             body: LLSD.toXML({ ack, done: false }),
-            headers: { "Content-Type": "application/llsd+xml", Accept: "application/llsd+xml" },
+            headers: { "Content-Type": "application/llsd+xml", Accept: "application/llsd+xml, application/llsd+binary" },
             timeout: 70000,
           });
-          const data = LLSD.parse(res.text) || {};
+          const data = LLSD.parse(res.bytes && res.bytes.length ? res.bytes : res.text) || {};
+          failures = 0;
           for (const ev of data.events || []) this.handleEventQueueEvent(ev);
           if (typeof data.id === "number") ack = data.id;
         } catch (e) {
           if (this.state !== "online") return;
+          failures++;
+          if (failures === 1 || failures % 10 === 0) {
+            this.log(`EventQueue: fallo ${failures} (${(e && e.message) || e}).`);
+          }
           await new Promise((r) => setTimeout(r, 3000));
         }
       }
@@ -548,6 +655,8 @@ export class SLSession {
       case "ImprovedInstantMessage": return this.onInstantMessage(data);
       case "CoarseLocationUpdate": return this.onCoarseLocation(data);
       case "StartPingCheck": return this.onStartPing(data);
+      case "PacketAck": return this.onPacketAck(data);
+      case "SimulatorViewerTimeMessage": return this.onTimeSync(data);
       case "UUIDNameReply": return this.onUUIDNameReply(data);
       case "AgentDataUpdate": return this.onAgentDataUpdate(data);
       case "DisableSimulator": return this.log("El simulador cerró el circuito.");
@@ -571,15 +680,18 @@ export class SLSession {
       };
       this.app.viewer.water.setLevel(t.waterHeight);
     }
+    this.log(`RegionHandshake: «${this.regionName}»${this.regionUUID ? " " + this.regionUUID : ""}, agua a ${info.WaterHeight ?? "?"} m.`);
+    // Flags (llviewerregion.h): 0x4 = supports self appearance, 0x2 = our object
+    // cache is empty so the simulator should send the objects themselves instead
+    // of CRC probes (we have no cache to compare against).
     this.send("RegionHandshakeReply", {
       AgentData: { AgentID: this.agentID, SessionID: this.sessionID },
-      RegionInfo: { Flags: 0 },
+      RegionInfo: { Flags: 0x6 },
     });
-    this.send("CompleteAgentMovement", {
-      AgentData: { AgentID: this.agentID, SessionID: this.sessionID, CircuitCode: this.circuitCode },
-    });
-    this.sendThrottle();
-    this.send("AgentDataUpdateRequest", { AgentData: { AgentID: this.agentID, SessionID: this.sessionID } });
+    // The handshake usually arrives *after* CompleteAgentMovement (which is what
+    // asks the simulator to put us in the region); send it here too in case this
+    // simulator does it the other way round.
+    this.sendCompleteAgentMovement("handshake recibido");
     this.status(`Región: ${this.regionName} (agua a ${info.WaterHeight ?? "?"} m).`);
   }
 
@@ -597,12 +709,13 @@ export class SLSession {
 
   onMovementComplete(data) {
     const d = data.Data || {};
+    this.movementComplete = true;
     if (d.Position) this.agentPos = d.Position;
     if (this.app.viewer) {
       this.app.viewer.controls.focus(this.agentPos, 12);
       this.app.viewer.controls.groundHeight = (x, y) => this.app.world.heightAt(x, y);
     }
-    this.log(`Posición recibida: ${(d.Position || []).map((v) => v.toFixed(1)).join(", ")}`);
+    this.log(`AgentMovementComplete: estás en ${(d.Position || []).map((v) => Number(v).toFixed(1)).join(", ")} — el mundo debería empezar a llegar.`);
   }
 
   onLayerData(data) {
@@ -635,7 +748,7 @@ export class SLSession {
     this.send("RequestMultipleObjects", {
       AgentData: { AgentID: this.agentID, SessionID: this.sessionID },
       ObjectData: wanted,
-    }, { reliable: false });
+    });
   }
 
   onObjectUpdateCompressed(data) {
@@ -741,9 +854,28 @@ export class SLSession {
     for (let i = 0; i < 32; i++) {
       const f = textureEntry.getFace(i);
       const id = f && f.textureID;
-      if (!id || id.startsWith("00000000") || this.textureCache.has(id) || this.pendingTextures.has(id)) continue;
-      this.pendingTextures.add(id);
-      this.fetchTexture(id).catch(() => this.pendingTextures.delete(id));
+      if (id) this.requestTexture(id);
+    }
+  }
+
+  // Textures are fetched through the GetTexture capability. A region can ask for
+  // hundreds at once, so they are queued with a small in-flight limit (a mobile
+  // link must not open a hundred sockets at the same time).
+  requestTexture(uuid) {
+    if (!uuid || uuid.startsWith("00000000") || !this.caps.GetTexture) return;
+    if (this.textureCache.has(uuid) || this.pendingTextures.has(uuid)) return;
+    this.pendingTextures.add(uuid);
+    this.textureQueue.push(uuid);
+    this.pumpTextures();
+  }
+
+  pumpTextures() {
+    while (this.textureInFlight < MAX_TEXTURE_INFLIGHT && this.textureQueue.length) {
+      const uuid = this.textureQueue.shift();
+      this.textureInFlight++;
+      this.fetchTexture(uuid)
+        .catch(() => { this.pendingTextures.delete(uuid); })
+        .then(() => { this.textureInFlight--; this.pumpTextures(); });
     }
   }
 
@@ -753,11 +885,14 @@ export class SLSession {
     const url = base + (base.includes("?") ? "&" : "?") + "texture_id=" + uuid;
     const res = await this.http({ url, timeout: 60000 });
     if (!res.ok || !res.bytes.length) throw new Error("textura " + uuid);
-    this.pendingTextures.delete(uuid);
     const decoded = await this.decodeImage(res.bytes, res.headers["content-type"] || "");
     if (decoded) {
       this.textureCache.set(uuid, decoded);
       if (this.app.world) this.app.world.applyTexture(uuid, decoded);
+    }
+    this.stats.textures++;
+    if (this.stats.textures === 1) {
+      this.log(`Primera textura del grid recibida (${res.bytes.length} B, ${res.headers["content-type"] || "sin tipo"}).`);
     }
   }
 
@@ -863,6 +998,36 @@ export class SLSession {
     this.send("CompletePingCheck", { PingID: { PingID: d.PingID } }, { reliable: false });
   }
 
+  // The simulator acknowledges our reliable packets with standalone PacketAck
+  // messages (not only with the appended-ack trailer). Missing these left every
+  // reliable packet "unacked" forever, so the resend loop retried it forever.
+  onPacketAck(data) {
+    const seqs = [];
+    for (const block of data.Packets || []) {
+      const id = Number(block && block.ID);
+      if (Number.isFinite(id)) seqs.push(id >>> 0);
+    }
+    if (!seqs.length) return;
+    for (const s of seqs) this.circuit.ack(s);
+    if (!this.movementSent && this.useCircuitSeq && seqs.includes(this.useCircuitSeq >>> 0)) {
+      this.sendCompleteAgentMovement("el simulador confirmó UseCircuitCode");
+    }
+  }
+
+  // Real region time: SL sends the sun direction in region coordinates
+  // (x east, y north, z up), which drives the sky/lighting.
+  onTimeSync(data) {
+    const t = data.TimeInfo || {};
+    this.worldTime = { usec: t.UsecSinceStart, secPerDay: t.SecPerDay, secPerYear: t.SecPerYear, phase: t.SunPhase };
+    const s = t.SunDirection;
+    if (Array.isArray(s) && s.length >= 3 && this.app.viewer) {
+      const len = Math.hypot(s[0], s[1], s[2]) || 1;
+      const elevation = Math.asin(Math.max(-1, Math.min(1, s[2] / len)));
+      const azimuth = Math.atan2(s[1], s[0]);
+      this.app.viewer.setSun(elevation, azimuth);
+    }
+  }
+
   onUUIDNameReply(data) {
     for (const block of data.UUIDNameBlock || []) {
       const uuid = uuidString(block.ID);
@@ -927,7 +1092,10 @@ export class SLSession {
 
   sendPing() {
     this.pingID = (this.pingID + 1) & 0xff;
-    const oldest = this.circuit.unacked.size ? Math.min(...this.circuit.unacked.keys()) : 0;
+    let oldest = 0;
+    for (const seq of this.circuit.unacked.keys()) {
+      if (oldest === 0 || seq < oldest) oldest = seq;
+    }
     this.send("StartPingCheck", { PingID: { PingID: this.pingID, OldestUnacked: oldest } }, { reliable: false });
   }
 

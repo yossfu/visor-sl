@@ -98,6 +98,8 @@ class NativeBridge(private val activity: Activity) {
         o.put("sdk", android.os.Build.VERSION.SDK_INT)
         o.put("model", android.os.Build.MODEL)
         o.put("manufacturer", android.os.Build.MANUFACTURER)
+        o.put("appVersion", BuildConfig.VERSION_NAME)
+        o.put("appBuild", BuildConfig.VERSION_CODE)
         o.put("nativeBridge", true)
         o.put("udp", true)
         return o.toString()
