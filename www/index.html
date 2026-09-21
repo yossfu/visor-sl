@@ -1,0 +1,63 @@
+<link rel="stylesheet" href="css/app.css">
+<canvas id="view"></canvas>
+<div id="hud"></div>
+<div id="boot">
+  <div class="bootbox">
+    <div class="logo">Visor&nbsp;SL</div>
+    <div class="sub">motor de mundo virtual en WebGL</div>
+    <div class="spin"></div>
+  </div>
+</div>
+<script>
+  (function () {
+    window.visorBooted = false;
+    function showBootError(text) {
+      const b = document.getElementById("boot");
+      if (!b) return;
+      b.classList.remove("gone");
+      b.innerHTML =
+        '<div class="bootbox"><div class="logo">Error</div><div class="sub">' +
+        String(text) + "</div></div>";
+    }
+    function report(text) {
+      const msg = String(text);
+      if (!window.visorBooted) { showBootError(msg); return; }
+      const log = document.getElementById("log");
+      if (log) {
+        const line = document.createElement("div");
+        line.className = "line";
+        line.textContent = "⚠ " + msg;
+        log.appendChild(line);
+        while (log.children.length > 60) log.removeChild(log.firstChild);
+        log.scrollTop = log.scrollHeight;
+      }
+      console.error("[visor]", msg);
+    }
+    function describe(e) {
+      if (!e) return "error desconocido";
+      const t = e.target;
+      if (t && (t.src || t.href)) return "no se pudo cargar " + (t.src || t.href);
+      const err = e.error || e.reason;
+      return String(e.message || (err && (err.message || err)) || err || e);
+    }
+    window.addEventListener("error", function (e) { report(describe(e)); }, true);
+    window.addEventListener("unhandledrejection", function (e) { report(describe(e)); });
+  })();
+</script>
+<script type="module">
+  import { boot } from "./js/app.js";
+  try {
+    if (!document.createElement("canvas").getContext("webgl2")) {
+      throw new Error("Este dispositivo no soporta WebGL2, que es necesario para el visor 3D. Actualiza el navegador / Android System WebView.");
+    }
+    boot();
+    window.visorBooted = true;
+    const b = document.getElementById("boot");
+    if (b) b.classList.add("gone");
+    setTimeout(() => { const x = document.getElementById("boot"); if (x) x.remove(); }, 600);
+  } catch (e) {
+    const b = document.getElementById("boot");
+    if (b) b.innerHTML = '<div class="bootbox"><div class="logo">Error</div><div class="sub">' + String(e && e.message || e) + "</div></div>";
+    console.error(e);
+  }
+</script>

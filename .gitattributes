@@ -1,3 +1,0 @@
-# Keep Unix build scripts executable and with LF line endings in CI.
-gradlew text eol=lf
-*.sh text eol=lf

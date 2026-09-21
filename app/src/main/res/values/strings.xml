@@ -1,1 +1,4 @@
-<resources><string name="app_name">Visor SL Native</string></resources>
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Visor SL</string>
+</resources>

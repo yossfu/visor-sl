@@ -1,92 +1,126 @@
-name: Compilar APK Native
+name: Compilar APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
 
+# Necesita escribir para poder publicar build-error.log cuando la compilacion
+# falla: asi el registro se puede leer desde fuera de la interfaz de Actions.
 permissions:
-  contents: read
+  contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Compilar APK (Visor SL)
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
-      - name: Checkout
+      - name: Descargar el codigo
         uses: actions/checkout@v5
 
-      - name: Java 17
+      - name: Anotar la version compilada en el resumen
+        run: |
+          V=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts || echo "?")
+          C=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts || echo "?")
+          {
+            echo "### Visor SL $V (build $C)"
+            echo ""
+            echo "Instala **app-release.apk**. Al abrir la app, el registro debe empezar por \`app $V (build $C)\`; si no, el APK instalado no es este."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Instalar Java 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Android SDK
+      - name: Preparar el SDK de Android
         uses: android-actions/setup-android@v4
 
-      - name: SDK / NDK / CMake
-        run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.31.6"
+      - name: Preparar Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
-      - name: Show source tree
-        run: |
-          echo "== settings =="
-          test -f settings.gradle.kts && sed -n '1,200p' settings.gradle.kts
-          echo "== app build =="
-          sed -n '1,240p' app/build.gradle.kts
-          echo "== NativeFilamentView =="
-          sed -n '1,320p' app/src/main/java/net/visorsl/viewer/NativeFilamentView.kt
-          echo "== CMake =="
-          sed -n '1,200p' app/src/main/cpp/CMakeLists.txt
-
-      - name: Make Gradle wrapper executable
-        run: |
-          chmod +x ./gradlew
-          ls -l ./gradlew
-          ./gradlew --version
-
-      - name: Compile Kotlin (diagnóstico)
+      # Dos intentos: el primero con la cache de compilacion de Gradle, el
+      # segundo con el estado limpio. Una entrada de cache corrupta (o un fallo
+      # transitorio del propio runner) rompe una compilacion que estaba bien, y
+      # volver a empezar de cero cuesta menos que una ejecucion perdida.
+      - name: Compilar el APK de depuracion
         run: |
           set -o pipefail
-          ./gradlew :app:compileDebugKotlin --no-daemon --stacktrace --console=plain 2>&1 | tee kotlin-build.log
+          LOG="$RUNNER_TEMP/compilar.log"
+          : > "$LOG"
+          if gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee -a "$LOG"; then
+            exit 0
+          fi
+          {
+            echo "### El primer intento fallo; se repite con el estado limpio"
+            echo '```'
+            grep -nE "^e: |error:|FAILURE:|What went wrong|Execution failed|Caused by|Unresolved|Could not" "$LOG" | tail -n 40 || echo "(sin lineas de error reconocibles)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "==== segundo intento, sin cache de compilacion ====" | tee -a "$LOG"
+          rm -rf app/build build .gradle
+          gradle assembleDebug --no-daemon --stacktrace --no-build-cache 2>&1 | tee -a "$LOG"
 
-      - name: Compile C++ / NDK (diagnóstico)
+      # El registro del fallo va al resumen de la ejecucion y ademas a
+      # build-error.log en el repositorio, que se puede leer sin sesion:
+      #   https://raw.githubusercontent.com/<usuario>/<repo>/main/build-error.log
+      - name: Publicar el registro del fallo
+        if: failure()
         run: |
-          set -o pipefail
-          ./gradlew :app:externalNativeBuildDebug --no-daemon --stacktrace --console=plain 2>&1 | tee native-build.log
+          LOG="$RUNNER_TEMP/compilar.log"
+          URL="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/build-error.log"
+          {
+            echo "### La compilacion ha fallado"
+            echo ""
+            echo "Registro completo: $URL"
+            echo ""
+            echo "Errores encontrados:"
+            echo '```'
+            grep -nE "^e: |error:|FAILURE:|What went wrong|Execution failed|Caused by|Unresolved|Could not" "$LOG" | tail -n 60 || echo "(sin lineas de error reconocibles)"
+            echo '```'
+            echo "Ultimas lineas del registro:"
+            echo '```'
+            tail -n 80 "$LOG" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "# Visor SL — registro del fallo de compilacion"
+            echo ""
+            echo "Commit: ${GITHUB_SHA}"
+            echo ""
+            echo "## Errores"
+            echo '```'
+            grep -nE "^e: |error:|FAILURE:|What went wrong|Execution failed|Caused by|Unresolved|Could not" "$LOG" | tail -n 80 || true
+            echo '```'
+            echo "## Ultimas 150 lineas"
+            echo '```'
+            tail -n 150 "$LOG" || true
+            echo '```'
+          } > build-error.log
+          git config user.email "actions@github.com"
+          git config user.name "Visor SL CI"
+          git add -f build-error.log
+          git commit -m "diagnostico: registro del fallo de compilacion [skip ci]" || exit 0
+          git push || echo "no se pudo publicar build-error.log (mira el resumen de esta ejecucion)"
 
-      - name: Assemble Debug APK
-        run: |
-          set -o pipefail
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace --console=plain 2>&1 | tee assemble-debug.log
+      - name: Compilar tambien el APK de release (firmado con la clave de depuracion)
+        run: gradle assembleRelease --no-daemon
+        continue-on-error: true
 
-      - name: Assemble Release APK
-        run: |
-          set -o pipefail
-          ./gradlew :app:assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee assemble-release.log
-
-      - name: Upload APK artifacts
-        if: success()
+      - name: Publicar el APK como artefacto descargable
         uses: actions/upload-artifact@v4
         with:
-          name: visor-sl-native-apks
+          name: visor-sl-apk
           path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
-
-      - name: Upload build diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: visor-sl-native-build-logs
-          path: |
-            kotlin-build.log
-            native-build.log
-            assemble-debug.log
-            assemble-release.log
-          if-no-files-found: ignore
+          retention-days: 90
