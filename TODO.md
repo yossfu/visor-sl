@@ -49,6 +49,16 @@ conviene pasar a un motor nativo (Filament). Hecho en esta ronda:
 - [x] **Cielo negro arreglado**: el plano lejano de la cámara cortaba la cúpula del
       cielo y aparecía un polígono negro grande.
 - [x] Versión **1.3.0 (build 4)** — el registro debe decirlo.
+- [x] **Error de compilación de Kotlin arreglado** (por eso falló la primera
+      compilación de esta ronda): `MainActivity.kt` pasaba `pendingFolderRequest`
+      (un `String?`) a `pushResult(kind, id: String)`. Ahora hay un `if (id ==
+      null) return` después de leerlo en `onActivityResult`.
+- [x] **`pushRaw` de `NativeBridge.kt` arreglado**: la concatenación
+      `"…(" + if (…) "'" + json + "'" else … + ")"` colgaba el `+ ")"` del
+      `else` (precedencia de Kotlin), así que la rama normal generaba
+      `visornative('…'` **sin cerrar el paréntesis** — un error de sintaxis en
+      cada respuesta nativa. Ahora el argumento se compone en una `val` antes de
+      construir la llamada.
 
 Pendiente de comprobar en el móvil (informe 5):
 

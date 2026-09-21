@@ -756,8 +756,8 @@ class NativeBridge(private val activity: Activity) {
      * every character of a multi-kilobyte datagram batch.
      */
     private fun pushRaw(json: String) {
-        val js = "window.visornative && window.visornative(" + if (quoteSafe(json)) "'" + json + "'" else JSONObject.quote(json) + ")"
-        runOnUi { evalJs(js) }
+        val arg = if (quoteSafe(json)) "'" + json + "'" else JSONObject.quote(json)
+        runOnUi { evalJs("window.visornative && window.visornative($arg)") }
     }
 
     /** True when a JSON string can go to JS inside single quotes as-is. */

@@ -301,6 +301,7 @@ class MainActivity : Activity() {
         if (requestCode != REQUEST_FOLDER) return
         val id = pendingFolderRequest
         pendingFolderRequest = null
+        if (id == null) return
         val extra = org.json.JSONObject()
         val uri = data?.data
         if (resultCode == RESULT_OK && uri != null) {
