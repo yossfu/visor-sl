@@ -37,7 +37,7 @@ function b64decode(text) {
   return out;
 }
 
-function installSink() {
+export function installSink() {
   if (sinkInstalled || typeof window === "undefined") return;
   sinkInstalled = true;
   window.visornative = (json) => {

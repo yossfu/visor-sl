@@ -9,6 +9,9 @@ export const SAMPLES_PER_EDGE = PATCHES_PER_EDGE * PATCH_SIZE + 1; // 257
 class BitBuffer {
   constructor(bytes) { this.b = bytes; this.bitPos = 0; }
   getBits(n) {
+    // A truncated (or corrupt) LayerData stream used to read zeros forever and
+    // hang the render loop; the decoder must bail out instead.
+    if (this.bitPos + n > this.b.length * 8) throw new Error("flujo de bits agotado");
     let v = 0;
     for (let i = 0; i < n; i++) {
       const byte = this.b[this.bitPos >> 3] || 0;

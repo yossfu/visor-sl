@@ -319,8 +319,20 @@ export class World {
     return touched;
   }
 
-  // Other residents are drawn as a capsule + billboarded name tag.
+  // Other residents are drawn as a capsule + billboarded name tag. Creating an
+  // avatar that already exists updates its name instead of duplicating it (the
+  // simulator sends our own avatar through the same path as everyone else).
   addAvatar(id, name) {
+    const known = this.avatars.get(id);
+    if (known) {
+      if (name && name !== known.name && !/^\(.*\)$/.test(name)) {
+        known.name = name;
+        known.sprite.material.map.dispose();
+        known.sprite.material.map = nameTexture(name);
+        known.sprite.material.needsUpdate = true;
+      }
+      return known;
+    }
     const group = new THREE.Group();
     const body = new THREE.Mesh(
       new THREE.CapsuleGeometry(0.28, 1.1, 6, 12),
@@ -330,14 +342,15 @@ export class World {
     body.castShadow = true;
     group.add(body);
     const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
-      map: nameTexture(name || "residente"), transparent: true, depthTest: false,
+      // Name tags always draw on top, like the SL viewer does: it is how you
+      // find your own avatar and other residents behind geometry.
+      map: nameTexture(name || "residente"), transparent: true, depthTest: false, depthWrite: false,
     }));
     sprite.scale.set(2.4, 0.6, 1);
     sprite.position.y = 2.1;
     group.add(sprite);
     this.root.add(group);
     const av = { id, name, group, body, sprite };
-    this.avatars = this.avatars || new Map();
     this.avatars.set(id, av);
     return av;
   }
@@ -360,6 +373,25 @@ export class World {
   }
 
   get objectCount() { return this.objects.size; }
+
+  /**
+   * Empties the world: no prims, no avatars and a flat region floor. Connecting
+   * to the grid uses this so the procedural demo island cannot survive behind
+   * the real region (it used to bury every prim and the avatar inside it).
+   */
+  reset(terrain) {
+    for (const id of [...this.objects.keys()]) this.removePrim(id, true);
+    for (const av of [...this.avatars.values()]) this.removeAvatar(av);
+    this.objects.clear();
+    this.avatars.clear();
+    this.resident = this.resident || new Map();
+    this.resident.clear();
+    this._lodQueue = [];
+    this.selection = null;
+    const t = terrain || new Terrain();
+    for (let i = 0; i < t.samples.length; i++) t.samples[i] = 0;
+    this.setTerrain(t);
+  }
 
   dispose() {
     for (const id of [...this.objects.keys()]) this.removePrim(id, true);

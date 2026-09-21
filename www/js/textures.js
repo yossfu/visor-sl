@@ -309,8 +309,18 @@ export class TextureLibrary {
     this.roof = roofTexture();
     this.uuidLoader = null;
   }
-  install(uuid, texture) {
-    this.cache.set(uuid, texture);
+  /**
+   * Stores a texture downloaded from the grid. The bytes arrive as an
+   * ImageBitmap, and a plain `new THREE.Texture(bitmap)` has version 0, so the
+   * renderer never uploads it and every textured face rendered **black**. It
+   * needs `needsUpdate` (and sRGB, since these are colour textures).
+   */
+  install(uuid, source) {
+    const tex = source && source.isTexture ? source : new THREE.Texture(source);
+    if (tex.version === 0) tex.needsUpdate = true;
+    if (tex.colorSpace === undefined || tex.colorSpace === "") tex.colorSpace = THREE.SRGBColorSpace;
+    this.cache.set(uuid, tex);
+    return tex;
   }
   get(key) {
     if (!key) return this.default;

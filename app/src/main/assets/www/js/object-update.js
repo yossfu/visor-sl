@@ -32,26 +32,42 @@ function dequantize(step, value, min, max) {
 
 const U8_STEP = 1 / 255;
 const U16_STEP = 1 / 65535;
-// Region-local decode windows used by the reference viewers.
+// Decode windows from the official viewer (llviewerobject.cpp, 16-bit terse
+// path, and llworld.h): the region is 256 m wide, its floor is at -256 m and
+// objects top out at MAX_OBJECT_Z = 4096 m.
+//
+//   pos.xy  -> U16_to_F32(v, -0.5*width, 1.5*width)   = [-128, 384]
+//   pos.z   -> U16_to_F32(v, MIN_HEIGHT, MAX_HEIGHT)  = [-256, 4096]
+//   vel/acc/omega -> U16_to_F32(v, -width, width)     = [-256, 256]
+//   rotation -> four U16s, each U16_to_F32(v, -1, 1)  (x, y, z, w)
 export const POS_XY = [-128, 384];
 export const POS_Z = [-256, 4096];
-export const VEL_XY = [-128, 384];
-export const VEL_Z = [-256, 4096];
+export const VEL_XY = [-256, 256];
+export const VEL_Z = [-256, 256];
+// Legacy 8-bit quantisation (size 16; the SL servers do not send it any more,
+// but Lumiya accepted it and some OpenSim grids still do).
+export const U8_POS_XY = [-128, 384];
+export const U8_VEL = [-256, 256];
 
-function readU8Vec(data, off, xy, z) {
-  return [
-    dequantize(U8_STEP, data[off], xy[0], xy[1]),
-    dequantize(U8_STEP, data[off + 1], xy[0], xy[1]),
-    dequantize(U8_STEP, data[off + 2], z[0], z[1]),
-  ];
-}
-
-function readU16Vec(view, off, xy, z) {
+function quantVec(view, off, xy, z) {
   return [
     dequantize(U16_STEP, view.getUint16(off, true), xy[0], xy[1]),
     dequantize(U16_STEP, view.getUint16(off + 2, true), xy[0], xy[1]),
     dequantize(U16_STEP, view.getUint16(off + 4, true), z[0], z[1]),
   ];
+}
+
+// All four quaternion components are on the wire in the 16-bit form (the
+// official viewer reads four U16s); deriving w from x,y,z loses the sign.
+function quantQuat(view, off) {
+  const q = [
+    dequantize(U16_STEP, view.getUint16(off, true), -1, 1),
+    dequantize(U16_STEP, view.getUint16(off + 2, true), -1, 1),
+    dequantize(U16_STEP, view.getUint16(off + 4, true), -1, 1),
+    dequantize(U16_STEP, view.getUint16(off + 6, true), -1, 1),
+  ];
+  const m = Math.hypot(q[0], q[1], q[2], q[3]);
+  return m > 0 ? [q[0] / m, q[1] / m, q[2] / m, q[3] / m] : [0, 0, 0, 1];
 }
 
 function readF32Vec(view, off) {
@@ -81,31 +97,51 @@ function readQuat(data, view, off, quant) {
   return quatFrom3(view.getFloat32(off, true), view.getFloat32(off + 4, true), view.getFloat32(off + 8, true));
 }
 
-// Lengths seen on the wire: 16/32/48 (quantised) and 60/76 (floats,
-// the 76-byte variant carries a 16-byte collision-plane prefix).
+// ImprovedTerseObjectUpdate / the Data block of ObjectUpdate. The official
+// viewer (llviewerobject.cpp, processUpdateMessage) accepts exactly these
+// payloads and nothing else — anything else it logs as "Unexpected ObjectData
+// buffer size":
+//   16  legacy 8-bit quantised (x,y,z / vel / acc / 3-component rotation)
+//   32  terse 16-bit: pos, vel, acc, rotation (4 components!), omega
+//   48  same as 32 but preceded by a 16-byte collision plane (avatars)
+//   64/80  the "extended" variants of 32/48 (extra trailing data, unused)
+//   60  full precision: pos, vel, acc, rotation (3 floats, w derived), omega
+//   76  same as 60 preceded by the 16-byte collision plane (avatars)
 export function decodeTerseObjectData(bytes) {
   const len = bytes.length;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const out = { position: [0, 0, 0], velocity: [0, 0, 0], acceleration: [0, 0, 0], rotation: [0, 0, 0, 1], angularVelocity: [0, 0, 0], quantised: true };
   if (len === 16) {
-    out.position = readU8Vec(bytes, 0, POS_XY, POS_Z);
-    out.velocity = readU8Vec(bytes, 3, VEL_XY, VEL_Z);
-    out.acceleration = readU8Vec(bytes, 6, VEL_XY, VEL_Z);
-    out.rotation = readQuat(bytes, view, 9, 8);
-  } else if (len === 32) {
-    out.position = readU16Vec(view, 0, POS_XY, POS_Z);
-    out.velocity = readU16Vec(view, 6, VEL_XY, VEL_Z);
-    out.acceleration = readU16Vec(view, 12, VEL_XY, VEL_Z);
-    out.rotation = readQuat(bytes, view, 18, 16);
-    if (len >= 32) out.angularVelocity = readU16Vec(view, 24, VEL_XY, VEL_Z);
-  } else if (len === 48) {
-    out.position = readU16Vec(view, 16, POS_XY, POS_Z);
-    out.velocity = readU16Vec(view, 22, VEL_XY, VEL_Z);
-    out.acceleration = readU16Vec(view, 28, VEL_XY, VEL_Z);
-    out.rotation = readQuat(bytes, view, 34, 16);
-    out.angularVelocity = readU16Vec(view, 40, VEL_XY, VEL_Z);
+    out.position = [
+      dequantize(U8_STEP, bytes[0], U8_POS_XY[0], U8_POS_XY[1]),
+      dequantize(U8_STEP, bytes[1], U8_POS_XY[0], U8_POS_XY[1]),
+      dequantize(U8_STEP, bytes[2], POS_Z[0], POS_Z[1]),
+    ];
+    out.velocity = [
+      dequantize(U8_STEP, bytes[3], U8_VEL[0], U8_VEL[1]),
+      dequantize(U8_STEP, bytes[4], U8_VEL[0], U8_VEL[1]),
+      dequantize(U8_STEP, bytes[5], U8_VEL[0], U8_VEL[1]),
+    ];
+    out.acceleration = [
+      dequantize(U8_STEP, bytes[6], U8_VEL[0], U8_VEL[1]),
+      dequantize(U8_STEP, bytes[7], U8_VEL[0], U8_VEL[1]),
+      dequantize(U8_STEP, bytes[8], U8_VEL[0], U8_VEL[1]),
+    ];
+    out.rotation = quatFrom3(
+      dequantize(U8_STEP, bytes[9], -1, 1),
+      dequantize(U8_STEP, bytes[10], -1, 1),
+      dequantize(U8_STEP, bytes[11], -1, 1)
+    );
+  } else if (len >= 32 && len < 60) {
+    // Avatars carry a collision plane first (48 = 16 + 32, 80 = 16 + 64).
+    const base = (len === 48 || len === 80) ? 16 : 0;
+    out.position = quantVec(view, base, POS_XY, POS_Z);
+    out.velocity = quantVec(view, base + 6, VEL_XY, VEL_Z);
+    out.acceleration = quantVec(view, base + 12, VEL_XY, VEL_Z);
+    out.rotation = quantQuat(view, base + 18);
+    out.angularVelocity = quantVec(view, base + 26, VEL_XY, VEL_Z);
   } else if (len >= 60) {
-    const base = len >= 76 ? 16 : 0;
+    const base = len >= 76 && len < 124 ? 16 : 0;
     out.quantised = false;
     out.position = readF32Vec(view, base);
     out.velocity = readF32Vec(view, base + 12);
@@ -115,6 +151,40 @@ export function decodeTerseObjectData(bytes) {
   }
   return out;
 }
+
+/**
+ * The Data blob of ImprovedTerseObjectUpdate. Unlike ObjectUpdate's ObjectData
+ * field, this one carries the object's local ID and state itself, and the viewer
+ * (llviewerobject.cpp, OUT_TERSE_IMPROVED with a data packer) reads:
+ *
+ *   U32 LocalID, U8 State, U8 hasCollisionPlane,
+ *   [LLVector4 plane (16) when hasCollisionPlane],
+ *   F32 x/y/z position,
+ *   U16 velocity x3   (-128, 128)
+ *   U16 acceleration x3, U16 rotation x4 (-1, 1), U16 omega x3   (all -64, 64)
+ */
+export function decodeImprovedTerse(data) {
+  const bytes = data || new Uint8Array(0);
+  if (bytes.length < 6) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let p = 0;
+  const localID = view.getUint32(0, true); p += 4;
+  const state = bytes[p++];
+  const hasPlane = bytes[p++];
+  if (hasPlane) p += 16;
+  if (p + 12 + 6 + 6 + 8 + 6 > bytes.length) return null;
+  const position = [view.getFloat32(p, true), view.getFloat32(p + 4, true), view.getFloat32(p + 8, true)];
+  p += 12;
+  const vel = quantVec(view, p, [-128, 128], [-128, 128]); p += 6;
+  const acc = quantVec(view, p, [-64, 64], [-64, 64]); p += 6;
+  const rotation = quantQuat(view, p); p += 8;
+  const omega = quantVec(view, p, [-64, 64], [-64, 64]);
+  return {
+    localID, state, isAvatar: (state & 1) !== 0, hasPlane: !!hasPlane,
+    position, velocity: vel, acceleration: acc, rotation, angularVelocity: omega,
+  };
+}
+
 
 export const EXTRA_FLEXIBLE = 0x10;
 export const EXTRA_LIGHT = 0x20;
@@ -208,12 +278,17 @@ export function parseCompressedObjectData(bytes) {
     s += bytes[i].toString(16).padStart(2, "0");
     if (i === 3 || i === 5 || i === 7 || i === 9) s += "-";
   }
-  const out = { fullID: s, localID: view.getUint32(16, true), pcode: 9, scale: [1, 1, 1], position: [0, 0, 0], rotation: [0, 0, 0, 1] };
+  // Layout (see the official viewer's compressed unpacking): FullID (16),
+  // LocalID (4), PCode (1), State (1), CRC (4), Material (1), ClickAction (1),
+  // Scale (12), Position (12), Rotation (12), CompressedFlags (4),
+  // [OwnerID (16) if flag 0x01].
+  const out = {
+    fullID: s, localID: view.getUint32(16, true), pcode: bytes[20] || PCODE_PRIM,
+    scale: [1, 1, 1], position: [0, 0, 0], rotation: [0, 0, 0, 1],
+  };
   try {
-    let p = 20;
-    p += 1;
-    const state = bytes[p++];
-    out.state = state;
+    let p = 21;
+    out.state = bytes[p++];
     p += 4;
     out.material = bytes[p++];
     out.clickAction = bytes[p++];

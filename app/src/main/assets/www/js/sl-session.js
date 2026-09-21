@@ -12,7 +12,7 @@ import { httpRequest, openUdp, hasUdp, platformInfo, netInfo, udpProbe } from ".
 import { parseTextureEntry } from "./texture-entry.js";
 import { decodeTerrainLayer } from "./terrain.js";
 import {
-  decodeTerseObjectData, primParamsFromShape, decodeExtraParams, parseCompressedObjectData,
+  decodeTerseObjectData, decodeImprovedTerse, primParamsFromShape, decodeExtraParams, parseCompressedObjectData,
   PCODE_PRIM, PCODE_AVATAR, PCODE_GRASS, PCODE_TREE, PCODE_NEW_TREE, PCODE_PART_SYS,
 } from "./object-update.js";
 
@@ -278,8 +278,13 @@ export class SLSession {
     }
     this.caps = caps;
     const names = Object.keys(caps).filter((k) => k !== "seed_capability");
-    const key = ["EventQueueGet", "GetTexture", "GetMesh", "GetDisplayNames"].filter((k) => caps[k]);
+    const key = ["EventQueueGet", "GetTexture", "ViewerAsset", "GetMesh", "GetDisplayNames"].filter((k) => caps[k]);
     this.log(`Capacidades: ${names.length}/${CAPABILITY_NAMES.length}${key.length ? " · " + key.join(", ") : ""}`);
+    if (!caps.GetTexture && !caps.ViewerAsset) {
+      this.log("⚠ La región no ofrece GetTexture ni ViewerAsset: los prims se verán con color plano (por UUID).");
+    } else if (!caps.GetTexture && caps.ViewerAsset) {
+      this.log("Las texturas se piden por ViewerAsset (la región no ofrece GetTexture).");
+    }
     return this.caps;
   }
 
@@ -547,7 +552,8 @@ export class SLSession {
       try {
         decoded = decodeMessage(def, packet);
       } catch (e) {
-        this.log(`No se pudo leer ${def.name}: ${e.message}`);
+        this.log(`No se pudo leer ${def.name}: ${e.message} · ${packet.payload.length} B, ` +
+          `cabecera: ${hexHead(packet.payload, 16)}`);
         return;
       }
       try {
@@ -723,13 +729,23 @@ export class SLSession {
     if (!payload || !payload.length) return;
     if (data.LayerID && data.LayerID.Type !== 0) return;
     try {
+      let n = 0;
       for (const patch of decodeTerrainLayer(payload)) {
         if (patch.patchId >= 1024) continue;
         this.app.world.terrain.applyPatch(patch);
+        n++;
       }
       this.app.world.terrainDirty = true;
+      const before = this.terrainPatches || 0;
+      this.terrainPatches = before + n;
+      if (n && (before === 0 || Math.floor(this.terrainPatches / 256) > Math.floor(before / 256))) {
+        const t = this.app.world.terrain;
+        let lo = Infinity, hi = -Infinity;
+        for (let i = 0; i < t.samples.length; i += 37) { lo = Math.min(lo, t.samples[i]); hi = Math.max(hi, t.samples[i]); }
+        this.log(`Terreno del grid: ${this.terrainPatches} parches aplicados (alturas ${lo.toFixed(1)} … ${hi.toFixed(1)} m, agua a ${t.waterHeight} m).`);
+      }
     } catch (e) {
-      this.log("terreno: " + e.message);
+      this.log("terreno: " + e.message + ` (parche de ${payload.length} B, primeros bytes: ${hexHead(payload)})`);
     }
   }
 
@@ -755,11 +771,19 @@ export class SLSession {
     for (const block of data.ObjectData || []) {
       const parsed = parseCompressedObjectData(block.Data);
       if (!parsed) continue;
+      // A compressed update only carries position/rotation/scale/flags: the
+      // shape and the texture entry are known from an earlier full update, so
+      // they must be kept instead of overwritten with cube defaults.
+      const known = this.objects.get(parsed.fullID);
       const rec = Object.assign({}, parsed, {
-        id: parsed.fullID, name: this.names.get(parsed.fullID) || "(objeto)",
-        params: { profileCurve: 1, pathCurve: 16 }, textureEntry: null,
+        id: parsed.fullID,
+        name: (known && known.name) || this.names.get(parsed.fullID) || "(objeto)",
+        params: (known && known.params) || { profileCurve: 1, pathCurve: 16 },
+        textureEntry: known ? known.textureEntry : null,
+        updateFlags: block.UpdateFlags,
       });
       this.storeObject(rec);
+      if (rec.pcode === PCODE_AVATAR) this.requestName(rec.id);
     }
   }
 
@@ -807,6 +831,13 @@ export class SLSession {
     if (known) Object.assign(known, rec);
     else this.objects.set(rec.id, rec);
     if (rec.localID) this.byLocalID.set(rec.localID, rec.id);
+    if (!this.firstObjectLogged) {
+      this.firstObjectLogged = true;
+      const p = rec.position || [];
+      this.log(`Primer objeto del simulador: pcode ${rec.pcode} en ${p.map((v) => Number(v).toFixed(1)).join(", ")} ` +
+        `· escala ${(rec.scale || []).map((v) => Number(v).toFixed(1)).join("×")}` +
+        `${rec.textureEntry ? " · con texturas" : ""}`);
+    }
     if (isAvatar) {
       this.upsertAvatar(this.objects.get(rec.id));
       return;
@@ -837,6 +868,13 @@ export class SLSession {
     });
     this.resident.set(id, stored);
     if (rec.textureEntry) this.requestTextures(rec.textureEntry);
+    if (!this.firstPrimLogged) {
+      this.firstPrimLogged = true;
+      const p = rec.position || [];
+      this.log(`Primer prim dibujado: «${rec.name}» pcode ${rec.pcode} en ` +
+        `${p.map((v) => Number(v).toFixed(1)).join(", ")} · escala ${(rec.scale || []).map((v) => Number(v).toFixed(1)).join("×")} · ` +
+        `${this.resident.size} en pantalla`);
+    }
     return true;
   }
 
@@ -862,7 +900,7 @@ export class SLSession {
   // hundreds at once, so they are queued with a small in-flight limit (a mobile
   // link must not open a hundred sockets at the same time).
   requestTexture(uuid) {
-    if (!uuid || uuid.startsWith("00000000") || !this.caps.GetTexture) return;
+    if (!uuid || uuid.startsWith("00000000") || !this.textureCap()) return;
     if (this.textureCache.has(uuid) || this.pendingTextures.has(uuid)) return;
     this.pendingTextures.add(uuid);
     this.textureQueue.push(uuid);
@@ -880,47 +918,87 @@ export class SLSession {
   }
 
   async fetchTexture(uuid) {
-    const base = this.caps.GetTexture || this.caps["GetTexture"];
+    const base = this.textureCap();
     if (!base) return;
-    const url = base + (base.includes("?") ? "&" : "?") + "texture_id=" + uuid;
+    // The official viewer builds the URL as <capability>/?texture_id=<uuid>
+    // (lltexturefetch.cpp, "Texture URL: ..."), which is also what Lumiya did.
+    const url = String(base).replace(/\/+$/, "") + "/?texture_id=" + uuid;
     const res = await this.http({ url, timeout: 60000 });
-    if (!res.ok || !res.bytes.length) throw new Error("textura " + uuid);
-    const decoded = await this.decodeImage(res.bytes, res.headers["content-type"] || "");
+    const type = header(res.headers, "content-type");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.bytes.length) throw new Error("respuesta vacía");
+    const decoded = await this.decodeImage(res.bytes, type);
     if (decoded) {
       this.textureCache.set(uuid, decoded);
       if (this.app.world) this.app.world.applyTexture(uuid, decoded);
+      this.stats.textures++;
+    } else {
+      this.stats.textureFailures = (this.stats.textureFailures || 0) + 1;
+      this.textureProblems = this.textureProblems || [];
+      if (this.textureProblems.length < 6) {
+        this.textureProblems.push(`${uuid.slice(0, 8)}: ${res.bytes.length} B, tipo "${type || "?"}"${this.lastDecodeError ? " → " + this.lastDecodeError : ""}`);
+      }
     }
-    this.stats.textures++;
-    if (this.stats.textures === 1) {
-      this.log(`Primera textura del grid recibida (${res.bytes.length} B, ${res.headers["content-type"] || "sin tipo"}).`);
+    const first = this.stats.textures + (this.stats.textureFailures || 0);
+    if (first === 1 || (first === 6 && !this.stats.textures)) {
+      this.log(`Texturas del grid: primera respuesta de GetTexture — ${res.bytes.length} B, tipo "${type || "sin tipo"}", ${decoded ? "decodificada" : "NO decodificada"}` +
+        `${this.lastDecodeError ? " (" + this.lastDecodeError + ")" : ""} · primeros bytes: ${hexHead(res.bytes, 12)}`);
+    }
+    if (this.textureProblems && this.textureProblems.length === 6 && !this.textureProblemsLogged) {
+      this.textureProblemsLogged = true;
+      this.log("Texturas: 6 fallos. Ejemplos: " + this.textureProblems.join(" | "));
     }
   }
 
+  // GetTexture is the classic capability; newer regions only advertise
+  // ViewerAsset, which serves the same requests.
+  textureCap() {
+    return this.caps.GetTexture || this.caps.ViewerAsset || null;
+  }
+
   async decodeImage(bytes, contentType) {
-    if (contentType.includes("jpeg") || contentType.includes("png") || contentType.includes("webp")) {
-      return createImageBitmap(new Blob([bytes], { type: contentType }));
+    const type = String(contentType || "").toLowerCase().split(";")[0].trim();
+    try {
+      if (/^(image\/(jpeg|png|webp|bmp|gif|avif))$/.test(type) || type === "image/jpg") {
+        return await createImageBitmap(new Blob([bytes], { type }));
+      }
+      const { decodeJ2C } = await import("./j2c.js");
+      return await decodeJ2C(bytes);
+    } catch (e) {
+      this.lastDecodeError = (e && e.message) || String(e);
+      return null;
     }
-    const { decodeJ2C } = await import("./j2c.js");
-    const bitmap = await decodeJ2C(bytes);
-    return bitmap;
   }
 
   onTerseUpdate(data) {
     for (const block of data.ObjectData || []) {
-      const terse = decodeTerseObjectData(block.Data || new Uint8Array(0));
-      const recID = block.ID;
-      const uuid = recID ? this.byLocalID.get(recID) : null;
-      if (!uuid) continue;
+      // The Data blob carries the local ID and state itself (see
+      // decodeImprovedTerse / the official viewer's OUT_TERSE_IMPROVED path).
+      const terse = decodeImprovedTerse(block.Data);
+      if (!terse) continue;
+      const uuid = this.byLocalID.get(terse.localID);
+      if (!uuid) {
+        this.unknownTerse = (this.unknownTerse || 0) + 1;
+        continue;
+      }
       const rec = this.objects.get(uuid);
       if (!rec) continue;
       rec.position = terse.position;
       rec.rotation = terse.rotation;
+      if (!this.terseLogged) {
+        this.terseLogged = (block.Data || []).length;
+        this.log(`ImprovedTerseObjectUpdate: ${this.terseLogged} B por objeto (localID ${terse.localID}) · ejemplo ` +
+          `${uuid.slice(0, 8)} → ${terse.position.map((v) => v.toFixed(1)).join(", ")}`);
+      }
       if (block.TextureEntry && block.TextureEntry.length > 8) {
         try {
           rec.textureEntry = parseTextureEntry(block.TextureEntry, 32);
         } catch (e) { /* keep the previous entry */ }
       }
-      if (uuid === this.agentID) this.agentPos = terse.position;
+      if (uuid === this.agentID) {
+        this.agentPos = terse.position;
+        this.agentRot = terse.rotation;
+      }
       if (rec.pcode === PCODE_AVATAR) {
         this.upsertAvatar(rec);
       } else if (this.resident.has(uuid) && this.app.world) {
@@ -1040,6 +1118,7 @@ export class SLSession {
         rec.name = name;
         const stored = this.app.world && this.app.world.objects.get(uuid);
         if (stored) stored.name = name;
+        if (rec.pcode === PCODE_AVATAR) this.upsertAvatar(rec);
       }
       if (uuid === this.agentID) this.agentName = name;
     }
@@ -1067,11 +1146,10 @@ export class SLSession {
   upsertAvatar(rec) {
     const world = this.app.world;
     if (!world) return;
-    let av = this.avatars.get(rec.id);
-    if (!av) {
-      av = world.addAvatar(rec.id, rec.name);
-      this.avatars.set(rec.id, av);
-    }
+    // addAvatar is idempotent and renames in place, so the name tag picks up the
+    // name as soon as UUIDNameReply/AgentDataUpdate supplies it.
+    const av = world.addAvatar(rec.id, rec.name);
+    this.avatars.set(rec.id, av);
     world.updateAvatar(av, rec.position, rec.rotation, this.regionName);
   }
 
@@ -1177,6 +1255,22 @@ export class SLSession {
 
 function data_agentBlock(session) {
   return { AgentID: session.agentID, SessionID: session.sessionID };
+}
+
+// HTTP header names arrive in whatever case the server (or the native bridge)
+// used; a plain res.headers["content-type"] silently missed "Content-Type",
+// which is why every texture was logged as "sin tipo".
+function header(headers, name) {
+  if (!headers) return "";
+  const want = name.toLowerCase();
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === want) return String(headers[k]);
+  }
+  return "";
+}
+
+function hexHead(bytes, n = 12) {
+  return [...bytes.slice(0, n)].map((b) => b.toString(16).padStart(2, "0")).join(" ");
 }
 
 function randomUuidBytes() {

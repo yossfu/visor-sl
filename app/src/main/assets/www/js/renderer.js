@@ -373,6 +373,17 @@ export class CameraController {
     this.applyOrbit();
   }
 
+  // Moves the orbit centre to an SL position without changing the camera's
+  // yaw/pitch/distance: the camera is dragged along by the same delta.
+  follow(slPos) {
+    if (!slPos) return;
+    const w = new THREE.Vector3(slPos[0], slPos[2], -slPos[1]);
+    const d = w.clone().sub(this.target);
+    if (d.lengthSq() === 0) return;
+    this.target.copy(w);
+    this.viewer.camera.position.add(d);
+  }
+
   update(dt) {
     if (!this.flying || !this.enabled) return;
     const cam = this.viewer.camera;

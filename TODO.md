@@ -3,14 +3,65 @@
 Ordenado por impacto. Lo primero es lo que hay que hacer en cuanto se pruebe con
 una cuenta real en el grid.
 
-## 0. Primera conexión real (comprobaciones)
+## 0. Conexión real (comprobaciones)
 
-**Estado tras la 2ª prueba real (cuenta ExeQiel, circuito 712948182, Xiaomi API 36):**
-el login funciona y el **circuito UDP vive** (el simulador manda `PacketAck` y
-`StartPingCheck`, y contesta a nuestros pings). No llegaba el mundo, y ya se sabe
-por qué.
+**Estado tras la 3ª prueba real (cuenta ExeQiel, Diamond Cove 54.190.153.220, Xiaomi API 36):**
+el login funciona, el circuito UDP vive y **el mundo llegó entero**: 37/55
+capacidades (EventQueueGet, GetTexture, GetMesh, GetDisplayNames),
+`RegionHandshake` («Diamond Cove», agua a 20 m), agenta en **155.0, 101.6, 21.5**,
+`LayerData`, `ObjectUpdateCompressed` (×400), `ObjectUpdate` (×200),
+`ImprovedTerseObjectUpdate` (×600), `AvatarAppearance`, `CoarseLocationUpdate`,
+`SimStats`, `KillObject` y una primera textura de 227 B. El usuario veía la isla
+demo, ni terreno ni prims ni su avatar; era **todo de render**, no de protocolo.
 
-Corregido en esta revisión:
+Corregido en esta revisión (3ª prueba):
+
+- **La isla demo no se borraba nunca.** `App.connect()` entraba al grid sin
+  limpiar el mundo procedural (alturas 3–46 m), que **enterraba** la región real
+  (objetos a z≈21). Ahora `World.reset()` borra prims/avatares y pone un suelo
+  plano a 0 m antes del login, y si el login falla se vuelve solo al modo demo.
+- **El avatar no se veía** (sólo «la píldora con mi apodo»): el cartel tenía
+  `depthTest:false` y la cápsula quedaba enterrada. `addAvatar()` es idempotente y
+  renombra en el sitio, `App.followAgent()` crea/actualiza el avatar propio desde
+  `agentPos`/`agentRot` cada fotograma y la cámara lo sigue (`CameraController.follow`).
+- **`ImprovedTerseObjectUpdate` se ignoraba por completo** (el fallo grande): su
+  bloque `Data` **no** tiene el formato de `ObjectUpdate`; lleva LocalID(4)+estado(1)+
+  [plano 16]+pos F32×3+vel/acc/rot(4×U16)/omega. Nuevo `decodeImprovedTerse()`.
+- **El "terse" de 32 B estaba mal**: la rotación son **cuatro U16** (x,y,z,w) en
+  +18 y omega en +26 (no tres U16/+24); los rangos de vel/acc/omega son (-256,256).
+- **Las texturas salían negras**: `TextureLibrary.install()` creaba la textura con
+  versión 0 (nunca se subía a la GPU); arreglado con `needsUpdate` + sRGB. Además
+  la URL de `GetTexture` era incorrecta (ahora `<cap>/?texture_id=<uuid>`), se lee
+  la cabecera sin distinguir mayúsculas ("sin tipo" era un fallo de mayúsculas) y
+  hay reserva por `ViewerAsset`.
+- **JPEG2000 real**: se vendorizó OpenJPEG wasm (`src/web/vendor/openjpeg/`) y
+  `j2c.js` se reescribió; verificado decodificando un J2C real.
+- **El terreno ya no puede colgar la página**: `BitBuffer` lanza si el flujo se
+  agota (un `LayerData` truncado antes se quedaba leyendo ceros para siempre).
+
+Pendiente de comprobar en el grid real (4ª prueba):
+
+- [ ] **4ª prueba real**: ¿se ve el terreno del grid, los prims y el avatar?
+- [ ] Texturas del terreno (`TerrainDetail0..3`) y texturas de prims con el
+      contenido correcto (el informe 3 trae el resultado de `textureFailures`).
+- [ ] `KillObject` da «Offset is outside the bounds of the DataView»: ahora se
+      registra con tamaño + cabecera hex en vez de romper el bucle; comprobar el
+      patrón exacto en el informe 4 y ajustar el offsets si hace falta.
+- [ ] Que llegue el `RegionHandshake` y que el mundo empiece a cargar
+      (LayerData/ObjectUpdate) tras `CompleteAgentMovement`.
+- [ ] **MFA** (código de 6 dígitos) si la cuenta lo pide.
+- [ ] **Posiciones "terse"**: ya corregidas contra `llviewerobject.cpp`; si aun
+      así salen desplazadas, revisar `POS_XY`/`POS_Z`/`VEL_XY`/`VEL_Z`.
+- [ ] **ImprovedInstantMessage**: verificar que el simulador acepta el mensaje
+      con `EstateBlock`/`MetaData` (si los IM no llegan, probar sin ellos).
+- [ ] **Zerocoding de salida**: se envía sin zerocode (bandera limpia) a
+      propósito; si el simulador rechazara esos paquetes, activarlo en `udp.js`.
+- [ ] **Orden del handshake**: `UseCircuitCode → RegionHandshake →
+      RegionHandshakeReply → CompleteAgentMovement → AgentThrottle`.
+      Si el sim descarta algún paquete, probar `AgentDataUpdateRequest` y
+      `RequestRegionInfo` antes de `CompleteAgentMovement`.
+
+Corregido en la 2ª revisión:
 
 - **`CompleteAgentMovement` no se enviaba nunca.** Lo mandábamos dentro del
   manejador del `RegionHandshake`, pero el visor oficial (`llstartup.cpp`) lo envía
@@ -55,12 +106,12 @@ Pendiente de comprobar en el grid real:
 
 ## 1. Texturas
 
-- [ ] Decodificador **JPEG2000** real. `j2c.js` intenta cargar
-      `@cornerstonejs/codec-openjpeg` desde esm.sh; hay que comprobar que carga
-      y que la API (`J2KDecoder`, `getEncodedBuffer`, `getDecodedBuffer`,
-      `getFrameInfo`) es la esperada. Alternativas: vendorizar el `jpx.js` de
-      pdf.js (JS puro, ~90 KB) o compilar openjpeg a wasm y subirlo con
-      `upload_file` (dejando la receta de compilación en un comentario).
+- [x] Decodificador **JPEG2000** real: **OpenJPEG compilado a wasm y
+      vendorizado** en `src/web/vendor/openjpeg/` (`openjpegwasm_decode.js` +
+      `.wasm`, de `@cornerstonejs/codec-openjpeg`). `j2c.js` inyecta el glue,
+      apunta `locateFile` al wasm local y expone `decodeJ2C`/`warmUp`. Verificado
+      con un J2C real. (El intento anterior por esm.sh fallaba con
+      `[unenv] fs.readFileSync`.)
 - [ ] Descarga **progresiva** de texturas (cabecera + niveles de detalle por
       `Range`), que es como lo hace Lumiya, para no bajar 1 MB por textura.
 - [ ] Texturas del **terreno** desde RegionHandshake (`TerrainDetail0..3`).

@@ -69,11 +69,15 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
 - **Presupuesto de prims**: de todos los objetos de la región sólo los ~900 más
   cercanos (dentro de 320 m) tienen geometría real; el resto se guarda como
   metadatos y entra/sale según te mueves (`updateResidency`).
-- **Texturas del grid**: descarga por la capacidad `GetTexture`; el JPEG2000 se
-  decodifica si hay decodificador disponible (ver TODO) y mientras tanto se usa
-  un color plano por UUID.
-- **Otros residentes**: cápsula + cartel con el nombre, alimentado por
-  ObjectUpdate (PCode 47) y CoarseLocationUpdate.
+- **Texturas del grid**: descarga por la capacidad `GetTexture`, con reserva por
+  `ViewerAsset`; el JPEG2000 se decodifica con **OpenJPEG wasm vendorizado**
+  (`src/web/vendor/openjpeg/`, sin CDN) y se sube a la GPU como textura sRGB.
+- **Otros residentes**: cápsula + cartel con el nombre, alimentado por ObjectUpdate
+  (PCode 47), ImprovedTerseObjectUpdate y CoarseLocationUpdate; el cartel se
+  dibuja siempre encima (como en SL) y el nombre se pide con UUIDNameRequest.
+- **Al conectar se limpia el mundo demo**: `World.reset()` borra la isla de
+  prueba (y su suelo a 3–46 m) antes del login, así que la región real no queda
+  enterrada. Si el login falla, se vuelve al modo demo automáticamente.
 - **HUD**: fps/tris/prims/objetos, inspector de prims en vivo, panel de mundo,
   registro/chat, modal de login.
 - **Diagnóstico de red/UDP** (botón ⧉ del registro y «Diagnóstico de red y UDP» en
@@ -103,11 +107,14 @@ el APK, porque el protocolo de SL necesita **UDP** y un navegador no puede abrir
 | `src/web/js/object-update.js` | datos "terse" (16/32/48/60/76 bytes), ExtraParams, formas |
 | `src/web/js/llsd.js` | LLSD XML / Notation / Binary + XML-RPC (login) |
 | `src/web/js/md5.js` | MD5 (hash de contraseña `$1$…`) |
-| `src/web/js/j2c.js` | decodificador JPEG2000 perezoso (texturas del grid) |
+| `src/web/js/j2c.js` | decodificador JPEG2000 (OpenJPEG wasm vendorizado, carga perezosa) |
+| `src/web/js/test/prims-selftest.js` | pruebas visuales de geometría de prims (`?test=prims`) |
+| `src/web/js/test/fake-grid.js` | simulador falso en memoria: prueba todo el camino del grid sin cuenta (`?test=grid`) |
 | `src/web/data/message_template.msg` | plantilla de mensajes oficial de SL (241 KB) |
 | `src/web/vendor/three.module.min.js` | three.js r169 (vendorizado) |
+| `src/web/vendor/openjpeg/` | OpenJPEG wasm (decodificador J2C/JPEG2000 real; `openjpegwasm_decode.js` + `.wasm`) |
 | `src/tools/pack.mjs` | empaqueta `visor-sl-app.zip` a partir de estas fuentes |
-| `src/tools/proto-selftest.mjs` | 45 pruebas del protocolo (ver abajo) |
+| `src/tools/proto-selftest.mjs` | 54 pruebas del protocolo (ver abajo) |
 | `src/android/**` | proyecto Gradle + WebView + `NativeBridge` (UDP/HTTP) |
 | `src/ci/build-apk.yml` | workflow de GitHub Actions |
 
@@ -141,16 +148,29 @@ En el editor de Perchance (o en la consola del visor web):
 await window.runVisorSelfTest();
 ```
 
-Comprueba **45 cosas** sin necesidad de cuenta: que la plantilla tiene 483
+Comprueba **54 cosas** sin necesidad de cuenta: que la plantilla tiene 483
 mensajes, que los números de mensaje son **byte a byte** los mismos que los de
 Lumiya (descubiertos en el código decompilado), que `ChatFromViewer` coincide con
 la referencia, que `AgentUpdate` mide 115 bytes, ida y vuelta de paquetes con
-zerocode y ACKs, decodificación de posición/rotación "terse", ExtraParams,
-**la petición de login completa comparada con la del visor oficial** (struct
-XML-RPC plano, `first`/`last` con usuario de una palabra, `$1$`+md5,
-`agree_to_tos`/`read_critical`/`extended_errors` como enteros, `token`/`mfa_hash`)
-y su reto MFA, lectura de respuestas LLSD (XML plano del simulador y notación),
-LLSD binary y un **ObjectUpdate completo byte a byte** más su decodificación.
+zerocode y ACKs, decodificación de posición/rotación "terse" (32 B con
+**cuaternión de 4 componentes**, ImprovedTerse de 44/60 B con su LocalID propio,
+y el rechazo de blobs truncados), **terreno** (ida y vuelta de parches DCT,
+dcOffset→nivel medio, parche vacío plano y **flujo truncado que lanza error en
+vez de colgarse**), **TextureEntry** (textura, RGBA, repeat/offset, rotación,
+material, media, glow), ExtraParams, **la petición de login completa comparada
+con la del visor oficial** (struct XML-RPC plano, `first`/`last` con usuario de
+una palabra, `$1$`+md5, `agree_to_tos`/`read_critical`/`extended_errors` como
+enteros, `token`/`mfa_hash`) y su reto MFA, lectura de respuestas LLSD (XML plano
+del simulador y notación), LLSD binary y un **ObjectUpdate completo byte a byte**
+más su decodificación.
+
+Además hay un **simulador falso** para probar el camino completo del grid sin
+cuenta ni red: abre el visor con `?test=grid` (o `await
+import("./src/web/js/test/fake-grid.js").then(m => m.runFakeGrid(window.visor))`)
+y el visor se conecta a un simulador en memoria que responde login XML-RPC,
+capacidades, `GetTexture` (JPEG2000 real), EventQueueGet y envía RegionHandshake,
+4× LayerData (256 parches), ~40 prims comprimidos, ObjectUpdate con TextureEntry,
+dos avatares (con nombre), KillObject y pings — más un agente que camina.
 
 Nota: en el editor el visor se ejecuta dentro de un iframe con service worker;
 si `fetch("src/...")` falla con "Load failed" es porque el navegador no soporta
@@ -164,7 +184,8 @@ service workers (p. ej. el navegador interno de la app de Google en iOS).
   de comprobaciones al conectar por primera vez.
 - El navegador no puede abrir UDP: sin el APK, el botón de conectar avisa y
   se queda en modo demo.
-- Las texturas del grid son JPEG2000; sin decodificador se ven colores planos.
+- Las texturas del grid son JPEG2000 y ya se decodifican con OpenJPEG wasm; si
+  `WebAssembly` no está disponible se cae a un color plano por UUID.
 - Los avatares son cápsulas con el nombre, no mallas con esqueleto.
 - Sin inventario, apariencia, sculpt maps, mallas, grupos, búsqueda, voz, RLV,
   minimapa ni dinero (ver `LUMIYA.md`).

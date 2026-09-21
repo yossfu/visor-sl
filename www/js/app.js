@@ -121,6 +121,10 @@ export class App {
   async connect(opts) {
     const mod = await import("./sl-session.js");
     this.CONTROL = mod.CONTROL;
+    // The demo island must be gone *before* the region stream starts: otherwise
+    // its terrain stays on screen and swallows every prim and avatar the
+    // simulator sends (they sit at 20-25 m, inside the demo hills).
+    this.enterGridMode();
     this.session = new mod.SLSession(this, { onStatus: opts.status });
     let reply;
     try {
@@ -131,6 +135,8 @@ export class App {
       this.ui.log("⚠ No se pudo conectar: " + ((e && e.message) || e));
       try { await s.disconnect(); } catch (_) {}
       this.session = null;
+      this.ui.log("Volviendo al modo demo.");
+      this.loadDemo();
       throw e;
     }
     this.rememberDiag(this.session);
@@ -138,6 +144,22 @@ export class App {
     this.bindControls();
     this.ui.log("Controles: W/A/S/D moverse, Q/E subir-bajar, Espacio volar, Shift correr (en la app Android).");
     return reply;
+  }
+
+  /**
+   * Leaves the sandbox behind and prepares an empty region: flat floor at 0 m
+   * (the real heights arrive as LayerData patches), no prims, no avatars, water
+   * at the default level until the handshake says otherwise.
+   */
+  enterGridMode() {
+    this.mode = "grid";
+    this.world.reset();
+    this.selected = null;
+    if (this.ui.showInspector) this.ui.showInspector(null);
+    if (this.ui.regionEl) this.ui.regionEl.textContent = "conectando…";
+    this.viewer.water.setLevel(20);
+    this.viewer.controls.focus([128, 128, 30], 18);
+    this.ui.log("Modo grid: se descarta la isla de demostración y empieza el terreno real (plano hasta que lleguen los parches del simulador).");
   }
 
   rememberDiag(session) {
@@ -224,6 +246,17 @@ export class App {
     });
   }
 
+  // Keeps the camera anchored to our own avatar: the simulator is the one that
+  // moves it (we only send control flags), so the view has to follow whatever
+  // position the region reports. In fly mode the camera is free.
+  followAgent() {
+    const s = this.session;
+    if (!s || s.state !== "online" || !s.movementComplete) return;
+    const av = this.world.addAvatar(s.agentID, s.agentName);
+    this.world.updateAvatar(av, s.agentPos, s.agentRot);
+    if (!this.viewer.controls.flying) this.viewer.controls.follow(s.agentPos);
+  }
+
   loop() {
     const now = performance.now();
     const dt = Math.min(0.1, (now - this.lastTime) / 1000);
@@ -233,6 +266,7 @@ export class App {
       this.world.terrainDirty = false;
       this.world.rebuildTerrain();
     }
+    this.followAgent();
     this.world.updateLOD(this.viewer.camera.position, 2);
     this.frameCount = (this.frameCount || 0) + 1;
     if (this.frameCount % 6 === 0) this.world.updateVisibility(this.viewer.camera.position);
@@ -246,8 +280,14 @@ export function boot() {
   const canvas = document.getElementById("view");
   const app = new App(canvas);
   window.visor = app;
-  if (location.search.includes("test=prims")) {
+  const params = location.search;
+  if (params.includes("test=prims")) {
     import("./test/prims-selftest.js").then((m) => m.runSelfTest(app)).catch(console.error);
+  }
+  if (params.includes("test=grid")) {
+    import("./test/fake-grid.js")
+      .then((m) => m.runFakeGrid(app))
+      .catch((e) => app.ui.error("harness: " + ((e && e.message) || e)));
   }
   return app;
 }
