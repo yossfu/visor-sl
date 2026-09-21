@@ -64,7 +64,10 @@ const CAPABILITY_NAMES = [
 ];
 
 const AGENT_UPDATE_HZ = 10;
-const MAX_TEXTURE_INFLIGHT = 6;
+// A phone link should not have a dozen texture downloads in flight: each one
+// holds its codestream, its decoded pixels and (while it is decoded) part of the
+// wasm heap all at once.
+const MAX_TEXTURE_INFLIGHT = 4;
 const QUIET_IN = /^(PacketAck|StartPingCheck|CompletePingCheck|ObjectUpdate|ObjectUpdateCached|ImprovedTerseObjectUpdate|CoarseLocationUpdate|SimStats|ViewerStats|ParcelOverlay|ChatFromSimulator|ObjectProperties|AvatarAnimation)$/;
 const PING_INTERVAL = 5000;
 const RESEND_INTERVAL = 300;
@@ -779,6 +782,7 @@ export class SLSession {
         n++;
       }
       this.app.world.terrainDirty = true;
+      if (n) this.app.world.setTerrainKnown(true);
       const before = this.terrainPatches || 0;
       this.terrainPatches = before + n;
       if (n && (before === 0 || Math.floor(this.terrainPatches / 256) > Math.floor(before / 256))) {
@@ -1112,12 +1116,13 @@ export class SLSession {
 
   async decodeImage(bytes, contentType) {
     const type = String(contentType || "").toLowerCase().split(";")[0].trim();
+    const maxSize = (this.app && this.app.profile && this.app.profile.texMax) || 512;
     try {
       if (/^(image\/(jpeg|png|webp|bmp|gif|avif))$/.test(type) || type === "image/jpg") {
-        return await createImageBitmap(new Blob([bytes], { type }));
+        return await fitBitmap(await createImageBitmap(new Blob([bytes], { type })), maxSize);
       }
       const { decodeJ2C } = await import("./j2c.js");
-      return await decodeJ2C(bytes);
+      return await decodeJ2C(bytes, maxSize);
     } catch (e) {
       this.lastDecodeError = (e && e.message) || String(e);
       return null;
@@ -1507,6 +1512,31 @@ function header(headers, name) {
 
 function hexHead(bytes, n = 12) {
   return [...bytes.slice(0, n)].map((b) => b.toString(16).padStart(2, "0")).join(" ");
+}
+
+/**
+ * Shrinks a decoded texture to `maxSize` in its largest dimension. Second Life
+ * hands out 1024px textures for everything; on a phone screen that is four times
+ * the GPU memory and upload time for pixels nobody can see, and texture upload
+ * is one of the two or three things that decide the frame rate.
+ */
+async function fitBitmap(bitmap, maxSize) {
+  const biggest = Math.max(bitmap.width, bitmap.height);
+  if (!maxSize || biggest <= maxSize) return bitmap;
+  const k = maxSize / biggest;
+  try {
+    const small = await createImageBitmap(bitmap, {
+      resizeWidth: Math.max(1, Math.round(bitmap.width * k)),
+      resizeHeight: Math.max(1, Math.round(bitmap.height * k)),
+      resizeQuality: "medium",
+    });
+    if (small !== bitmap) {
+      try { bitmap.close(); } catch (_) { /* older engines have no close() */ }
+    }
+    return small;
+  } catch (_) {
+    return bitmap;
+  }
 }
 
 function randomUuidBytes() {

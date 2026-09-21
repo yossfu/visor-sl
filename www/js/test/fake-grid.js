@@ -511,6 +511,17 @@ export async function installFakeGrid(opts = {}) {
   const sim = new FakeSim(opts);
   await sim.init();
   const sockets = new Map();
+  // The harness *replaces* the app's native bridge, which means the viewer can no
+  // longer reach the real grid while it runs. Saving the previous bridge lets the
+  // diagnostics offer the test as a reversible step ("is it the phone or the
+  // grid?") instead of something that requires restarting the app.
+  const previousBridge = typeof window !== "undefined" ? window.VisorNative : null;
+  sim.restoreBridge = () => {
+    try {
+      if (previousBridge) window.VisorNative = previousBridge;
+      else delete window.VisorNative;
+    } catch (_) { /* nothing to restore */ }
+  };
 
   const push = (obj) => {
     if (typeof window.visornative === "function") window.visornative(JSON.stringify(obj));
@@ -557,7 +568,7 @@ export async function installFakeGrid(opts = {}) {
   window.VisorNative = {
     platform: () => JSON.stringify({
       platform: "android", sdk: 36, model: "harness", manufacturer: "Perchance",
-      appVersion: "1.2.0", appBuild: 3, nativeBridge: true, udp: true,
+      appVersion: "1.3.0", appBuild: 4, nativeBridge: true, udp: true,
     }),
     netInfo: () => JSON.stringify({ tipo: "wifi (simulada)", validada: true, sinMedir: true, udpOk: true, puertoDePrueba: 40000 }),
     log: (m) => console.log("[harness nativo]", m),

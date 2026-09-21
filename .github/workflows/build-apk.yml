@@ -21,6 +21,13 @@ jobs:
       - name: Descargar el codigo
         uses: actions/checkout@v5
 
+      - name: Anotar la version compilada en el resumen
+        run: |
+          V=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts)
+          C=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts)
+          echo "### Visor SL $V (build $C)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Instala **app-release.apk**. Al abrir la app, el registro debe empezar por \`app $V (build $C)\`; si no, el APK instalado no es este." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Instalar Java 17
         uses: actions/setup-java@v5
         with:

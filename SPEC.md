@@ -1,7 +1,7 @@
 # Especificación — Visor SL
 
 Resumen de lo que el usuario pidió, para que ninguna sesión futura lo pierda.
-Última actualización: ronda de implementación del protocolo SL.
+Última actualización: ronda 8 (rendimiento, diagnóstico y decisión de motor).
 
 ## Petición original (resumen fiel)
 
@@ -142,4 +142,69 @@ Requisitos concretos (todos obligatorios):
 | 6. Controles tipo Genshin | **hecho**: joystick izquierdo, cámara por arrastre en la mitad derecha, botones de saltar/volar/correr/sentar, doble toque para saltar y stick a tope = correr |
 | 7. Investigación exhaustiva | **hecho y documentado** en `LUMIYA.md`: formatos de red verificados contra el código decompilado de Lumiya y contra el visor oficial de Linden (`ObjectUpdateCompressed`, ExtraParams, `AnimationData`, `SLSkeletonBone`/`getPelvisToFoot`, `LLPolySkeletalDistortion`) |
 | 8. Avisos del informe 4 | **hecho**: `KillObject` ya no falla (bloque `Variable` truncado por los *acks adjuntos* → ahora se recorta a lo que cabe); 70/70 pruebas del protocolo |
+
+---
+
+## Ronda 8 (tras la prueba en el móvil: «todo se ve mal y va lentísimo»)
+
+> «probe la app todo se ve mal, no carga texturas ni nada de terreno, el avatar
+> sigue siendo una capsula, todo va super lentisimo no esta optimizado para
+> compresion y calidad baja para el mvil quiza. tambien lo que veo solamente son
+> puros cuadros negros y espacios transparentes.. la app no me pidio acceso o
+> permiso de almacenamient... tambien creo que nos estamos enfocando en una
+> version web.. tenemos android y podriamos usar lo que es un juego basado en
+> android y no gl web.. por favor soluciona todo investiga bien como lo hce
+> lumiya y aplicalo a nuestra app android. soluciona problemas e implementa sin
+> mi concentimiento lo que deduscas necesario, tu tienes el control y te doy el
+> permiso completo y autonomo de agregar lo que es necesario, modificar y
+> emplear metodos mas nuevos, incluso si es posible usar el motor grafico
+> filament»
+
+Requisitos de esta ronda:
+
+1. **Que se vea**: texturas y terreno de verdad, sin cuadros negros ni huecos.
+2. **Que sea fluido en el móvil**: perfiles de calidad, presupuesto de objetos y
+   de texturas, y que el visor se adapte solo si el aparato no llega.
+3. **Saber por qué no se ve**, sin depender de que el usuario lea una consola:
+   diagnóstico en el propio dispositivo y avisos en el registro.
+4. **Permisos de almacenamiento**: pedirlos donde existan, explicarlos donde no, y
+   dejar elegir carpeta.
+5. **Investigar a Lumiya** y aplicar lo que hacía (rendimiento, caché de texturas,
+   descarga progresiva, residencia de objetos).
+6. **Permiso total** para añadir, modificar y usar métodos nuevos, incluido
+   cambiar de motor gráfico si conviene.
+
+### Decisión sobre el motor gráfico (Filament / nativo)
+
+Se mantiene **WebGL2 dentro del WebView**, con el trabajo de rendimiento de esta
+ronda (batches estáticos, perfiles, texturas limitadas, decodificación en otro
+hilo). Razones, por orden de peso:
+
+- **Todo el valor que ya funciona es web**: protocolo SL, terreno, prims,
+  avatares con morphs y huesos, animaciones y UI son ~150 KB de JS verificados
+  contra el simulador falso más 70/70 pruebas de protocolo. Portarlo a Kotlin/C++
+  para Filament es rehacerlo **sin poder verificarlo aquí**: este entorno no
+  compila ni ejecuta código Android nativo, así que se enviaría a ciegas al móvil.
+- **El cuello de botella real era el exceso de llamadas de dibujo**, no el motor:
+  3259 → 187 llamadas medidas con el mismo WebGL2. Filament no arregla eso por sí
+  solo; la solución era dejar de dibujar 3500 mallas.
+- **Filament se puede adoptar por partes** más adelante, si el diagnóstico del
+  móvil demuestra que el WebView no da más de sí: la pieza sustituible es el
+  render (`renderer.js`/`world.js`), no el protocolo. El paso intermedio sensato
+  sería un `SurfaceView` + GLES nativo por el puente, dejando toda la lógica de SL
+  en JS.
+
+Lo que sí se hizo, en la dirección que pedía el mensaje («cómo lo hace Lumiya»),
+está en `LUMIYA.md` §7.
+
+### Estado frente a los requisitos de la ronda 8
+
+| Requisito | Estado |
+| --- | --- |
+| 1. Que se vea | **hecho**: el mundo blanco era el bloque comprimido mal leído (ronda 6) y el polígono negro del cielo era el plano lejano cortando la cúpula (ronda 8); una textura que no llega ya no queda negra sino con un patrón de «falta». Pendiente de confirmar en el móvil con el informe 5 |
+| 2. Fluidez | **hecho**: perfiles `bajo`/`medio`/`alto`, batches estáticos (3259 → 187 llamadas; ~15 → 38-55 fps en el equipo de pruebas), gobernador de fps y bajada automática de perfil si el aparato no llega |
+| 3. Saber por qué | **hecho**: panel *Diagnóstico completo* (GPU, funciones del navegador, 8 archivos de avatar, decodificación de prueba, contadores vivos), aviso si el WebView va por software, aviso explícito si los cuerpos de avatar no cargan y **prueba de vista con simulador local** (☰) para separar «fallo del móvil» de «fallo de la conexión» sin salir de la app |
+| 4. Almacenamiento | **hecho**: panel con rutas, tamaño de caché, espacio libre, permiso clásico donde existe y selector de carpeta del sistema; el registro se puede guardar en *Descargas* |
+| 5. Lumiya | **hecho**: `LUMIYA.md` §7 (cómo dibujaba Lumiya, qué se ha aplicado y qué queda: descarga progresiva por `Range`) |
+| 6. Motor gráfico | **decidido**: se mantiene WebGL2 (razones arriba); el camino a un render nativo queda documentado y sólo se recorrerá si el diagnóstico del móvil lo justifica |
 

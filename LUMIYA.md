@@ -226,3 +226,51 @@ frontera JS↔Java. Lo que hay que respetar:
   al simulador. Es la forma de distinguir un fallo de red de un fallo de paquete.
   Se ejecuta sola cuando el circuito lleva 25 s sin recibir nada.
 
+## 7. Rendimiento: cómo dibujaba Lumiya y cómo lo hace el motor web (ronda 8)
+
+El usuario preguntó, con razón, si no deberíamos dejar el WebGL y usar algo como
+**Filament**. Esta sección es la investigación que respalda la decisión (seguir
+con WebGL2, y por qué) y el resumen de lo que sí se ha copiado de Lumiya.
+
+### Lo que hacía Lumiya
+
+| Pieza de Lumiya | Qué hacía | Nuestro equivalente |
+| --- | --- | --- |
+| `render/lumiya/drawable/*` (`DrawablePrim`) | Cada prim se dibujaba con **listas de dibujo por volumen**: la geometría de un volumen+detalle se construía una vez y se reutilizaba para todos los prims de la misma forma, con `glDrawElements` por cara. Era GLES **nativo**, sin capa de motor por encima | El coste equivalente en un motor web no son los triángulos sino las **llamadas de dibujo**: three.js no puede meter 3500 mallas en una sola. `batch.js` funde por celda+material (3259 → 187 llamadas medidas) |
+| `slproto/modules/texfetcher`, `texuploader` | **Descarga progresiva**: pedía la cabecera del J2C y luego los niveles por `Range`, decodificaba e iba subiendo niveles de detalle. Cada textura subida se quedaba en una **caché en disco** de la app | `j2c.js` decodifica la textura entera (OpenJPEG wasm) en un **worker** y la guarda en la caché en disco (`NativeBridge.cachePut`). La descarga progresiva por `Range` sigue pendiente: es el siguiente ahorro real |
+| `slproto/modules/SLMinimap`, listas de interés internas del `SLAgentCircuit` | Sólo se instanciaban los objetos cercanos; el resto existían como datos | `world.updateVisibility` + presupuesto de objetos por perfil (600/1600/4000) y `updateResidency` |
+| `DrawablePrim` con niveles de detalle por distancia | LOD de geometría por tamaño en pantalla | `world.updateLOD` (detalle 1-4 por distancia y tamaño) + `terrainSkip` por perfil |
+| Ajustes de calidad del visor Android | Distancia de dibujo, calidad de terreno, sombras, resolución | `perf.js`: perfiles con pixelRatio, alcance, sombras, teselado, tamaño de textura y presupuesto de GPU, con gobernador de fps |
+
+### Por qué no Filament (todavía)
+
+1. **El cuello de botella no era el motor gráfico.** Medido: el mismo WebGL2 pasa
+   de ~15 fps a 38-55 fps sólo dejando de emitir 3000 llamadas de dibujo. Filament
+   no hace eso por ti (sigue habiendo una llamada por *renderable*).
+2. **Filament es Vulkan/GLES nativo, no un plugin**: adoptarlo significa que el
+   render vive en C++/Kotlin y el protocolo SL, el terreno, los prims, el
+   *skinning* de avatares y la UI tienen que hablarle. Es un visor nuevo con el
+   mismo protocolo, no una mejora.
+3. **No se puede verificar aquí.** Este entorno no compila Kotlin/C++ ni ejecuta
+   un APK: cualquier port nativo se enviaría al móvil a ciegas, y las últimas
+   rondas han demostrado lo caro que sale depurar a ciegas (cuatro pruebas reales).
+4. **La arquitectura ya permite el cambio por partes.** El protocolo y los datos
+   son JS puro y están probados (70/70) contra el simulador falso; el render está
+   aislado en `renderer.js`/`world.js`. Si el diagnóstico del móvil demuestra que
+   el WebView no da más de sí (por ejemplo, `GPU (software): SÍ`), el paso
+   siguiente es un `SurfaceView` con GLES nativo detrás del puente, sustituyendo
+   sólo la capa de render.
+
+### Lo que sí se aplicó de Lumiya en esta ronda
+
+- Reutilización agresiva de geometría y materiales (equivalente a las listas de
+  dibujo por volumen), que es lo que permite que 4800 mallas se dibujen con 187
+  llamadas.
+- Presupuesto de objetos y LOD por distancia como las listas de interés.
+- Caché de texturas en disco **y** tope de memoria de GPU con recorte LRU: la
+  memoria gráfica se agota enseguida con texturas de 1024² y el driver empieza a
+  hacer *thrashing*.
+- Tamaño de textura dependiente del dispositivo (en Lumiya también se bajaba el
+  detalle antes de pedir la textura completa).
+
+

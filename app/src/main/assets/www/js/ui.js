@@ -1,6 +1,8 @@
 // HUD / panels. Plain DOM, no framework.
 import { md5Hex } from "./md5.js";
-import { prefsAll, prefsSet, storageInfo, saveToDownloads, cacheClear, platformInfo } from "./transport.js";
+import { prefsAll, prefsSet, storageInfo, storageStatus, requestStorage, pickFolder, saveToDownloads, cacheClear, platformInfo } from "./transport.js";
+import { PROFILES, profileNames } from "./perf.js";
+import { fullReport, bootCheck } from "./diag.js";
 
 // Same value sl-session.js sends as `passwd` (kept local so the login screen
 // does not pull the whole session module into the initial bundle).
@@ -34,6 +36,7 @@ const TEXTURES = [
 
 export class UI {
   constructor(app) {    this.app = app;
+    this.localTest = null;   // the in-memory simulator, while the local test runs
     this.root = document.getElementById("hud");
     this.build();
     this.log("Visor SL listo. Inicia sesión con tu cuenta de Second Life.");
@@ -43,6 +46,17 @@ export class UI {
       this.log(`GPU: ${gpu.renderer || gpu.vendor || "desconocida"} · ${gpu.webgl} · texturas hasta ${gpu.maxTexture}px · ${gpu.extensions} extensiones` +
         (gpu.software ? " ⚠ renderizado por software (sin GPU): bajará la fluidez." : ""));
     }
+    // Which quality the device got, on the same line-of-sight as the GPU: if a
+    // report says "va lento", this says what the viewer thought the device could
+    // afford, and whether it changed its mind later ("Rendimiento insuficiente").
+    if (app.profile) {
+      this.log(`Calidad: ${app.profile.name} (${app.profile.label}) · alcance ${app.profile.drawDistance} m · hasta ${app.profile.maxObjects} prims · texturas ≤${app.profile.texMax}px · sombras ${app.profile.shadows ? "sí" : "no"}`);
+    }
+    // Self-check of the things that fail silently on a phone (bundled assets,
+    // browser features, software rendering). It says nothing when all is well.
+    Promise.resolve()
+      .then(() => bootCheck(app, (m) => this.log(m)))
+      .catch(() => {});
   }
 
   build() {
@@ -128,7 +142,17 @@ export class UI {
       el("h3", { text: "Sol" }),
       this.slider("Ángulo", 0, 100, 42, (v) => this.app.viewer.setSun(v / 100 * 1.5, this.app.viewer.sunAzimuth)),
       el("h3", { text: "Diagnóstico" }),
+      b("Diagnóstico completo (GPU, archivos, texturas)", () => this.showDiagnostics()),
       b("Diagnóstico de red y UDP", () => this.app.diagnoseUdp().catch((e) => this.error(e.message))),
+      (this.localTestBtn = b("Prueba de vista con simulador local", () => this.runLocalTest())),
+      el("div", { class: "hint", text: "La prueba local conecta el visor a un simulador en memoria: si el mundo se ve bien aquí, el móvil y el motor están bien y el problema está en el grid; si también se ve mal, el problema es el dispositivo (mira el diagnóstico). Se sale pulsando el mismo botón." }),
+      el("h3", { text: "Rendimiento" }),
+      this.select("Perfil de render", profileNames().map((n) => [n, PROFILES[n].label + (this.app.profile && this.app.profile.name === n ? " — actual" : "")]), this.app.profile && this.app.profile.name || "alto", (v) => {
+        const p = this.app.setProfile(v);
+        prefsSet({ "visor.profile": v });
+        this.log(`Perfil de render: ${p.label} (alcance ${p.drawDistance} m, ${p.shadows ? "con" : "sin"} sombras, hasta ${p.maxObjects} prims).`);
+      }),
+      el("div", { class: "hint", text: "El visor baja la resolución solo cuando los fotogramas se atascan (gobernador de fps). El perfil «bajo» es el que conviene en un móvil modesto." }),
       el("h3", { text: "Datos en el dispositivo" }),
       b("Guardar registro en Descargas", () => this.saveLog()),
       b("Borrar caché de texturas", async () => {
@@ -140,6 +164,7 @@ export class UI {
         this.log(`Almacenamiento: ${s.platform === "web" ? "navegador" : s.cacheDir || "?"} · caché ${((s.cacheBytes || 0) / 1048576).toFixed(1)} MB en ${s.cacheFiles || 0} archivos · libre ${(((s.freeBytes || 0)) / 1073741824).toFixed(1)} GB` +
           (s.needsPermission === false ? " · no hace falta permiso de almacenamiento (carpeta propia de la app)" : ""));
       }),
+      b("Permiso y carpeta de almacenamiento", () => this.showStorage()),
       el("h3", { text: "Texturas" }),
       b("Informe de texturas/terreno", () => {
         if (this.app.session && this.app.session.textureReport) this.log(this.app.session.textureReport());
@@ -288,6 +313,166 @@ export class UI {
     try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
     document.body.removeChild(ta);
     done(ok);
+  }
+
+  /**
+   * Runs the whole pipeline against the in-memory simulator, on the device. It
+   * answers the question the user cannot answer from a screenshot — "is this the
+   * phone or the grid?" — without needing a second APK: if the world looks right
+   * here, the GPU, the renderer and the bundled avatar assets are fine and the
+   * problem is out on the grid; if it also looks wrong, the problem is the
+   * device, and the diagnostics panel says which part.
+   *
+   * The harness replaces the native bridge while it runs, so it is reversible:
+   * pressing the same button tears it down and restores the real bridge.
+   */
+  async runLocalTest() {
+    if (this.localTest) return this.stopLocalTest();
+    this.localTestBtn.textContent = "Preparando la prueba…";
+    try {
+      if (this.app.session) {
+        try { await this.app.session.disconnect(); } catch (_) {}
+        this.app.session = null;
+      }
+      this.app.returnToLogin();
+      const mod = await import("./test/fake-grid.js");
+      const sim = await mod.runFakeGrid(this.app);
+      this.localTest = sim;
+      this.localTestBtn.textContent = "Salir de la prueba local";
+      this.log("⚠ PRUEBA LOCAL: el visor está conectado a un simulador en memoria, no al grid. El terreno, los prims y las texturas que veas son sintéticos a propósito (es lo que permite distinguir un fallo del móvil de un fallo de la conexión).");
+    } catch (e) {
+      this.localTestBtn.textContent = "Prueba de vista con simulador local";
+      this.log("La prueba local no se pudo ejecutar: " + ((e && e.message) || e));
+    }
+  }
+
+  /** Undoes runLocalTest: real bridge back, session closed, login screen. */
+  async stopLocalTest() {
+    const sim = this.localTest;
+    this.localTest = null;
+    if (this.localTestBtn) this.localTestBtn.textContent = "Prueba de vista con simulador local";
+    try { if (this.app.session) await this.app.session.disconnect(); } catch (_) {}
+    this.app.session = null;
+    try { if (sim && sim.restoreBridge) sim.restoreBridge(); } catch (_) {}
+    this.app.returnToLogin();
+    this.log("Prueba local terminada: de vuelta a la pantalla de inicio de sesión.");
+  }
+
+  /**
+   * Full on-device report in a modal: GPU, browser features, every bundled
+   * avatar asset, the JPEG2000 decoder, the live texture/terrain/avatar
+   * counters and the storage paths. It is the answer to "why do I see no
+   * textures?", which cannot be guessed from the screen.
+   */
+  async showDiagnostics() {
+    const m = this.modalHost;
+    m.innerHTML = "";
+    m.classList.remove("hidden");
+    const close = () => { m.classList.add("hidden"); m.innerHTML = ""; };
+    const body = el("div", { class: "diagbody" }, [el("div", { class: "hint", text: "Comprobando GPU, archivos y decodificador…" })]);
+    const status = el("div", { class: "hint", text: "" });
+    const setText = () => {
+      this.diagText = (this.diagRows || []).map((r) =>
+        `${r.ok === true ? "OK   " : r.ok === false ? "FALLA" : "·    "} ${r.name}: ${r.detail}`).join("\n");
+    };
+    const copyBtn = el("button", { class: "btn", text: "⧉ Copiar", onclick: () => {
+      setText();
+      const text = this.diagText || "";
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => this.log("Diagnóstico copiado."), () => this.log("No se pudo copiar."));
+      } else this.log("Copia no disponible.");
+    } });
+    const saveBtn = el("button", { class: "btn", text: "Guardar en Descargas", onclick: async () => {
+      setText();
+      const res = await saveToDownloads("visor-sl-diagnostico.txt", new TextEncoder().encode(this.diagText || ""), "text/plain");
+      this.log(res && res.ok ? "Diagnóstico guardado en Descargas." : "Guardar necesita la app Android.");
+    } });
+    m.appendChild(el("div", { class: "modal wide" }, [
+      el("h2", { text: "Diagnóstico del visor" }),
+      body,
+      status,
+      el("div", { class: "row wrap" }, [copyBtn, saveBtn, el("button", { class: "btn", text: "Cerrar", onclick: close })]),
+    ]));
+
+    let rows;
+    try {
+      rows = await fullReport(this.app);
+    } catch (e) {
+      status.textContent = "No se pudo completar: " + ((e && e.message) || e);
+      return;
+    }
+    this.diagRows = rows;
+    setText();
+    body.innerHTML = "";
+    for (const r of rows) {
+      body.appendChild(el("div", { class: "diagrow " + (r.ok === true ? "ok" : r.ok === false ? "bad" : "info") }, [
+        el("span", { class: "tag", text: r.ok === true ? "OK" : r.ok === false ? "FALLA" : "·" }),
+        el("span", { class: "name", text: r.name + ": " }),
+        el("span", { class: "detail", text: r.detail }),
+      ]));
+    }
+    const bad = rows.filter((r) => r.ok === false);
+    status.textContent = bad.length ? `${bad.length} problema(s) detectado(s).` : "Todo correcto.";
+    status.className = "hint " + (bad.length ? "warn" : "");
+  }
+
+  /**
+   * Storage panel: where the data lives, plus the two actions Android offers —
+   * the (legacy) storage permission dialog and the system folder picker. This
+   * exists because "the app never asked for storage permission" looks like a
+   * bug, while in fact the app's own folders need none; the panel says so and
+   * still lets the user grant it on the versions that have it.
+   */
+  async showStorage() {
+    const m = this.modalHost;
+    m.innerHTML = "";
+    m.classList.remove("hidden");
+    const close = () => { m.classList.add("hidden"); m.innerHTML = ""; };
+    const info = el("div", { class: "hint", text: "Leyendo…" });
+    const status = el("div", { class: "hint", text: "" });
+    const info2 = storageInfo();
+    const st = storageStatus();
+    const lines = [];
+    if (info2.platform === "web") {
+      lines.push("Estás en el navegador: los datos van a localStorage/IndexedDB del navegador.");
+    } else {
+      lines.push(`Carpeta de la app: ${info2.cacheDir || "?"}`);
+      if (info2.externalDir) lines.push(`Carpeta externa propia: ${info2.externalDir}`);
+      lines.push(`Caché de texturas: ${((info2.cacheBytes || 0) / 1048576).toFixed(1)} MB en ${info2.cacheFiles || 0} archivos` +
+        (info2.cacheLimit ? ` (límite ${(info2.cacheLimit / 1048576).toFixed(0)} MB, se recorta sola)` : ""));
+      lines.push(`Espacio libre: ${((info2.freeBytes || 0) / 1073741824).toFixed(1)} GB`);
+    }
+    if (st) {
+      lines.push(`Carpeta elegida por ti: ${st.folder || "ninguna (se usa la de la app)"}`);
+      lines.push(`Permiso de almacenamiento: ${st.permission === "granted" ? "concedido" : st.permission === "not_needed" ? "no existe en esta versión de Android (Android 10+)" : "no concedido"}`);
+    }
+    info.textContent = "";
+    for (const l of lines) info.appendChild(el("div", { text: "· " + l }));
+    const ask = el("button", { class: "btn", text: "Pedir permiso de almacenamiento", onclick: async () => {
+      const res = await requestStorage();
+      if (res.unsupported) status.textContent = "Esta app no expone el permiso (hace falta un APK nuevo).";
+      else if (res.notNeeded) status.textContent = "Android 10+ ya no tiene ese permiso: la app guarda en su propia carpeta y exporta por MediaStore.";
+      else status.textContent = res.granted ? "Permiso de almacenamiento concedido." : "Permiso denegado.";
+      this.log("Almacenamiento: " + status.textContent);
+    } });
+    const pick = el("button", { class: "btn", text: "Elegir carpeta en el teléfono", onclick: async () => {
+      status.textContent = "Esperando a que elijas la carpeta…";
+      const res = await pickFolder();
+      status.textContent = res.ok ? `Carpeta elegida: ${res.folder}` : (res.cancelled ? "No se eligió ninguna carpeta." : "No se pudo abrir el selector.");
+      this.log("Almacenamiento: " + status.textContent);
+    } });
+    const clear = el("button", { class: "btn", text: "Borrar caché de texturas", onclick: async () => {
+      const res = await cacheClear();
+      status.textContent = res ? `Caché borrada (${res.deleted || 0} archivos).` : "No hay caché que borrar aquí.";
+      this.log("Almacenamiento: " + status.textContent);
+    } });
+    m.appendChild(el("div", { class: "modal wide" }, [
+      el("h2", { text: "Datos en el dispositivo" }),
+      info,
+      status,
+      el("div", { class: "row wrap" }, [ask, pick, clear, el("button", { class: "btn", text: "Cerrar", onclick: close })]),
+      el("div", { class: "hint", text: "El visor guarda las texturas del grid y la sesión en la carpeta propia de la app: ahí Android no pide ningún permiso. La carpeta elegida se usa además para exportar el registro y las capturas." }),
+    ]));
   }
 
   logText() {
