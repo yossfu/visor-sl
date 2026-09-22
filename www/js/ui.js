@@ -188,7 +188,7 @@ export class UI {
     this.regionEl = el("span", { class: "stat wide", text: "Demo Sandbox" });
     this.netEl = el("span", { class: "stat net", text: "sin conexión" });
     const top = el("div", { class: "bar top" }, [
-      el("b", { class: "brand", text: "Visor SL" }),
+      el("b", { class: "brand", text: "Visor SL" + ((typeof window !== "undefined" && window.visorBuildBadge) ? " " + window.visorBuildBadge : "") }),
       this.regionEl, this.fpsEl, this.trisEl, this.objEl, this.netEl,
       el("span", { class: "spacer" }),
       el("button", { class: "btn", onclick: () => this.toggleFly(), id: "flyBtn", text: "Volar (F)" }),
@@ -451,7 +451,7 @@ export class UI {
    * The harness replaces the native bridge while it runs, so it is reversible:
    * pressing the same button tears it down and restores the real bridge.
    */
-  async runLocalTest() {
+  async runLocalTest(opts = {}) {
     if (this.localTest) return this.stopLocalTest();
     this.localTestBtn.textContent = "Preparando la prueba…";
     try {
@@ -460,11 +460,16 @@ export class UI {
         this.app.session = null;
       }
       this.app.returnToLogin();
+      // `returnToLogin` reopens the login screen; when the test is started FROM
+      // that screen the modal has to go, or it would cover the very world it is
+      // meant to show.
+      if (opts.hideModal) this.hideModal();
       const mod = await import("./test/fake-grid.js");
       const sim = await mod.runFakeGrid(this.app);
       this.localTest = sim;
+      if (opts.hideModal) this.hideModal();
       this.localTestBtn.textContent = "Salir de la prueba local";
-      this.log("⚠ PRUEBA LOCAL: el visor está conectado a un simulador en memoria, no al grid. El terreno, los prims y las texturas que veas son sintéticos a propósito (es lo que permite distinguir un fallo del móvil de un fallo de la conexión).");
+      this.log("⚠ PRUEBA LOCAL: el visor está conectado a un simulador en memoria, no al grid. El terreno, los prims y las texturas que veas son sintéticos a propósito (es lo que permite distinguir un fallo del móvil de un fallo de la conexión). Para salir: ☰ → «Salir de la prueba local».");
     } catch (e) {
       this.localTestBtn.textContent = "Prueba de vista con simulador local";
       this.log("La prueba local no se pudo ejecutar: " + ((e && e.message) || e));
@@ -1245,6 +1250,10 @@ export class UI {
     };
     m.appendChild(el("div", { class: "modal" }, [
       el("h2", { text: "Conectar a Second Life" }),
+      // The installed build, right where it cannot be missed. After a round of
+      // "I installed the APK and nothing changed", the version is the fact that
+      // decides whether the phone is even running the new code.
+      el("div", { class: "hint buildline", text: "Versión instalada: " + (window.visorBuild || "web") }),
       el("div", { class: "hint", text: "Tu contraseña sólo se envía al servidor de login de Linden Lab (como hash $1$ + md5, igual que cualquier visor)." }),
       grid, user, pass, token, deviceHint, rememberLabel, status,
       el("div", { class: "row" }, [
@@ -1252,7 +1261,16 @@ export class UI {
         el("button", { class: "btn", onclick: () => go(true), text: "Entrar (acceso guardado)" }),
         el("button", { class: "btn", onclick: close, text: "Cancelar" }),
       ]),
+      el("div", { class: "row" }, [
+        el("button", {
+          class: "btn",
+          text: "Probar el motor sin cuenta (mundo de prueba)",
+          onclick: () => { close(); this.runLocalTest({ hideModal: true }); },
+        }),
+      ]),
+      el("div", { class: "hint", text: "El mundo de prueba no necesita cuenta ni conexión: si ahí se ve un mundo con terreno, objetos y texturas, el visor y el móvil están bien y el problema estaría en la conexión con el grid." }),
       el("div", { class: "hint", text: "Sirve tanto el usuario de una sola palabra (cuentas nuevas) como «Nombre Apellido». Si el login falla, el motivo exacto que devuelve el servidor queda en el registro de abajo." }),
+      el("div", { class: "hint", text: "Si la versión de arriba no cambia al instalar un APK nuevo, ese APK no se ha instalado: desinstala antes TODAS las copias de «Visor SL» (Ajustes → Aplicaciones) y vuelve a instalar. Los APK antiguos se firmaron con otra clave y Android no deja actualizarlos por encima." }),
     ]));
   }
 

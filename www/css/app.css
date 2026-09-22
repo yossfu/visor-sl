@@ -103,6 +103,9 @@ body.touch-mode .bar.bottom { padding: 5px 8px calc(5px + env(safe-area-inset-bo
 }
 .brand { font-size: 15px; letter-spacing: .3px; color: #fff; margin-right: 4px; }
 .brand::first-letter { color: var(--accent); }
+/* The installed build, in the header: any screenshot then says whether the phone
+   is running the build that was just installed. */
+.hint.buildline { color: var(--txt); font-weight: 600; }
 .spacer { flex: 1 1 auto; }
 .stat {
   font-variant-numeric: tabular-nums; color: var(--dim);
@@ -201,9 +204,12 @@ body.touch-mode .bar.bottom { padding: 5px 8px calc(5px + env(safe-area-inset-bo
 .bar.bottom .btn { flex: 0 0 auto; }
 
 /* ---------- modal ---------- */
+/* Light enough that the login screen's backdrop (the test island) is clearly
+   visible behind the panel: the first screen of the app should never look like
+   an empty void. */
 .modal-host {
   position: absolute; inset: 0; z-index: 9; display: flex; align-items: center; justify-content: center;
-  background: rgba(4, 7, 11, 0.72); backdrop-filter: blur(4px);
+  background: rgba(4, 7, 11, 0.58); backdrop-filter: blur(3px);
 }
 .modal-host.hidden { display: none; }
 .check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dim); }

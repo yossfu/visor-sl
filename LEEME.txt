@@ -5,15 +5,23 @@ QUE HAY AQUI
   www/                              el visor web (abrelo en un navegador de PC)
   app/src/main/assets/www/          el mismo visor, empaquetado dentro de la app Android
   app/src/main/java/...             la app Android (WebView + puente nativo UDP/HTTP)
+  app/visor-sl.p12                  la clave de firma (fija, publica a proposito)
   .github/workflows/build-apk.yml   compila el APK automaticamente en GitHub
   src/                              (no existe en el repo: es de la carpeta de trabajo)
 
-COMO COMPILAR EL APK
-  1. Crea un repositorio en GitHub llamado  visor-sl
-  2. Deja este zip junto al archivo  subir-a-github-y-compilar.bat  y ejecutalo
-  3. Cuando termine, abre  https://github.com/TU_USUARIO/visor-sl/actions
+COMO INSTALARLO EN EL MOVIL
+  1. Deja este zip junto al archivo  subir-a-github-y-compilar.bat  y ejecutalo
+  2. Cuando termine, abre  https://github.com/TU_USUARIO/visor-sl/actions
      y descarga el artefacto  visor-sl-apk
-  4. Instala el APK en el movil
+  3. Dentro hay UN SOLO APK con la version en el nombre (VisorSL-1.7.1-b9.apk)
+  4. ANTES DE INSTALARLO, LA PRIMERA VEZ: desinstala todas las copias de
+     "Visor SL" que haya en el movil (Ajustes - Aplicaciones).  Los APK
+     anteriores se firmaron con otra clave y Android no deja actualizarlos por
+     encima: sin desinstalar, el movil sigue abriendo el visor viejo y parece
+     que el APK nuevo no ha cambiado nada.
+  5. Abre la app: arriba tiene que poner "Visor SL 1.7.1" y el registro empieza
+     por "Arranque: 1.7.1 (build 9)". Si no lo pone, el que se ha abierto no es
+     el APK nuevo.
 
   Tambien puedes abrir la carpeta en Android Studio y pulsar "Run".
 

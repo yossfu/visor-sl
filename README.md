@@ -18,10 +18,17 @@ Autor del proyecto: yossfu · repositorio de trabajo: `yossfu/visor-sl`
    El .bat descomprime el zip, clona/actualiza `https://github.com/yossfu/visor-sl.git`,
    copia los archivos, hace commit y push.
 3. Abre `https://github.com/yossfu/visor-sl/actions`: el workflow **Compilar APK**
-   compila `assembleDebug` y `assembleRelease` y publica el artefacto
-   **visor-sl-apk** con los dos APK. Descárgalo al final de la página de la ejecución.
-4. Instala el APK en el móvil (`app-debug.apk`). En el móvil abre la app → botón
-   **Conectar a SL** → nombre completo y contraseña.
+   compila `assembleRelease` y publica el artefacto **visor-sl-apk**, que contiene
+   **un solo APK** con la versión en el nombre (`VisorSL-1.7.1-b9.apk`).
+   Descárgalo al final de la página de la ejecución.
+4. **Antes de instalarlo, la primera vez: desinstala todas las copias de «Visor SL»
+   que haya en el móvil** (Ajustes → Aplicaciones). Los APK anteriores se firmaron
+   con otra clave (ver §2g), y Android no deja actualizar por encima una aplicación
+   firmada con otra clave: si no se desinstala, el móvil sigue abriendo el visor
+   viejo y parece que el APK nuevo no ha cambiado nada.
+5. Instala el APK y ábrelo: arriba tiene que poner **Visor SL 1.7.1** y el registro
+   tiene que empezar por `Arranque: 1.7.1 (build 9)`. Si no lo pone, el APK abierto
+   no es el nuevo. Después: **Conectar a SL** → nombre completo y contraseña.
 
 También puedes abrir la carpeta descomprimida en Android Studio y pulsar *Run*.
 
@@ -509,6 +516,77 @@ cobertura** —`head_color` 96 %, `upperbody_color` 99 % y `lowerbody_color` 87 
 transparentes—, no mapas difusos, así que no se pueden enchufar directamente;
 haría falta el compositor por capas de SL. Queda anotado en el TODO con los
 números, para no repetir el intento a ciegas.
+
+## 2g. Ronda 13 — «sigue igual, nada cambia»: el APK que llegaba al móvil no era el nuevo
+
+> sigue igual. sin cargar mapa sin buscar lands sin mostrar resultados. el mundo
+> no serenderiza. soluciona de una vez por todas!
+
+La pista no estaba en el visor sino en **qué APK estaba ejecutando el móvil**. Se
+comprobó contra el repositorio y contra las capturas que envió el usuario:
+
+- El repositorio (`raw.githubusercontent.com/yossfu/visor-sl/main/...`) **sí**
+  tiene el código nuevo: `versionCode = 8`, `j2c-worker.js` con el arreglo del
+  píxel (`pxStride`), `index.html` con el sondeo de WebGL. La subida funcionaba.
+- Las capturas del móvil (21/09, 17:13) enseñan el panel de texturas con los
+  **cuadros de colores en franjas finas y barra negra a la derecha** — la firma
+  exacta del error de lectura de JPEG2000 de 4 componentes que se arregló en la
+  ronda 11. Es decir: el teléfono estaba ejecutando código **anterior**. El
+  arreglo nunca llegó a ejecutarse ahí.
+- Y hay una razón de peso para que no llegara: **cada compilación del CI se
+  firmaba con una clave distinta**. `app/build.gradle.kts` firmaba con la
+  configuración `debug`, y AGP **genera esa clave al vuelo** (`~/.android/debug.keystore`)
+  cuando no existe: en un servidor de GitHub nuevo se crea una clave nueva en cada
+  ejecución. Android **rechaza** instalar un APK firmado con otra clave sobre una
+  aplicación ya instalada («Aplicación no instalada»), así que el móvil se quedaba
+  con la versión vieja por muchas veces que se recompilara.
+- Además había **dos paquetes** (`net.visorsl.viewer` y `net.visorsl.viewer.debug`,
+  por el sufijo `.debug`) con la **misma etiqueta** «Visor SL»: dos iconos
+  idénticos, y los informes del usuario confirman que cada copia estaba en una
+  versión distinta (build 4 en una, build 5 en la otra). Abrir la copia vieja se
+  ve exactamente igual que «el APK nuevo no cambió nada».
+
+Lo que se ha cambiado, y por qué:
+
+- [x] **Clave de firma fija y compartida** (`app/visor-sl.p12`, pública a
+      propósito: no guarda ningún secreto, sólo hace que todas las compilaciones
+      sean *la misma aplicación*). `build.gradle.kts` **lee el alias del almacén**
+      con `java.security.KeyStore` en vez de adivinarlo, y el workflow comprueba
+      con `keytool` que la clave se puede leer; si no, crea una con `keytool` y
+      **la guarda en el repositorio** para que la próxima vez ya sirva. La huella
+      SHA-256 de la clave se publica en el resumen de la ejecución: si cambia de
+      una compilación a otra, se ve al instante.
+- [x] **Un solo paquete**: se ha quitado el sufijo `.debug`, así que las dos
+      variantes son la misma aplicación y **instalar cualquiera actualiza la
+      misma copia** del móvil. La etiqueta del lanzador ahora es
+      **«Visor SL 1.7.1»**, distinta de cualquier copia antigua que hubiera
+      quedado instalada.
+- [x] **Un solo APK en el artefacto**, con la versión en el nombre
+      (`VisorSL-1.7.1-b9.apk`): no hay que elegir ni adivinar cuál es el nuevo.
+- [x] **La versión, a la vista**. En la barra de arriba pone **«Visor SL b9»**
+      (badge del build), la pantalla de acceso dice **«Versión instalada: …»** y el
+      registro sigue empezando por `Arranque: …`. Cualquier captura dice ya qué
+      build está ejecutándose.
+- [x] **La pantalla de acceso ya no es un vacío**: la isla procedural vuelve como
+      fondo del inicio de sesión (con el nombre «Demo Sandbox» en el campo de
+      región y un aviso en el registro). Un mundo negro es indistinguible de «no
+      se renderiza nada», que es justo como se describió la primera pantalla.
+- [x] **Botón «Probar el motor sin cuenta» en la propia pantalla de acceso**, que
+      levanta el simulador en memoria sin necesidad de cuenta ni de red: es la
+      forma de comprobar en el móvil, en diez segundos, que el APK nuevo está
+      instalado y que el motor dibuja.
+- [x] Instrucciones explícitas en el `.bat`, en `LEEME.txt` y en el resumen del
+      workflow: **desinstalar todas las copias de «Visor SL» antes de la primera
+      instalación nueva**, y comprobar que arriba pone la versión nueva.
+- [x] Versión **1.7.1 (build 9)**.
+
+**Por qué esto explica los cuatro síntomas a la vez**: el APK que se ejecutaba era
+el de la ronda ~9. En aquel motor el buscador de tierras no tenía aún la petición
+por UDP (`MapNameRequest`), las fichas del mapa se pedían sin `User-Agent` (el CDN
+responde 403 sin él) y el JPEG2000 de 4 componentes se leía mal — de ahí «sin
+cargar mapa», «sin buscar lands, sin mostrar resultados» y las texturas sin
+sentido. Todo eso estaba ya arreglado en el repositorio; no había llegado al
+teléfono.
 
 ## 3. Arquitectura (código)
 

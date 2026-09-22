@@ -473,6 +473,19 @@ export function boot() {
   const app = new App(canvas);
   window.visor = app;
   const params = location.search;
+  // The login screen is never an empty void. With no session there is nothing
+  // in the region, and an empty screen is indistinguishable from "the world does
+  // not render" — which is exactly how the phone's first screen was described.
+  // The procedural island is back as the login screen's backdrop, clearly named
+  // in the region field, and connecting (or `?test=…`) replaces it.
+  if (!/test=/.test(params)) {
+    try {
+      app.loadDemo();
+      app.ui.log("Vista previa sin conexión: isla de prueba. Pulsa «Conectar a SL» para entrar al grid real (la isla desaparece al conectar).");
+    } catch (e) {
+      app.ui.error("No se pudo preparar la isla de prueba: " + ((e && e.message) || e));
+    }
+  }
   if (params.includes("test=grid")) {
     import("./test/fake-grid.js")
       .then((m) => m.runFakeGrid(app))

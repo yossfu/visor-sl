@@ -117,13 +117,20 @@
     // from the one that was downloaded.
     (function stamp() {
       let text = "web";
+      let badge = "web";
       try {
         if (window.VisorNative && window.VisorNative.platform) {
           const p = JSON.parse(window.VisorNative.platform());
           text = `${p.appVersion || "?"} (build ${p.appBuild || "?"}) · Android ${p.sdk || "?"}`;
+          // Also kept as a short badge: it is printed in the HUD bar, so ANY
+          // screenshot says which build is installed. After several rounds of
+          // "nothing changes on the phone" that single fact is the one that
+          // separates "the fix did not work" from "the fix never arrived".
+          badge = p.appBuild ? "b" + p.appBuild : "app";
         }
       } catch (e) { text = "web"; }
       window.visorBuild = text;
+      window.visorBuildBadge = badge;
       const el = document.getElementById("bootBuild");
       if (el) el.textContent = text;
     })();

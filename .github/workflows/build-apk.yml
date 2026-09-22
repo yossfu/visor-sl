@@ -6,13 +6,20 @@ on:
   workflow_dispatch:
 
 # Necesita escribir para poder publicar build-error.log cuando la compilacion
-# falla: asi el registro se puede leer desde fuera de la interfaz de Actions.
+# falla (asi el registro se puede leer desde fuera de la interfaz de Actions) y
+# para guardar la clave de firma la primera vez.
 permissions:
   contents: write
 
 concurrency:
   group: apk-${{ github.ref }}
   cancel-in-progress: false
+
+env:
+  # La contraseña del almacén de claves. Es pública a propósito: la clave de
+  # firma también lo es (vive en el repositorio) y sólo sirve para que todas las
+  # compilaciones sean la misma aplicación.
+  VISOR_STORE_PASS: visor-sl-3f9c1a7d42b8
 
 jobs:
   build:
@@ -22,16 +29,6 @@ jobs:
     steps:
       - name: Descargar el codigo
         uses: actions/checkout@v5
-
-      - name: Anotar la version compilada en el resumen
-        run: |
-          V=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts || echo "?")
-          C=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts || echo "?")
-          {
-            echo "### Visor SL $V (build $C)"
-            echo ""
-            echo "Instala **app-release.apk**. Al abrir la app, el registro debe empezar por \`app $V (build $C)\`; si no, el APK instalado no es este."
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Instalar Java 17
         uses: actions/setup-java@v5
@@ -47,16 +44,77 @@ jobs:
         with:
           gradle-version: "8.7"
 
+      # La clave de firma tiene que ser SIEMPRE la misma. Si la que viene en el
+      # repositorio no se puede leer (o no está), se crea aquí una y se guarda en
+      # el repositorio, de modo que la próxima compilación ya la reutilice. Sin
+      # esto cada ejecución firmaría con una clave nueva y el móvil rechazaría la
+      # actualización ("Aplicación no instalada"), que es exactamente lo que hacía
+      # que los arreglos no llegaran nunca al teléfono.
+      - name: Comprobar la clave de firma
+        run: |
+          {
+            echo "### Clave de firma"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if keytool -list -keystore app/visor-sl.p12 -storetype PKCS12 \
+               -storepass "$VISOR_STORE_PASS" >/dev/null 2>&1; then
+            echo "La clave guardada en el repositorio se puede leer: **se reutiliza**." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::La clave guardada no se puede leer; se crea una nueva y se guarda."
+            echo "No existía / no se podía leer: **se ha creado una nueva y se ha guardado**." >> "$GITHUB_STEP_SUMMARY"
+            rm -f app/visor-sl.p12
+            keytool -genkeypair -v -keystore app/visor-sl.p12 -storetype PKCS12 \
+              -alias visorsl -keyalg RSA -keysize 2048 -validity 10950 \
+              -storepass "$VISOR_STORE_PASS" -keypass "$VISOR_STORE_PASS" \
+              -dname "CN=Visor SL CI, O=Visor SL, C=ES"
+            git config user.email "actions@github.com"
+            git config user.name "Visor SL CI"
+            git add -f app/visor-sl.p12
+            git commit -m "firma: guardar la clave de firma estable [skip ci]" || true
+            git push || echo "no se pudo guardar la clave en el repositorio"
+          fi
+          {
+            echo ""
+            echo '```'
+            keytool -list -v -keystore app/visor-sl.p12 -storetype PKCS12 \
+              -storepass "$VISOR_STORE_PASS" 2>/dev/null | grep -E "Alias name|SHA256:" || true
+            echo '```'
+            echo "Si esta huella cambia de una compilación a otra, el móvil no podrá"
+            echo "actualizar la aplicación instalada."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Anotar la version compilada en el resumen
+        run: |
+          V=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts || echo "?")
+          C=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts || echo "?")
+          {
+            echo ""
+            echo "### Visor SL $V (build $C)"
+            echo ""
+            echo "Descarga **visor-sl-apk** desde abajo, descomprímelo e instala el único"
+            echo "APK que contiene (**VisorSL-$V-b$C.apk**)."
+            echo ""
+            echo "> **Antes, la primera vez: desinstala todas las copias de «Visor SL».**"
+            echo "> Los APK anteriores estaban firmados con otra clave, así que Android"
+            echo "> no deja actualizarlos por encima y el móvil se queda con el viejo."
+            echo "> Ajustes → Aplicaciones → busca «Visor SL» → Desinstalar (si aparece"
+            echo "> más de una vez, desinstálalas todas). Después sólo hay que actualizar."
+            echo ""
+            echo "Al abrir la app tiene que poner **Visor SL $V** en la barra de arriba y"
+            echo "el registro empieza por \`Arranque: $V (build $C)\`. Si no lo pone, el"
+            echo "APK instalado no es este."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # Dos intentos: el primero con la cache de compilacion de Gradle, el
       # segundo con el estado limpio. Una entrada de cache corrupta (o un fallo
       # transitorio del propio runner) rompe una compilacion que estaba bien, y
       # volver a empezar de cero cuesta menos que una ejecucion perdida.
-      - name: Compilar el APK de depuracion
+      - name: Compilar el APK (release, firmado con la clave fija)
         run: |
           set -o pipefail
           LOG="$RUNNER_TEMP/compilar.log"
           : > "$LOG"
-          if gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee -a "$LOG"; then
+          if gradle assembleRelease --no-daemon --stacktrace -Pvisor.storePass="$VISOR_STORE_PASS" 2>&1 | tee -a "$LOG"; then
             exit 0
           fi
           {
@@ -67,7 +125,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "==== segundo intento, sin cache de compilacion ====" | tee -a "$LOG"
           rm -rf app/build build .gradle
-          gradle assembleDebug --no-daemon --stacktrace --no-build-cache 2>&1 | tee -a "$LOG"
+          gradle assembleRelease --no-daemon --stacktrace --no-build-cache -Pvisor.storePass="$VISOR_STORE_PASS" 2>&1 | tee -a "$LOG"
 
       # El registro del fallo va al resumen de la ejecucion y ademas a
       # build-error.log en el repositorio, que se puede leer sin sesion:
@@ -111,16 +169,23 @@ jobs:
           git commit -m "diagnostico: registro del fallo de compilacion [skip ci]" || exit 0
           git push || echo "no se pudo publicar build-error.log (mira el resumen de esta ejecucion)"
 
-      - name: Compilar tambien el APK de release (firmado con la clave de depuracion)
-        run: gradle assembleRelease --no-daemon
-        continue-on-error: true
+      # Un solo APK, con la version en el nombre: no hay que elegir ni adivinar
+      # cual es el nuevo. Al no haber sufijo `.debug`, las dos variantes son la
+      # misma aplicacion, asi que instalar cualquiera de las dos actualiza la
+      # misma copia del movil.
+      - name: Bautizar el APK con su version
+        run: |
+          V=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts || echo "?")
+          C=$(grep -oP 'versionCode\s*=\s*\K[0-9]+' app/build.gradle.kts || echo "?")
+          NAME="VisorSL-$V-b$C.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$NAME"
+          echo "VISOR_APK=$NAME" >> "$GITHUB_ENV"
+          ls -l "$NAME"
 
       - name: Publicar el APK como artefacto descargable
         uses: actions/upload-artifact@v4
         with:
           name: visor-sl-apk
-          path: |
-            app/build/outputs/apk/debug/app-debug.apk
-            app/build/outputs/apk/release/app-release.apk
+          path: ${{ env.VISOR_APK }}
           if-no-files-found: error
           retention-days: 90

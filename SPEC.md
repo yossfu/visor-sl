@@ -297,5 +297,36 @@ Estado:
 | 3. Saber qué APK está instalado | **hecho**: el recuadro de arranque y la primera línea del registro llevan la versión y el build; y se comprueba que el APK tiene todos los métodos del puente nativo (si faltan, lo dice: «el APK instalado es más antiguo que este motor web») |
 | Qué necesito de él | **el registro del teléfono** (☰ → «Guardar registro en Descargas») y el resultado de pulsar **☰ → «Prueba de vista con simulador local»** en el móvil: eso separa «el motor no dibuja» de «no conecta con el grid» sin más idas y vueltas |
 
+## Ronda 13 (informe 10: «sigue igual. sin cargar mapa sin buscar lands sin mostrar resultados. el mundo no serenderiza. soluciona de una vez por todas!»)
+
+La comprobación decisiva no fue sobre el visor sino sobre **qué APK estaba
+ejecutando el teléfono**, y la respuesta es que era uno de hace cuatro rondas.
+
+Requisitos, tal como los pide el usuario:
+
+1. **Que el mundo se renderice en el móvil real.**
+2. **Que cargue el mapa.**
+3. **Que el buscador de tierras encuentre y muestre resultados.**
+4. **Que se solucione de una vez por todas** (no otra ronda de «casi»).
+
+Evidencia recogida:
+
+| Comprobación | Resultado |
+| --- | --- |
+| ¿El repositorio tenía el código nuevo? | **Sí**: descargado de `raw.githubusercontent.com/yossfu/visor-sl/main`, con `versionCode = 8`, el arreglo del píxel en `j2c-worker.js` y el sondeo de WebGL en `index.html`. La subida funcionaba. |
+| ¿Qué enseñan las capturas del móvil (21/09 17:13)? | El panel de texturas con **franjas finas de colores y barra negra a la derecha**: la firma del error de JPEG2000 de 4 componentes, **arreglado en la ronda 11**. El teléfono ejecutaba código anterior. |
+| ¿Qué APK había instalado? | Dos copias con la misma etiqueta «Visor SL» en **versiones distintas** (informes del usuario: build 4 en `net.visorsl.viewer` y build 5 en `net.visorsl.viewer.debug`). |
+| ¿Cómo se firmaban los APK? | Con la configuración `debug`. AGP **genera esa clave al vuelo** cuando no existe, así que **cada compilación del CI firmaba con una clave nueva**. Android rechaza actualizar por encima un APK firmado con otra clave: el móvil se quedaba con el visor viejo. |
+
+Estado frente a los requisitos:
+
+| Requisito | Estado |
+| --- | --- |
+| 1. Renderizar en el móvil | **causa encontrada**: el APK con los arreglos de las rondas 7–12 nunca llegó a ejecutarse en el teléfono (firma distinta + dos paquetes + dos iconos idénticos). Arreglado: clave de firma **fija y pública** (`app/visor-sl.p12`, alias leído del almacén con Java, validada con `keytool` en el CI y regenerada y guardada si no se puede leer), **un solo paquete** (sin sufijo `.debug`) y **un solo APK** en el artefacto, con la versión en el nombre |
+| 2. Cargar el mapa | El motor ya lo hacía (fichas de `map.secondlife.com` con `User-Agent`, por el puente nativo o `superFetch`, con rejilla, nombres por UDP y marcadores). Verificado en el editor: 3×3 fichas reales, nombres, recuadro verde del destino y círculo amarillo propio |
+| 3. Buscador de tierras | Ya resolvía por UDP (`MapNameRequest`/`MapBlockReply`) y por la web del grid como reserva. Verificado en el editor: «Ahern está en (997, 1002)» |
+| 4. «De una vez por todas» | La versión instalada es ahora **visible** (badge `Visor SL b9` en la barra, «Versión instalada: …» en la pantalla de acceso, `Arranque:` en el registro) y hay una prueba **sin cuenta** en la propia pantalla de acceso («Probar el motor sin cuenta»), para comprobarlo en el móvil en diez segundos. Además la pantalla de acceso ya no es un vacío: la isla de prueba vuelve como fondo |
+| Extra | Versión **1.7.1 (build 9)**; instrucciones de desinstalación en el `.bat`, en `LEEME.txt` y en el resumen del workflow |
+
 
 

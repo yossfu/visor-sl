@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Visor SL</string>
+    <!-- La etiqueta del lanzador lleva la versión a propósito: en el móvil puede
+         haber quedado instalada una copia antigua con la misma calificación, y
+         ver "Visor SL 1.7.1" junto a un "Visor SL" a secas es la forma más rápida
+         de saber cuál se está abriendo. Debe coincidir con `versionName` de
+         build.gradle.kts. -->
+    <string name="app_name">Visor SL 1.7.1</string>
 </resources>

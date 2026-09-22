@@ -3,6 +3,62 @@
 Ordenado por impacto. Lo primero es lo que hay que hacer en cuanto se pruebe con
 una cuenta real en el grid.
 
+## Ronda 13 — el problema era que el APK nuevo NO llegaba al móvil
+
+El informe («sigue igual. sin cargar mapa sin buscar lands sin mostrar resultados.
+el mundo no serenderiza») no describía un fallo del motor: describía **el motor de
+hace cuatro rondas**. Comprobado con el repositorio y con las capturas del móvil:
+
+- En GitHub (`raw.githubusercontent.com/yossfu/visor-sl/main`) SÍ estaba el código
+  nuevo (`versionCode = 8`, `pxStride` en `j2c-worker.js`, sondeo de WebGL en
+  `index.html`): la subida funcionaba.
+- Las capturas del 21/09 a las 17:13 enseñan el panel de texturas con **franjas
+  finas y barra negra a la derecha**, que es la firma del error de JPEG2000 de 4
+  componentes **arreglado en la ronda 11**: el teléfono ejecutaba código anterior.
+
+Causas y arreglos (esto es lo primero que hay que mirar en cualquier «no cambia
+nada» futuro):
+
+- [x] **Clave de firma distinta en cada compilación del CI.** Se firmaba con la
+      configuración `debug` y AGP genera esa clave al vuelo en `~/.android/debug.keystore`:
+      en un servidor nuevo (GitHub Actions) es una clave **nueva en cada ejecución**.
+      Android **rechaza** instalar un APK firmado con otra clave sobre una app ya
+      instalada, así que el móvil se quedaba con el visor viejo para siempre.
+      Arreglado con una clave fija y pública (`app/visor-sl.p12`); el alias se lee
+      del almacén con `java.security.KeyStore` y el workflow la valida con
+      `keytool` (y la regenera y guarda si no se puede leer). La huella SHA-256 se
+      publica en el resumen de cada ejecución.
+- [x] **Dos paquetes con la misma etiqueta** (`net.visorsl.viewer` y
+      `net.visorsl.viewer.debug`): dos iconos «Visor SL» idénticos, y los informes
+      muestran que cada copia estaba en una versión distinta (build 4 y build 5).
+      Abrir la copia vieja se ve igual que «el APK nuevo no cambió nada». Se ha
+      quitado el sufijo `.debug` (mismo paquete para todo) y la etiqueta ahora es
+      **«Visor SL 1.7.1»**.
+- [x] **Un solo APK en el artefacto**, con la versión en el nombre
+      (`VisorSL-1.7.1-b9.apk`).
+- [x] **La versión a la vista**: badge en la barra de arriba (**Visor SL b9**),
+      línea «Versión instalada: …» en la pantalla de acceso, y `Arranque:` en el
+      registro. Cualquier captura dice ya qué build es.
+- [x] **Instrucciones de desinstalación** en el `.bat`, en `LEEME.txt` y en el
+      resumen del workflow: hay que borrar todas las copias viejas **una vez**;
+      después las actualizaciones ya funcionan solas.
+- [x] **La pantalla de acceso ya no es un vacío**: la isla procedural vuelve como
+      fondo del login (nombre «Demo Sandbox» en el campo de región + aviso en el
+      registro) y hay un botón **«Probar el motor sin cuenta»** que levanta el
+      simulador en memoria. En diez segundos, en el propio móvil: si ahí se ve un
+      mundo, el APK nuevo está instalado y el motor dibuja.
+- [x] Versión **1.7.1 (build 9)**.
+
+Lo que sigue pendiente de comprobar **en el móvil**, ya con el APK nuevo dentro:
+
+- [ ] Que la barra de arriba diga «Visor SL b9» (si no, sigue habiendo una copia
+      vieja instalada).
+- [ ] El buscador de tierras: el mapa (fichas de `map.secondlife.com` por el
+      puente nativo) y sus nombres de región (por UDP, `MapBlockRequest`).
+- [ ] La búsqueda por nombre y el teletransporte contra el grid real (en el editor
+      está verificado con el simulador falso; falta el grid).
+- [ ] El terreno real (LayerData tipo 76) y las mallas de los edificios.
+
 ## Ronda 12 — lo hecho en esta revisión (informe 9)
 
 El informe 9 dijo: en el móvil real sigue sin renderizarse nada y nada cambia.
@@ -64,9 +120,12 @@ Qué hace falta del móvil para cerrar esto (informe 10):
 - [ ] Si el registro dice «faltan N» métodos del puente nativo, el APK instalado
       es más antiguo que el motor web: reinstalar el APK entero (no sólo copiar
       `www`).
-- [ ] Confirmar **cuál** de los dos APK del artefacto se instala: `app-debug.apk`
-      y `app-release.apk` son **paquetes distintos** (`.debug`), así que se pueden
-      tener los dos instalados a la vez y abrir siempre el viejo.
+- [x] Confirmar **cuál** de los dos APK del artefacto se instala: ya no hay dos.
+      Desde la ronda 13 se quita el sufijo `.debug`, así que las dos variantes son
+      **el mismo paquete** y sólo hay **un APK** en el artefacto
+      (`VisorSL-1.7.1-b9.apk`). Además los APK se firmaban con una clave distinta
+      en cada compilación del CI, así que Android rechazaba la actualización y el
+      móvil se quedaba con el visor viejo (ver la Ronda 13, arriba).
 
 ## Ronda 11 — lo hecho en esta revisión (informe 8)
 

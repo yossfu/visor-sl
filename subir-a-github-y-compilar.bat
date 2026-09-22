@@ -103,7 +103,21 @@ echo    Ahora abre esta pagina y espera a que termine "Compilar APK":
 echo    https://github.com/yossfu/visor-sl/actions
 echo.
 echo    Cuando acabe, entra en la ejecucion terminada y descarga
-echo    "visor-sl-apk" al final de la pagina. Instalalo en el movil.
+echo    "visor-sl-apk" al final de la pagina. Dentro hay UN solo APK
+echo    con la version en el nombre (por ejemplo VisorSL-1.7.1-b9.apk).
+echo.
+echo    IMPORTANTE - solo la primera vez:
+echo    los APK antiguos estaban firmados con otra clave, asi que
+echo    Android NO deja actualizarlos por encima: si no se desinstala
+echo    antes, el movil sigue abriendo el visor viejo y parece que el
+echo    APK nuevo no ha cambiado nada.
+echo      Ajustes - Aplicaciones - busca "Visor SL" - Desinstalar
+echo      (si aparece mas de una vez, desinstalalas todas)
+echo    Despues ya se puede instalar y actualizar normalmente.
+echo.
+echo    Al abrir la app, arriba tiene que poner "Visor SL 1.7.1" y el
+echo    registro empieza por "Arranque: 1.7.1 (build 9)". Si no lo pone,
+echo    el APK que se ha abierto no es el nuevo.
 echo ================================================================
 echo.
 pause
