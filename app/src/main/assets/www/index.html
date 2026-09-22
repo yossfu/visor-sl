@@ -6,6 +6,7 @@
     <div class="logo">Visor&nbsp;SL</div>
     <div class="sub">motor de mundo virtual en WebGL</div>
     <div class="spin"></div>
+    <div class="sub build" id="bootBuild"></div>
   </div>
 </div>
 <script>
@@ -42,13 +43,101 @@
     }
     window.addEventListener("error", function (e) { report(describe(e)); }, true);
     window.addEventListener("unhandledrejection", function (e) { report(describe(e)); });
+
+    // ---------------------------------------------------------------------
+    // GPU probe — done HERE, before any module loads, and on the real canvas.
+    //
+    // This used to be a hard requirement: no WebGL2, no viewer. That is the
+    // wrong shape of failure. A WebView that only offers WebGL1 (or that
+    // refuses WebGL2 for any reason) showed a bare error box and *nothing*
+    // rendered, with no mention of what the device had actually reported —
+    // while the desktop preview, which obviously has WebGL2, worked. So the
+    // probe now records exactly what the device can do, keeps the context for
+    // the renderer to use, and only refuses to start when there is no WebGL at
+    // all. Whatever it finds is printed on screen and into the log.
+    //
+    // The probe runs on #view on purpose: a canvas can only ever have one kind
+    // of context, so the probe and three.js must agree on the same one.
+    // ---------------------------------------------------------------------
+    (function probeGpu() {
+      const canvas = document.getElementById("view");
+      const gpu = {
+        ok: false, webgl2: false, api: "ninguna", vendor: "?", renderer: "?",
+        version: "?", maxTextureSize: 0, maxSamples: 0, software: false,
+        error: null, context: null,
+      };
+      window.visorGpu = gpu;
+      if (!canvas) { gpu.error = "no hay <canvas id=view>"; return; }
+      const opts = {
+        // `antialias` is fixed here rather than taken from the quality profile
+        // (which is chosen later, in the app): the canvas keeps this context for
+        // the whole session, and reporting the GPU truthfully matters more than
+        // the small saving a no-AA context gives on the lowest profile.
+        alpha: false, antialias: true, depth: true, stencil: false,
+        powerPreference: "default",
+        // Same rule as the renderer's: keep the drawing buffer only where a
+        // screenshot needs it (the designer's preview), never on a phone, where
+        // it costs a full-frame copy on every present. This has to be decided
+        // HERE because a canvas keeps the first context it hands out.
+        preserveDrawingBuffer: !window.VisorNative,
+        failIfMajorPerformanceCaveat: false,
+      };
+      let ctx = null;
+      for (const name of ["webgl2", "webgl", "experimental-webgl"]) {
+        try {
+          ctx = canvas.getContext(name, opts);
+        } catch (e) {
+          gpu.error = name + ": " + ((e && e.message) || e);
+          ctx = null;
+        }
+        if (ctx) { gpu.api = name; gpu.webgl2 = name === "webgl2"; break; }
+      }
+      if (!ctx) {
+        gpu.error = gpu.error || "el dispositivo no dio ningún contexto WebGL";
+        return;
+      }
+      gpu.ok = true;
+      gpu.context = ctx;
+      try {
+        const gl = ctx;
+        const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+        gpu.vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+        gpu.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+        gpu.version = gl.getParameter(gl.VERSION);
+        gpu.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+        gpu.maxSamples = gpu.webgl2 ? gl.getParameter(gl.MAX_SAMPLES) : 0;
+        gpu.software = /swiftshader|software|llvmpipe|basic render/i.test(String(gpu.renderer));
+      } catch (e) {
+        gpu.error = "no se pudieron leer los datos de la GPU: " + ((e && e.message) || e);
+      }
+    })();
+
+    // The build stamp. On the phone the shell knows it (it comes from the APK
+    // itself), and seeing it change is the only way to tell an installed build
+    // from the one that was downloaded.
+    (function stamp() {
+      let text = "web";
+      try {
+        if (window.VisorNative && window.VisorNative.platform) {
+          const p = JSON.parse(window.VisorNative.platform());
+          text = `${p.appVersion || "?"} (build ${p.appBuild || "?"}) · Android ${p.sdk || "?"}`;
+        }
+      } catch (e) { text = "web"; }
+      window.visorBuild = text;
+      const el = document.getElementById("bootBuild");
+      if (el) el.textContent = text;
+    })();
   })();
 </script>
 <script type="module">
   import { boot } from "./js/app.js";
+  const g = window.visorGpu || {};
   try {
-    if (!document.createElement("canvas").getContext("webgl2")) {
-      throw new Error("Este dispositivo no soporta WebGL2, que es necesario para el visor 3D. Actualiza el navegador / Android System WebView.");
+    if (!g.ok) {
+      throw new Error(
+        "Este dispositivo no ofrece WebGL, que es lo que necesita el visor 3D. " +
+        "Actualiza «Android System WebView» / Chrome desde Play Store. (" +
+        (g.error || "sin detalle") + ")");
     }
     boot();
     window.visorBooted = true;

@@ -47,9 +47,29 @@ export const MESH_LODS = ["lowest_lod", "low_lod", "medium_lod", "high_lod"];
 let fflatePromise = null;
 
 /**
+ * Inflates one zlib block with the vendored fflate. `DecompressionStream`
+ * cannot be relied on everywhere (see `inflateZlib`), so this is the path a
+ * phone actually takes when it is missing — which is why it is exported and
+ * tested against a real mesh block rather than kept private.
+ *
+ * `unzlibSync`, not `inflateSync`: in fflate `inflateSync` is *raw* DEFLATE and
+ * `unzlibSync` is the zlib container. Handing a zlib block to the raw inflater
+ * throws "unexpected EOF" — for every block, i.e. no building in the region
+ * would ever be drawn, on exactly the devices that have no DecompressionStream.
+ */
+export async function inflateZlibFallback(buf) {
+  if (!fflatePromise) fflatePromise = import("../vendor/fflate/fflate.esm.js");
+  const fflate = await fflatePromise;
+  return fflate.unzlibSync(buf);
+}
+
+/**
  * Inflates one zlib block. `DecompressionStream("deflate")` is the zlib
  * container (not raw deflate), which is what the viewer's `inflateInit` writes.
- * Browsers inside some apps lack it, so fflate is the fallback.
+ * Some WebViews lack it, so fflate is the fallback — vendored inside the app
+ * (`../vendor/fflate/`), never fetched from a CDN: a mesh block that cannot be
+ * inflated is a building that cannot be drawn, and the phone may well have no
+ * route to a CDN the desktop preview is using.
  */
 export async function inflateZlib(bytes) {
   const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -58,12 +78,12 @@ export async function inflateZlib(bytes) {
       const stream = new Blob([buf]).stream().pipeThrough(new DecompressionStream("deflate"));
       return new Uint8Array(await new Response(stream).arrayBuffer());
     } catch (e) {
+      // Corruption is corruption whichever inflater reads it; do not turn a
+      // broken block into a second, slower attempt that fails the same way.
       throw new Error("mesh: bloque zlib corrupto (" + ((e && e.message) || e) + ")");
     }
   }
-  if (!fflatePromise) fflatePromise = import("https://esm.sh/fflate@0.8.2");
-  const fflate = await fflatePromise;
-  return fflate.inflateSync(buf);
+  return inflateZlibFallback(buf);
 }
 
 // ---------------------------------------------------------------------------

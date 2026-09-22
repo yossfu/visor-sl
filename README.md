@@ -405,7 +405,7 @@ hace el visor oficial y Lumiya (que es lo que se ha usado como referencia):
       relleno). `World.meshFacesFor` reutiliza toda la tubería de prims
       (geometría compartida por activo+LOD, materiales por cara, batching).
 - [x] **`mesh-encode.js` escribe activos reales**, así que el mismo formato se
-      prueba de los dos lados: el autotest (97/97) y el arnés local
+      prueba de los dos lados: el autotest (99/99) y el arnés local
       (`?test=grid`, que sirve una casa de dos materiales y una caja por su
       `GetMesh`) comprueban el decodificador **contra un codificador**, no contra
       un muñeco. El demo offline (`?test=demo`) tiene también dos edificios de
@@ -453,7 +453,65 @@ tests unitarios:
   los dos casos que **no** deben dibujarse (mapa sin relieve, malla sin activo)
   no dibujan nada.
 
+## 2f. Ronda 12 — «en el móvil no se renderiza nada»
+
+El informe 9 dijo, en sustancia, que en el móvil real no cambia nada y no se
+renderiza nada, y que el APK pesa 3 MB mientras Lumiya pesa 10. Se buscaron las
+causas que sólo existen **en el dispositivo** (en el editor todo parece bien):
+
+- [x] **Bug real y latente: el inflador de reserva de zlib estaba mal usado.**
+      En fflate `inflateSync` es DEFLATE **crudo** y `unzlibSync` es el
+      contenedor **zlib** — que es lo que usa un bloque de malla. El código
+      llamaba a `inflateSync` sobre bloques zlib, así que lanzaba
+      «unexpected EOF» en **todos** los bloques. En el editor no se notaba porque
+      `DecompressionStream` está disponible y la reserva no se toca; en un WebView
+      sin `DecompressionStream` significaba **cero mallas descodificadas = cero
+      estructuras**. Ahora se usa `unzlibSync` (`inflateZlibFallback`), y el
+      autotest comprueba las dos cosas: que el inflador lee un bloque real y que
+      la malla entera se decodifica **con `DecompressionStream` desactivado**
+      (99/99).
+- [x] **fflate vendorizado (`src/web/vendor/fflate/`)**: era el único
+      `import` a una URL de red (`esm.sh`) en todo el visor. Un móvil sin ruta a
+      ese CDN no podía descomprimir ni una malla, y nada en pantalla lo decía.
+- [x] **WebGL2 ya no es un requisito duro.** `index.html` exigía WebGL2 y, si no
+      lo había, mostraba un recuadro de error y **no arrancaba nada**: el síntoma
+      exacto de «no se renderiza nada», sin decir qué había dado el dispositivo.
+      Ahora hay un **sondeo de WebGL** que crea el contexto en el propio `<canvas
+      id=view>` (uno solo, porque un canvas se queda con el primero que da),
+      registra qué encontró (`api`, `vendor`, `renderer`, versión, tamaño máximo
+      de textura, si es software) y **arranca igualmente en modo de compatibilidad
+      WebGL1** si no hay WebGL2. `Viewer` reutiliza ese mismo contexto.
+- [x] **Línea de arranque siempre en el registro**, no sólo los errores:
+      `Arranque: <build> · <WebGL2|WebGL1> · <GPU> · texturas ≤Npx · puente nativo
+      sí/no (faltan N)`. Con eso, un informe de una sola línea ya cuenta la
+      historia entera. Además se comprueba que el APK instalado tiene **todos** los
+      métodos del puente nativo (un APK viejo con un motor web nuevo se detecta y
+      lo dice) y se listan bajo «sondeo de WebGL (arranque)» en el diagnóstico.
+- [x] **Prueba en el dispositivo sin cuenta**: el botón ☰ → «Prueba de vista con
+      simulador local» levanta el simulador falso dentro de la app, así que se
+      puede comprobar en el propio móvil que el motor dibuja. Verificado en el
+      editor: 42 prims, 50 fps, terreno y edificios en pantalla.
+- [x] Versión **1.7.0 (build 8)**, que es lo primero que dice el registro.
+
+### Sobre el tamaño del APK (3 MB frente a los 10 MB de Lumiya)
+
+No es que falte motor: es dónde vive cada cosa. De los 23,9 MB sin comprimir del
+APK de Lumiya, **7,7 MB son `classes.dex`** (toda su interfaz en Java), ~5,9 MB
+son las mismas bibliotecas nativas repetidas **por cada ABI** (`libgvr.so` de
+Cardboard, `libopenjpeg.so`, `librawbuf.so`) y ~0,9 MB son recursos Java (layouts,
+dibujables por densidad, sonidos). El contenido 3D apenas pesa: sus mallas de
+avatar `.lbm` son 2,4 MB y nosotros llevamos las equivalentes (1,6 MB), y las 118
+animaciones son 0,3 MB en ambos. Nosotros hacemos el resto en JS: three.js 671 KB,
+OpenJPEG wasm 243 KB. Lo que **sí** trae Lumiya y nosotros no: las texturas `.tga`
+del avatar por defecto (piel, pecas, maquillaje, prendas) y el cielo *windlight*
+con sus nubes. Las `.tga` se han decodificado y medido: son **máscaras de
+cobertura** —`head_color` 96 %, `upperbody_color` 99 % y `lowerbody_color` 87 %
+transparentes—, no mapas difusos, así que no se pueden enchufar directamente;
+haría falta el compositor por capas de SL. Queda anotado en el TODO con los
+números, para no repetir el intento a ciegas.
+
 ## 3. Arquitectura (código)
+
 
 | fichero | papel |
 | --- | --- |
@@ -497,8 +555,9 @@ tests unitarios:
 | `src/web/data/message_template.msg` | plantilla de mensajes oficial de SL (241 KB) |
 | `src/web/vendor/three.module.min.js` | three.js r169 (vendorizado) |
 | `src/web/vendor/openjpeg/` | OpenJPEG wasm (decodificador J2C/JPEG2000 real; `openjpegwasm_decode.js` + `.wasm`) |
+| `src/web/vendor/fflate/` | fflate 0.8.2 (inflador zlib de reserva para los bloques de malla si el WebView no tiene `DecompressionStream`; vendorizado, sin CDN) |
 | `src/tools/pack.mjs` | empaqueta `visor-sl-app.zip` a partir de estas fuentes |
-| `src/tools/proto-selftest.mjs` | 97 pruebas del protocolo (ver abajo) |
+| `src/tools/proto-selftest.mjs` | 99 pruebas del protocolo (ver abajo) |
 | `src/android/**` | proyecto Gradle + WebView + `NativeBridge` (UDP/HTTP) |
 | `src/ci/build-apk.yml` | workflow de GitHub Actions |
 
@@ -544,7 +603,7 @@ que se importa antes de llamarla):
 
 ```js
 await import("./src/tools/proto-selftest.mjs");
-await window.runVisorSelfTest();   // → 97/97 correctas
+await window.runVisorSelfTest();   // → 99/99 correctas
 
 // Estrés de render (llena la región de prims con texturas y mide fps y llamadas
 // de dibujo): lo que se usa antes de tocar perf.js/batch.js.

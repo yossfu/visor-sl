@@ -3,6 +3,71 @@
 Ordenado por impacto. Lo primero es lo que hay que hacer en cuanto se pruebe con
 una cuenta real en el grid.
 
+## Ronda 12 — lo hecho en esta revisión (informe 9)
+
+El informe 9 dijo: en el móvil real sigue sin renderizarse nada y nada cambia.
+Se buscaron causas que **sólo existen en el dispositivo** — en el editor todo
+parece funcionar.
+
+- [x] **El inflador de reserva de zlib estaba mal usado (bug real).** En fflate
+      `inflateSync` es DEFLATE crudo; el contenedor zlib es `unzlibSync`. El
+      código llamaba a `inflateSync` sobre bloques zlib, así que **todos** los
+      bloques lanzaban «unexpected EOF». En el editor no se veía porque
+      `DecompressionStream` está disponible y la reserva no se usa; en un WebView
+      sin `DecompressionStream` son **cero mallas = cero estructuras**. Ahora se
+      usa `unzlibSync` y el autotest decodifica la malla entera **con
+      `DecompressionStream` desactivado** (99/99).
+- [x] **fflate vendorizado** (`src/web/vendor/fflate/`): era el único `import`
+      a una URL de red en todo el visor (`esm.sh`).
+- [x] **WebGL2 ya no es un requisito duro**: `index.html` sondea WebGL (creando
+      el contexto en el propio canvas), lo registra todo y arranca en
+      compatibilidad WebGL1 si no hay 2. Antes, sin WebGL2, no arrancaba **nada**
+      y el recuadro de error no decía qué había dado el dispositivo.
+- [x] **Línea `Arranque:` siempre en el registro** (build, nivel de WebGL, GPU,
+      puente nativo y métodos que falten) y fila «sondeo de WebGL (arranque)» en
+      el diagnóstico completo.
+- [x] La comprobación de arranque corre **siempre** (no sólo en móvil), así que
+      el registro de cualquier dispositivo empieza diciendo qué es.
+- [x] Verificado en el editor que el botón ☰ → «Prueba de vista con simulador
+      local» levanta el simulador falso **dentro de la app**: 42 prims, 50 fps,
+      terreno y edificios en pantalla.
+- [x] Versión **1.7.0 (build 8)** — el número sube a propósito: es lo primero que
+      dice el registro de arranque, y es la única forma de saber si el APK
+      instalado es el nuevo.
+
+Pendiente (de Lumiya, que sí lo trae y nosotros no):
+
+- [ ] Las **texturas `.tga` del avatar por defecto**: hoy un avatar sin *bake* del
+      grid se pinta con un color plano (`SKIN_COLOR`) y Lumiya lleva esas capas
+      dentro. **Ojo, ya comprobado: no son texturas de usar tal cual.** Al
+      decodificarlas (`scratch/lumiya-tga/`), `head_color` es **96 % transparente**,
+      `upperbody_color` **99 %** y `lowerbody_color` **87 %**: son **máscaras de
+      cobertura** (el alfa dice dónde se pinta, el RGB qué color), pensadas para
+      el compositor local de Lumiya, no mapas difusos. Ponerlas como textura daría
+      un avatar casi invisible. Para aprovecharlas haría falta montar el
+      compositor por capas (color base + `*_skingrain` + capas con máscara, en el
+      orden del diccionario de SL). Como el grid manda las texturas *baked* de
+      todos modos, esto sólo afecta a los primeros segundos de carga.
+- [ ] El **cielo *windlight*** de Lumiya (`clouds_*.tga` + los XML `A-12AM`…):
+      hoy el cielo es procedural.
+- [ ] Malla de pelo por defecto (Lumiya trae `avatar_hair.lbm`, 505 KB).
+
+Qué hace falta del móvil para cerrar esto (informe 10):
+
+- [ ] **La primera línea del registro**, que ahora empieza por `Arranque:` — con
+      eso se sabe de una vez qué build es, si el WebView dio WebGL2 o WebGL1, qué
+      GPU es y si el puente nativo está completo.
+- [ ] **El botón ☰ → «Prueba de vista con simulador local»** *en el teléfono*: si
+      ahí se ve terreno y edificios, el motor dibuja y el problema está en la
+      conexión al grid; si ahí tampoco se ve nada, el problema es de dibujo y el
+      registro dirá por qué.
+- [ ] Si el registro dice «faltan N» métodos del puente nativo, el APK instalado
+      es más antiguo que el motor web: reinstalar el APK entero (no sólo copiar
+      `www`).
+- [ ] Confirmar **cuál** de los dos APK del artefacto se instala: `app-debug.apk`
+      y `app-release.apk` son **paquetes distintos** (`.debug`), así que se pueden
+      tener los dos instalados a la vez y abrir siempre el viejo.
+
 ## Ronda 11 — lo hecho en esta revisión (informe 8)
 
 El informe 7 seguía diciendo «todo se ve roto sin sentido, sin estructuras ni
@@ -69,7 +134,8 @@ sin dibujar los dos casos que no deben dibujarse.
 
 Pendiente de comprobar en el móvil (informe 9), por orden:
 
-- [ ] Que el registro empiece por `app 1.6.0 (build 7)` y que la caché diga
+- [ ] Que el registro empiece por `app X (build N)` **y que N sea el del APK que
+      acabas de instalar** (si no coincide, el APK instalado no es el nuevo) y que la caché diga
       `revisión r3 … borrados N archivos` (si no aparece, la caché no se vació).
 - [ ] La línea `TEXTURAS:` debe mostrar `formas del codestream: 8b×1c:… 8b×3c:…`
       y —si aparece— `8b×4c:` con `decodificadas` subiendo: **si salen rayas

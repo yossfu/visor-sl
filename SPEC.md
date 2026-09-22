@@ -272,4 +272,30 @@ Estado frente a esos requisitos:
 | Extra | **`mesh-encode.js`** escribe activos `LLMESH` reales, así que el decodificador se prueba contra un codificador (autotest 97/97, arnés `?test=grid`, demo offline). Un bug del *batcher* al reutilizar el mundo (el demo mostraba sólo terreno) quedó arreglado. Versión **1.6.0 (build 7)** |
 | 3b. Verificación antes de subir | **hecho**, en `?test=grid`: el teletransporte **por la interfaz** (panel *Lands* → «Sandbox Cordova» → *Teletransportar*) recorre búsqueda UDP → `TeleportStart` → `TeleportFinish` y llega a la región nueva con sus 44 prims; la búsqueda por nombre resuelve por UDP; el mundo se ve con terreno, objetos sólidos y un edificio con tejado; y el arnés `?test=sculpt` dibuja las cinco esculturas y la casa de malla (y no dibuja los dos casos que no deben dibujarse) |
 
+## Ronda 12 (informe 9: «en el móvil no se renderiza nada, nada cambia; el APK pesa 3 MB y Lumiya 10»)
+
+> no se que estas modificando, veo que aqui pnes el visor y quisa te asas en lo
+> que funciona en el viewer de pruea pero no estas haciendo nada por el visor real
+> en android para second life. todo sigue siendo igual no se renderiza nada, nada
+> cambia ya te di muchos archivos y de ahi te puedes basar dime que necesitas, la
+> app pesa apenas 3 mb. lumiya pesa mas alrdedeor de 10mb....
+
+Requisitos:
+
+1. **Que el visor real de Android renderice** (no basta con que funcione en el
+   visor de pruebas del editor).
+2. **Basarse en los archivos que ya ha dado** (Linkpoint, Lumiya, y ahora el APK
+   de Lumiya), y **decirle qué se necesita** de su parte.
+3. Que quede claro que el APK instalado es el nuevo.
+
+Estado:
+
+| Requisito | Estado |
+| --- | --- |
+| 1. Renderizar en el móvil | **causa encontrada y arreglada**: (a) el inflador de reserva de zlib llamaba a `inflateSync` (DEFLATE crudo) sobre bloques **zlib** → «unexpected EOF» en todos los bloques de malla, es decir **cero estructuras** en cualquier WebView sin `DecompressionStream`; ahora `unzlibSync`, vendorizado (el `import` a `esm.sh` era el único URL de red del visor). (b) `index.html` exigía WebGL2 y sin él **no arrancaba nada**; ahora sondea WebGL, lo registra y arranca en compatibilidad WebGL1. (c) el registro empieza siempre por `Arranque:` (build, WebGL, GPU, puente nativo) para que el próximo informe sea concluyente |
+| 2. Basarse en lo dado | **hecho**: el APK de Lumiya se ha analizado entero (23,9 MB sin comprimir: 7,7 MB de `classes.dex`, ~5,9 MB de `.so` repetidos por ABI, 0,9 MB de recursos Java, 2,4 MB de mallas de avatar, 0,3 MB de animaciones, 3,1 MB de texturas de avatar). Lo que **sí** trae Lumiya y nosotros no queda anotado en el TODO: texturas del avatar por defecto y cielo *windlight* |
+| 3. Saber qué APK está instalado | **hecho**: el recuadro de arranque y la primera línea del registro llevan la versión y el build; y se comprueba que el APK tiene todos los métodos del puente nativo (si faltan, lo dice: «el APK instalado es más antiguo que este motor web») |
+| Qué necesito de él | **el registro del teléfono** (☰ → «Guardar registro en Descargas») y el resultado de pulsar **☰ → «Prueba de vista con simulador local»** en el móvil: eso separa «el motor no dibuja» de «no conecta con el grid» sin más idas y vueltas |
+
+
 

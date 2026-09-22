@@ -12,7 +12,6 @@
 // back to software, the avatar meshes never loaded — and from the screen alone
 // they all look identical. This module turns that into a sentence per stage.
 import { platformInfo, hasNative, storageInfo, netInfo, assetsList } from "./transport.js";
-import { isMobile } from "./perf.js";
 import { loadBytes, assetTransportReport } from "./avatar/assets.js";
 import { CACHE_REV, cacheMode, verifyCache } from "./cache.js";
 
@@ -41,6 +40,7 @@ function hasFeature(name) {
     case "Worker": return typeof Worker === "function";
     case "WebAssembly": return typeof WebAssembly === "object";
     case "WebGL2": return (() => { try { return !!document.createElement("canvas").getContext("webgl2"); } catch (_) { return false; } })();
+    case "WebGL": return !!(typeof window !== "undefined" && window.visorGpu && window.visorGpu.ok);
     case "ImageBitmapTransfer": return typeof ImageBitmap !== "undefined";
     case "SharedArrayBuffer": return typeof SharedArrayBuffer === "function";
     case "WorkerModule": return (() => {
@@ -70,10 +70,17 @@ export function quickReport(app) {
     out.push(["GPU", `${g.renderer || "?"} · ${g.webgl} · máx ${g.maxTexture}px · ${g.extensions} ext.${g.error ? " · " + g.error : ""}`]);
     out.push(["GPU (software)", g.software ? "SÍ — el WebView no usa la GPU" : "no"]);
   }
-  const feats = ["WebGL2", "DecompressionStream", "createImageBitmap", "OffscreenCanvas", "Worker", "WorkerModule", "WebAssembly"];
+  if (typeof window !== "undefined" && window.visorGpu) {
+    const g = window.visorGpu;
+    out.push(["sondeo de WebGL (arranque)", g.ok
+      ? `${g.api}${g.webgl2 ? "" : " (sin WebGL2: modo de compatibilidad)"} · ${g.vendor} · ${g.version}${g.maxSamples ? ` · hasta ${g.maxSamples} muestras` : ""}`
+      : `FALLA: ${g.error || "sin contexto"}`]);
+  }
+  const feats = ["WebGL", "DecompressionStream", "createImageBitmap", "OffscreenCanvas", "Worker", "WorkerModule", "WebAssembly"];
   out.push(["navegador soporta", feats.filter(hasFeature).join(", ")]);
   const missing = feats.filter((f) => !hasFeature(f));
   if (missing.length) out.push(["FALTA en este navegador", missing.join(", ")]);
+  if (!hasFeature("WebGL2")) out.push(["WebGL2", "no disponible — el visor funciona en modo de compatibilidad WebGL1"]);
   if (app && app.viewer && app.viewer.stats) {
     const s = app.viewer.stats;
     out.push(["render", `${s.fps ? s.fps.toFixed(0) : "?"} fps · ${s.drawCalls || 0} llamadas · ${((s.tris || 0) / 1000).toFixed(0)}k triángulos · escala ${(app.viewer.renderScale || 1).toFixed(2)}`]);
@@ -248,21 +255,48 @@ export function summary(list) {
   return `Diagnóstico: ${bad.length} problema(s) — ` + bad.slice(0, 4).map((r) => `${r.name}: ${r.detail}`).join(" · ");
 }
 
-/** Failures only — what the boot path logs without being asked. */
+/**
+ * What the app knows about itself the moment it starts, said out loud.
+ *
+ * The boot path used to log only the things that were *wrong*, which meant a
+ * report from a phone whose GPU fell back to software, or whose asset server
+ * was 404ing, read exactly like a healthy one that simply "renders nothing".
+ * So this now always prints one line with the facts — build, WebGL level, the
+ * GPU string, the native bridge, the delivered assets — and then any problems
+ * below it. If the next report is one line long, that line is the whole story.
+ */
 export async function bootCheck(app, log) {
   const problem = [];
   const info = platformInfo();
   const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
   const chrome = Number((ua.match(/Chrome\/(\d+)/) || [])[1] || 0);
+  const g = (typeof window !== "undefined" && window.visorGpu) || null;
+  const build = (typeof window !== "undefined" && window.visorBuild) ||
+    (info && info.platform === "android" ? `${info.appVersion || "?"} (build ${info.appBuild || "?"})` : "web");
+
   if (chrome && chrome < 90) problem.push(`El WebView es antiguo (Chrome ${chrome}); actualiza "Android System WebView" en Play Store.`);
-  if (!hasFeature("DecompressionStream")) problem.push("Falta DecompressionStream: los archivos del avatar no se podrán descomprimir.");
-  if (!hasFeature("WebGL2")) problem.push("No hay WebGL2: el motor 3D no funcionará.");
-  if (app && app.viewer && app.viewer.gpu && app.viewer.gpu.software) {
-    problem.push(`El WebView está renderizando por SOFTWARE (${app.viewer.gpu.renderer}): todo irá muy lento.`);
+  if (!hasFeature("DecompressionStream")) problem.push("Falta DecompressionStream: los archivos del avatar y los bloques de malla se descomprimen con el inflador incluido (más lento).");
+  if (g && !g.webgl2) problem.push(`El dispositivo no dio WebGL2 (${g.api || "?"}): el visor arranca en modo de compatibilidad con WebGL1; algunas cosas pueden verse distintas.`);
+  if (g && g.software) problem.push(`La GPU es de SOFTWARE (${g.renderer}): todo irá muy lento. Es lo que pasa cuando el WebView no consigue la GPU real.`);
+
+  const bridge = hasNative();
+  const wanted = ["udp", "udpOpen", "udpSend", "udpProbe", "http", "platform", "prefsAll", "prefsSet",
+    "storageStatus", "assetsList", "assetGet", "cacheGet", "cachePut", "saveToDownloads", "netInfo"];
+  let missing = [];
+  if (bridge && typeof window !== "undefined" && window.VisorNative) {
+    try { missing = wanted.filter((m) => typeof window.VisorNative[m] !== "function"); } catch (_) {}
   }
-  if (hasNative() && isMobile() && app) {
+  if (missing.length) problem.push(`El puente nativo no tiene ${missing.join(", ")}() — el APK instalado es más antiguo que este motor web (reinstala el APK completo).`);
+  if (app) {
     const r = await assetCheck();
     for (const [name, ok, detail] of r) if (!ok) problem.push(`${name}: ${detail}`);
+  }
+
+  if (log) {
+    const gpuText = g && g.ok
+      ? `${g.webgl2 ? "WebGL2" : "WebGL1 (compatibilidad)"} · ${g.renderer || "?"} · texturas ≤${g.maxTextureSize || "?"}px${g.software ? " · SOFTWARE" : ""}`
+      : `sin WebGL (${(g && g.error) || "no detectado"})`;
+    log(`Arranque: ${build} · ${gpuText} · puente nativo ${bridge ? "sí" : "no"}${bridge && missing.length ? ` (faltan ${missing.length})` : ""}`);
   }
   if (log) for (const p of problem) log("⚠ " + p);
   return problem;

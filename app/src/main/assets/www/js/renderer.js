@@ -37,13 +37,20 @@ export class Viewer {
     // needed so a screenshot (the editor's own preview, or the diagnostics
     // button) can read the canvas back — never for a normal frame on a phone.
     const keepBuffer = opts.preserveDrawingBuffer === true;
-    this.renderer = new THREE.WebGLRenderer({
+    // The context was already created by the page's GPU probe (index.html), on
+    // this very canvas, and recorded whatever the device could actually give:
+    // WebGL2, WebGL1, or nothing. three.js is handed that same context instead
+    // of asking for one of its own — a canvas keeps the first context it hands
+    // out for good, so a probe and a second request can only ever agree by
+    // accident.
+    const probed = (typeof window !== "undefined" && window.visorGpu && window.visorGpu.context) || null;
+    this.renderer = new THREE.WebGLRenderer(Object.assign({
       canvas,
       antialias: opts.antialias !== false,
       alpha: false,
       preserveDrawingBuffer: keepBuffer,
       powerPreference: "high-performance",
-    });
+    }, probed ? { context: probed } : {}));
     this.renderScale = 1;
     this.profile = opts.profile || null;
     this.maxPixelRatio = (this.profile && this.profile.pixelRatioMax) || Math.min(devicePixelRatio || 1, 2);

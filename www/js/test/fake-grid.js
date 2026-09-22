@@ -770,7 +770,7 @@ export async function installFakeGrid(opts = {}) {
   window.VisorNative = {
     platform: () => JSON.stringify({
       platform: "android", sdk: 36, model: "harness", manufacturer: "Perchance",
-      appVersion: "1.6.0", appBuild: 7, nativeBridge: true, udp: true,
+      appVersion: "1.7.0", appBuild: 8, nativeBridge: true, udp: true,
     }),
     netInfo: () => JSON.stringify({ tipo: "wifi (simulada)", validada: true, sinMedir: true, udpOk: true, puertoDePrueba: 40000 }),
     log: (m) => console.log("[harness nativo]", m),
